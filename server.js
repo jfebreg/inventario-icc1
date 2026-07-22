@@ -73,7 +73,7 @@ const server = http.createServer(async (req, res) => {
     const data = url.searchParams.get("data");
     if (!data) return json(res, 400, { error: "Falta dato para QR" });
     try {
-      const svg = await QRCode.toString(data, { type: "svg", errorCorrectionLevel: "M", margin: 1, width: 240 });
+      const svg = await QRCode.toString(data, { type: "svg", errorCorrectionLevel: "L", margin: 2, width: 512 });
       res.writeHead(200, { "Content-Type": "image/svg+xml; charset=utf-8", "Cache-Control": "public, max-age=86400" });
       return res.end(svg);
     } catch {
