@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Control de Activos</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="logo.css" />
+    <link rel="stylesheet" href="print.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand"><img class="brand-logo" src="logo-icc.jpg" alt="ICC Piping" /><span>Control<br>de Activos</span></div>
+        <nav id="nav" aria-label="Navegación principal"></nav>
+        <div class="user-card">
+          <div class="avatar">BC</div>
+          <div><strong id="activeUserName">Bodega Central</strong><small id="activeUserRole">Administrador</small></div>
+        </div>
+      </aside>
+      <main>
+        <header class="topbar">
+          <button class="menu-button" id="menuButton" aria-label="Abrir menú">☰</button>
+          <div id="breadcrumb">Resumen</div>
+          <div class="top-actions"><button class="outline" id="userSwitcher">Cambiar usuario</button><button class="profile-button" id="profileButton">BC</button></div>
+        </header>
+        <section id="view" class="view"></section>
+      </main>
+    </div>
+    <div id="modal" class="modal-root" aria-live="polite"></div>
+    <div id="toast" class="toast" role="status"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
