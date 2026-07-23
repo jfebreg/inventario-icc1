@@ -1,4 +1,4 @@
-# Publicar el sistema con Codex/OpenAI (guía simple)
+﻿# Publicar el sistema con Codex/OpenAI (guía simple)
 
 ## Antes de empezar
 
@@ -17,20 +17,30 @@ Necesita una cuenta de OpenAI, una cuenta de GitHub y una cuenta de Render.com. 
 2. Suba la carpeta `inventario-web` completa.
 3. En Render.com elija **New +** → **Web Service** → conecte ese repositorio.
 4. Configure la variable de entorno `OPENAI_API_KEY` con la clave creada en el paso 1.
-5. Configure también `APP_URL` con la dirección que Render entregue, por ejemplo `https://inventario-icc.onrender.com`.
-6. Pulse **Deploy**. Render mostrará una URL pública; compártala con los usuarios.
+5. Opcional: configure `OPENAI_MODEL`. Si no se define, el servidor usará `gpt-5`.
+6. Configure también `APP_URL` con la dirección que Render entregue, por ejemplo `https://inventario-icc1.onrender.com`.
+7. Pulse **Deploy**. Render mostrará una URL pública; compártala con los usuarios.
 
 ## 3. Usar documentos con IA de Codex/OpenAI
 
 El flujo correcto para una factura o guía es:
 
-1. Usuario toma una foto o adjunta PDF de la factura/guía.
-2. El servidor envía el documento a la capa de IA de OpenAI de forma segura.
-3. La IA extrae proveedor, fecha, productos, cantidades, unidad y precio.
-4. El sistema compara cada producto contra el catálogo y sus códigos.
-5. Si existe coincidencia, propone el código y el usuario confirma el ingreso.
-6. Si no existe coincidencia, abre el formulario manual para crear el producto o activo.
-7. Se guarda el documento original como respaldo del movimiento.
+1. Usuario abre **Digitalizar documentos**.
+2. Usuario toma una foto o adjunta PDF de la factura/guía.
+3. El servidor envía el documento a la capa de IA de OpenAI de forma segura.
+4. La IA extrae proveedor, fecha, productos, cantidades, unidad y posible código.
+5. El sistema compara cada producto contra el catálogo y sus códigos.
+6. Si existe coincidencia, propone el código y el usuario confirma el ingreso.
+7. Si no existe coincidencia, queda pendiente de registro manual.
+8. Se guarda un borrador IA y un registro del documento analizado.
+
+## 4. Usar IA con inspecciones existentes
+
+1. Usuario abre **Digitalizar documentos**.
+2. Selecciona **Formulario de inspección** y adjunta foto o PDF.
+3. La IA propone nombre del formulario, familia sugerida, checklist, campos y firmas.
+4. El usuario confirma para crear una plantilla borrador de inspección digital.
+5. La plantilla debe revisarse antes de usarse oficialmente en celular.
 
 ## Importante
 
