@@ -40,6 +40,21 @@ Roles disponibles:
 
 Importante: esta es una capa operativa inicial. Para seguridad definitiva conviene pasar luego a autenticación en servidor, con contraseña cifrada o enlace mágico.
 
+## Registro formal de documentos
+
+La app ahora centraliza respaldos en Reportes → Documentos y respaldos.
+
+Se registran automáticamente:
+
+- entregas a terreno;
+- solicitudes de aceptación EPP;
+- registros EPP aceptados digitalmente;
+- registros de inspección;
+- levantamientos de observaciones;
+- documentos analizados por IA.
+
+Por ahora algunos registros guardan sólo metadatos del archivo, como nombre, tipo, tamaño, fecha, código y referencia. Los registros EPP aceptados pueden descargarse como HTML firmado. La etapa productiva recomendada es mover los archivos reales a Supabase Storage o S3 compatible y dejar en la base de datos sólo la referencia segura.
+
 ## Próxima etapa recomendada
 
 1. Autenticación real:
