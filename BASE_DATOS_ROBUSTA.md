@@ -55,6 +55,19 @@ Se registran automáticamente:
 
 Por ahora algunos registros guardan sólo metadatos del archivo, como nombre, tipo, tamaño, fecha, código y referencia. Los registros EPP aceptados pueden descargarse como HTML firmado. La etapa productiva recomendada es mover los archivos reales a Supabase Storage o S3 compatible y dejar en la base de datos sólo la referencia segura.
 
+## Limpieza de eventos y auditoría de stock
+
+Se separaron handlers prioritarios para inspecciones, familias, bodegas, creación de centros de costo y plazos de corrección. Esto reduce el riesgo de ejecuciones duplicadas.
+
+El formulario principal de movimientos ahora guarda en cada movimiento:
+
+- stock antes del cambio;
+- stock después del cambio;
+- stock en origen;
+- stock en destino;
+- stock en tránsito;
+- total empresa antes/después.
+
 ## Próxima etapa recomendada
 
 1. Autenticación real:
