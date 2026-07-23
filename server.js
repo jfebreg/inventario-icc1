@@ -60,7 +60,7 @@ async function createNormalizedTables(client) {
   await client.query(`CREATE TABLE IF NOT EXISTS inventory_state_versions (id BIGSERIAL PRIMARY KEY, saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), saved_by TEXT, asset_count INTEGER, movement_count INTEGER, document_count INTEGER, payload JSONB)`);
 }
 
-async function syncNormalizedTables(client, state) {
+async function syncNormalizedTables(client, state, savedBy = "Sistema") {
   await client.query(`DELETE FROM inventory_asset_stock`);
   await client.query(`DELETE FROM inventory_workers`);
   await client.query(`DELETE FROM inventory_worker_signatures`);
@@ -68,7 +68,6 @@ async function syncNormalizedTables(client, state) {
   await client.query(`DELETE FROM inventory_ai_results`);
   await client.query(`DELETE FROM inventory_documents`);
   await client.query(`DELETE FROM inventory_inspections`);
-  await client.query(`DELETE FROM inventory_movements`);
   await client.query(`DELETE FROM inventory_assets`);
   await client.query(`DELETE FROM inventory_users`);
   await client.query(`DELETE FROM inventory_cost_centers`);
@@ -98,7 +97,7 @@ async function syncNormalizedTables(client, state) {
   }
   for (const [idx, m] of (state.movements || []).entries()) {
     const id = m.id || `legacy-${idx}-${m.code || "sin-codigo"}-${m.date || ""}`;
-    await client.query(`INSERT INTO inventory_movements (id, movement_date, code, action, user_name, from_location, to_location, quantity, status, detail, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)`, [id, m.date || "", m.code || "", m.action || "", m.user || "", m.from || "", m.to || "", Number(m.qty || 1), m.status || "", m.detail || "", asJson(m)]);
+    await client.query(`INSERT INTO inventory_movements (id, movement_date, code, action, user_name, from_location, to_location, quantity, status, detail, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT (id) DO NOTHING`, [id, m.date || "", m.code || "", m.action || "", m.user || "", m.from || "", m.to || "", Number(m.qty || 1), m.status || "", m.detail || "", asJson(m)]);
   }
   for (const i of state.inspections || []) {
     await client.query(`INSERT INTO inventory_inspections (id, asset_id, inspection_date, inspector, approver, result, notes, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,NOW())`, [i.id, i.assetId || "", i.date || "", i.inspector || "", i.approver || "", i.result || "", i.notes || "", asJson(i)]);
@@ -115,7 +114,7 @@ async function syncNormalizedTables(client, state) {
   for (const a of state.auditLog || []) {
     await client.query(`INSERT INTO inventory_audit_log (id, event_date, user_name, action, detail, payload) VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`, [a.id, a.date || new Date().toISOString(), a.user || "", a.action || "", a.detail || "", asJson(a)]);
   }
-  await client.query(`INSERT INTO inventory_state_versions (saved_by, asset_count, movement_count, document_count, payload) VALUES ($1,$2,$3,$4,$5::jsonb)`, [(state.users || [])[0]?.name || "Sistema", (state.assets || []).length, (state.movements || []).length, (state.documents || []).length, asJson({ savedAt: new Date().toISOString(), assetCount: (state.assets || []).length, movementCount: (state.movements || []).length })]);
+  await client.query(`INSERT INTO inventory_state_versions (saved_by, asset_count, movement_count, document_count, payload) VALUES ($1,$2,$3,$4,$5::jsonb)`, [savedBy || "Sistema", (state.assets || []).length, (state.movements || []).length, (state.documents || []).length, asJson({ savedAt: new Date().toISOString(), savedBy: savedBy || "Sistema", assetCount: (state.assets || []).length, movementCount: (state.movements || []).length })]);
 }
 
 async function analyzeWithOpenAI(body) {
@@ -199,7 +198,7 @@ const server = http.createServer(async (req, res) => {
       await client.query("BEGIN");
       await client.query(`INSERT INTO inventory_app_state (id, payload, updated_at) VALUES (1, $1::jsonb, NOW())
         ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, [JSON.stringify(body.state)]);
-      await syncNormalizedTables(client, body.state);
+      await syncNormalizedTables(client, body.state, body.savedBy || "Sistema");
       await client.query("COMMIT");
       return json(res, 200, { ok: true, normalized: true });
     } catch (error) {

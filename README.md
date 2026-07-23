@@ -1,4 +1,4 @@
-# Control de Activos
+﻿# Control de Activos
 
 Prototipo web local para control de activos y consumibles.
 
