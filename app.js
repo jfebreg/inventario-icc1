@@ -10,7 +10,7 @@
     { id:'obra', name:'Responsable Obra Túnel', initials:'OT', role:'Responsable centro de costo', costCenter:'Obra Túnel', admin:false }
   ],
   costCenters: [
-    { id:'central', name:'Bodega Central', inspectors:['Bodega Central'], approvers:['Bodega Central'], workers:['Trabajador Bodega Central|trabajador.central@empresa.cl'] },
+    { id:'central', name:'Bodega Central', inspectors:['Bodega Central'], approvers:['Bodega Central'], workers:['Trabajador Bodega Central|trabajador.central@empresa.cl','Julio Febre | jfebreg@msn.com | 56995575046'] },
     { id:'tunel', name:'Obra Túnel', inspectors:['Camila Soto','Jorge Pérez'], approvers:['Jefa de Obra Túnel'], workers:['Juan Pérez|juan.perez@empresa.cl','María González|maria.gonzalez@empresa.cl'] }
   ],
   assets: [
@@ -35,6 +35,7 @@ function repairTextState(value){if(Array.isArray(value))return value.map(repairT
 state=repairTextState(state);
 ensureInventoryModel();
 if(!state.families.some(f=>f.id==='epp'||String(f.name).toUpperCase()==='EPP'))state.families.push({id:'epp',name:'EPP',prefix:'EPP',serial:true,inspection:'EPP'});
+let julioWorker='Julio Febre | jfebreg@msn.com | 56995575046',centralCenter=state.costCenters.find(c=>c.name==='Bodega Central')||state.costCenters[0];if(centralCenter&&!centralCenter.workers.some(w=>/Julio Febre/i.test(w)))centralCenter.workers.push(julioWorker);
 localStorage.setItem(storageKey,JSON.stringify(state));
 if(!state.assets.some(a=>a.brand==='Distintec'&&a.name==='Eslinga sintética 2 capas')){
   let nextIzaje=Math.max(0,...state.assets.filter(a=>a.family==='izaje').map(a=>Number((a.code.match(/(\d+)$/)||['0','0'])[1])))+1;
@@ -60,7 +61,7 @@ function totalStock(a){ensureInventoryModel();return Object.values(a.stocks||{})
 function setStockAt(a,center,value){ensureInventoryModel();a.stocks[center]=Math.max(0,Number(value||0));a.stock=Object.entries(a.stocks).filter(([k])=>k!=='En tránsito').reduce((sum,[,v])=>sum+Number(v||0),0)}
 function moveStock(a,from,to,qty,status){ensureInventoryModel();qty=Math.max(1,Number(qty||1));from=from||a.location||activeUser().costCenter||'Bodega Central';to=to||activeUser().costCenter||'Bodega Central';let landing=status==='En tránsito'?'En tránsito':to;if(a.type==='Consumible'){if(from!==landing)setStockAt(a,from,stockAt(a,from)-qty);setStockAt(a,landing,stockAt(a,landing)+qty);a.status=a.stock<=Number(a.minimum||0)?'Stock bajo':'Disponible'}else{Object.keys(a.stocks).forEach(k=>a.stocks[k]=0);setStockAt(a,landing,1);a.location=landing;a.responsible=landing==='En tránsito'?`En tránsito a ${to}`:to;a.status=landing==='En tránsito'?'En tránsito':'Operativo';a.transferTo=landing==='En tránsito'?to:''}return {from,to,landing,qty}}
 function stockSummaryRows(){ensureInventoryModel();return state.assets.map(a=>`<tr><td><strong>${a.name}</strong><br><span class="code">${a.code}</span></td><td><strong>${totalStock(a)}</strong></td>${centerNames().map(c=>`<td>${stockAt(a,c)||''}</td>`).join('')}</tr>`).join('')}
-function parseWorker(raw,center){let [name,email,phone]=String(raw||'').split('|').map(x=>x.trim());return {name:name||raw,email:email||'',phone:phone||'',center:center.name}}
+function parseWorker(raw,center){let [name,email,phone]=String(raw||'').split(/[|;]/).map(x=>x.trim());return {name:name||raw,email:email||'',phone:phone||'',center:center.name}}
 function allWorkers(){ensureInventoryModel();return state.costCenters.filter(c=>c.name!=='En tránsito').flatMap(c=>(c.workers||[]).map(w=>parseWorker(w,c)))}
 function workerOptions(selected){let workers=allWorkers();return workers.length?workers.map(w=>`<option value="${w.name}|${w.email}|${w.phone}|${w.center}" ${w.name===selected?'selected':''}>${w.name} · ${w.center}${w.phone?` · ${w.phone}`:w.email?` · ${w.email}`:''}</option>`).join(''):'<option value="">Sin trabajadores configurados</option>'}
 function activeCustody(a){ensureInventoryModel();return state.assignments.find(x=>x.assetId===a.id&&x.kind==='Activo'&&x.status!=='Devuelto')}
