@@ -53,7 +53,22 @@ Se registran automáticamente:
 - levantamientos de observaciones;
 - documentos analizados por IA.
 
-Por ahora algunos registros guardan sólo metadatos del archivo, como nombre, tipo, tamaño, fecha, código y referencia. Los registros EPP aceptados pueden descargarse como HTML firmado. La etapa productiva recomendada es mover los archivos reales a Supabase Storage o S3 compatible y dejar en la base de datos sólo la referencia segura.
+Ahora el servidor incluye endpoint de archivo:
+
+- `POST /api/files/upload`: recibe adjuntos desde la app;
+- `GET /api/files/:id`: permite descargar el archivo archivado;
+- tabla `inventory_file_objects`: guarda metadatos, referencia y respaldo inicial.
+
+Si no se configura Supabase Storage, el sistema usa PostgreSQL como respaldo inicial para archivos pequeños. Esto permite avanzar y probar, pero para producción se recomienda Supabase Storage o S3.
+
+Variables opcionales para Supabase Storage en Render:
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_BUCKET`
+- `MAX_FILE_BYTES` opcional; por defecto 8 MB.
+
+Cuando esas variables existen, el servidor sube los archivos a Supabase Storage y conserva en la base de datos la referencia. Los registros EPP aceptados siguen pudiendo descargarse como HTML firmado.
 
 ## Limpieza de eventos y auditoría de stock
 

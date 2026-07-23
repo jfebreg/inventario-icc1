@@ -9,6 +9,7 @@ const root = fileURLToPath(new URL(".", import.meta.url));
 const port = Number(process.env.PORT || 3000);
 const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".jpg": "image/jpeg", ".png": "image/png", ".md": "text/markdown; charset=utf-8" };
 const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined }) : null;
+const maxFileBytes = Number(process.env.MAX_FILE_BYTES || 8_000_000);
 
 function json(res, status, value) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
@@ -38,6 +39,56 @@ function asJson(value) {
   return JSON.stringify(value ?? null);
 }
 
+function safeName(value) {
+  return String(value || "archivo").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\w.-]+/g, "_").slice(0, 120);
+}
+
+function decodeDataUrl(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:([^;,]+)?(;base64)?,(.*)$/);
+  if (!match) throw new Error("Archivo inválido");
+  const mimeType = match[1] || "application/octet-stream";
+  const data = match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3] || ""), "utf8");
+  if (data.length > maxFileBytes) throw new Error(`Archivo demasiado grande. Máximo permitido: ${Math.round(maxFileBytes / 1_000_000)} MB`);
+  return { mimeType, data, base64: data.toString("base64") };
+}
+
+async function uploadFileObject(body) {
+  if (!pool) throw new Error("DATABASE_URL no configurada");
+  const id = body.id || `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const filename = safeName(body.filename);
+  const category = safeName(body.category || "documentos");
+  const ref = String(body.ref || "");
+  const { mimeType, data, base64 } = decodeDataUrl(body.dataUrl);
+  let provider = "postgres";
+  let storagePath = "";
+  let publicUrl = "";
+
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET) {
+    provider = "supabase";
+    storagePath = `${category}/${new Date().toISOString().slice(0, 10)}/${id}-${filename}`;
+    const endpoint = `${process.env.SUPABASE_URL.replace(/\/$/, "")}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": mimeType,
+        "x-upsert": "true"
+      },
+      body: data
+    });
+    if (!response.ok) throw new Error(`No se pudo subir a Supabase Storage: ${await response.text()}`);
+    publicUrl = `${process.env.SUPABASE_URL.replace(/\/$/, "")}/storage/v1/object/${process.env.SUPABASE_BUCKET}/${storagePath}`;
+  }
+
+  await pool.query(`INSERT INTO inventory_file_objects (id, filename, mime_type, category, ref, size_bytes, provider, storage_path, public_url, data_base64, payload)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
+    ON CONFLICT (id) DO UPDATE SET filename=EXCLUDED.filename, mime_type=EXCLUDED.mime_type, category=EXCLUDED.category, ref=EXCLUDED.ref, size_bytes=EXCLUDED.size_bytes, provider=EXCLUDED.provider, storage_path=EXCLUDED.storage_path, public_url=EXCLUDED.public_url, data_base64=EXCLUDED.data_base64, payload=EXCLUDED.payload`,
+    [id, filename, mimeType, category, ref, data.length, provider, storagePath, publicUrl, provider === "postgres" ? base64 : "", asJson({ originalName: body.filename, uploadedBy: body.uploadedBy || "", code: body.code || "", center: body.center || "" })]);
+
+  return { id, filename, mimeType, size: data.length, provider, path: storagePath, publicUrl, downloadUrl: `/api/files/${encodeURIComponent(id)}` };
+}
+
 function parseWorkerLine(raw, center) {
   const [name, email, phone] = String(raw || "").split(/[|;]/).map(x => x.trim());
   return { id: `${center.id || center.name}:${name || raw}`.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: name || raw || "Sin nombre", email: email || "", phone: phone || "" };
@@ -58,6 +109,7 @@ async function createNormalizedTables(client) {
   await client.query(`CREATE TABLE IF NOT EXISTS inventory_inspection_templates (id TEXT PRIMARY KEY, name TEXT, family TEXT, source_draft TEXT, payload JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await client.query(`CREATE TABLE IF NOT EXISTS inventory_audit_log (id TEXT PRIMARY KEY, event_date TIMESTAMPTZ, user_name TEXT, action TEXT, detail TEXT, payload JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await client.query(`CREATE TABLE IF NOT EXISTS inventory_state_versions (id BIGSERIAL PRIMARY KEY, saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), saved_by TEXT, asset_count INTEGER, movement_count INTEGER, document_count INTEGER, payload JSONB)`);
+  await client.query(`CREATE TABLE IF NOT EXISTS inventory_file_objects (id TEXT PRIMARY KEY, filename TEXT, mime_type TEXT, category TEXT, ref TEXT, size_bytes NUMERIC, provider TEXT, storage_path TEXT, public_url TEXT, data_base64 TEXT, payload JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
 }
 
 async function syncNormalizedTables(client, state, savedBy = "Sistema") {
@@ -176,7 +228,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/api/health") {
-    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), openaiConfigured: Boolean(process.env.OPENAI_API_KEY) });
+    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), openaiConfigured: Boolean(process.env.OPENAI_API_KEY), fileStorageConfigured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET) });
   }
 
   if (url.pathname === "/api/state" && req.method === "GET") {
@@ -230,6 +282,40 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo analizar el documento" });
+    }
+  }
+
+  if (url.pathname === "/api/files/upload" && req.method === "POST") {
+    try {
+      const body = await readJson(req);
+      if (!body.filename || !body.dataUrl) return json(res, 400, { error: "Falta archivo" });
+      const result = await uploadFileObject(body);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el archivo" });
+    }
+  }
+
+  if (url.pathname.startsWith("/api/files/") && req.method === "GET") {
+    if (!pool) return json(res, 503, { error: "DATABASE_URL no configurada" });
+    try {
+      const id = decodeURIComponent(url.pathname.replace("/api/files/", ""));
+      const result = await pool.query("SELECT * FROM inventory_file_objects WHERE id = $1", [id]);
+      const row = result.rows[0];
+      if (!row) return json(res, 404, { error: "Archivo no encontrado" });
+      if (row.provider === "supabase" && row.storage_path && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET) {
+        const endpoint = `${process.env.SUPABASE_URL.replace(/\/$/, "")}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${String(row.storage_path).split("/").map(encodeURIComponent).join("/")}`;
+        const response = await fetch(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } });
+        if (!response.ok) throw new Error("No se pudo leer archivo desde Supabase");
+        const body = Buffer.from(await response.arrayBuffer());
+        res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"` });
+        return res.end(body);
+      }
+      const body = Buffer.from(row.data_base64 || "", "base64");
+      res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"` });
+      return res.end(body);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo descargar el archivo" });
     }
   }
 
