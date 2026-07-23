@@ -20,10 +20,55 @@ async function readJson(req) {
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 2_000_000) throw new Error("Solicitud demasiado grande");
+    if (size > 15_000_000) throw new Error("Solicitud demasiado grande");
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+function extractJson(text) {
+  const raw = String(text || "").trim();
+  try { return JSON.parse(raw); } catch {}
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("La IA no devolvió JSON válido");
+  return JSON.parse(match[0]);
+}
+
+async function analyzeWithOpenAI(body) {
+  if (!process.env.OPENAI_API_KEY) {
+    return { configured: false, result: null, message: "OPENAI_API_KEY no configurada en Render" };
+  }
+  const isInspection = body.kind === "inspection";
+  const schemaHint = isInspection
+    ? `{"documentType":"inspection","title":"","familySuggestion":"","checklist":[{"item":"","expectedAnswer":"Cumple/No cumple/No aplica","requiresEvidence":false}],"requiredFields":[""],"signatures":[""],"confidence":0}`
+    : `{"documentType":"purchase","supplier":"","supplierTaxId":"","folio":"","date":"","items":[{"description":"","quantity":1,"unit":"","brand":"","model":"","suggestedFamily":"","suggestedCode":"","confidence":0,"needsManualRegistration":false}],"confidence":0}`;
+  const catalog = (body.catalog || []).slice(0, 250).map(a => `${a.code} | ${a.name} | ${a.family} | ${a.type}`).join("\n");
+  const prompt = `Eres asistente de inventario ICC. Extrae datos desde el documento adjunto y responde SOLO JSON válido con esta forma: ${schemaHint}
+
+Reglas:
+- Si reconoces un producto del catálogo, usa suggestedCode.
+- Si no lo reconoces con seguridad, deja suggestedCode vacío y needsManualRegistration=true.
+- No inventes códigos.
+- Confianza entre 0 y 1.
+
+Catálogo disponible:
+${catalog}`;
+
+  const content = [{ type: "input_text", text: prompt }];
+  if (body.mime?.startsWith("image/")) content.push({ type: "input_image", image_url: body.dataUrl });
+  else content.push({ type: "input_file", filename: body.filename || "documento.pdf", file_data: body.dataUrl });
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: process.env.OPENAI_MODEL || "gpt-5",
+      input: [{ role: "user", content }]
+    })
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error?.message || "No se pudo analizar con OpenAI");
+  return { configured: true, result: extractJson(payload.output_text), rawModel: payload.model };
 }
 
 async function setupDatabase() {
@@ -66,6 +111,17 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo guardar" });
+    }
+  }
+
+  if (url.pathname === "/api/ai/analyze" && req.method === "POST") {
+    try {
+      const body = await readJson(req);
+      if (!body.kind || !body.filename || !body.dataUrl) return json(res, 400, { error: "Faltan datos del documento" });
+      const result = await analyzeWithOpenAI(body);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo analizar el documento" });
     }
   }
 
