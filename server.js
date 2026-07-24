@@ -4,6 +4,7 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import QRCode from "qrcode";
+import PDFDocument from "pdfkit";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const port = Number(process.env.PORT || 3000);
@@ -58,6 +59,80 @@ function decodeDataUrl(dataUrl) {
   const data = match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3] || ""), "utf8");
   if (data.length > maxFileBytes) throw new Error(`Archivo demasiado grande. Máximo permitido: ${Math.round(maxFileBytes / 1_000_000)} MB`);
   return { mimeType, data, base64: data.toString("base64") };
+}
+
+function dataUrlBuffer(value) {
+  if (!value) return null;
+  try { return decodeDataUrl(value).data; } catch { return null; }
+}
+
+function pdfText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim() || "—";
+}
+
+function drawSignature(doc, x, y, title, name, dataUrl) {
+  doc.font("Helvetica-Bold").fontSize(10).fillColor("#10251c").text(title, x, y, { width: 210 });
+  const img = dataUrlBuffer(dataUrl);
+  if (img) {
+    try { doc.image(img, x, y + 18, { fit: [180, 55] }); } catch {}
+  } else {
+    doc.moveTo(x, y + 72).lineTo(x + 200, y + 72).strokeColor("#10251c").stroke();
+  }
+  doc.font("Helvetica").fontSize(9).fillColor("#10251c").text(pdfText(name), x, y + 80, { width: 210 });
+}
+
+async function createInspectionPdf(body) {
+  const chunks = [];
+  const doc = new PDFDocument({ size: "A4", margin: 42, info: { Title: `Inspección ${body?.asset?.code || ""}` } });
+  doc.on("data", c => chunks.push(c));
+  const done = new Promise(resolve => doc.on("end", () => resolve(Buffer.concat(chunks))));
+  const logoPath = join(root, "logo-icc.jpg");
+  try { doc.image(logoPath, 42, 36, { fit: [62, 62] }); } catch {}
+  doc.font("Helvetica-Bold").fontSize(17).text("Registro de inspección", 118, 42);
+  doc.font("Helvetica").fontSize(9).text("ICC Piping · Control de Activos", 118, 64);
+  doc.font("Helvetica-Bold").fontSize(13).fillColor("#006b3a").text(pdfText(body?.asset?.code), 118, 82);
+  doc.fillColor("#10251c").moveDown(2);
+  const left = 42, right = 306, w = 235;
+  const row = (label, value, x, y) => {
+    doc.roundedRect(x, y, w, 42, 6).strokeColor("#d7e2dc").stroke();
+    doc.fillColor("#50635a").font("Helvetica").fontSize(8).text(label, x + 9, y + 8, { width: w - 18 });
+    doc.fillColor("#10251c").font("Helvetica-Bold").fontSize(10).text(pdfText(value), x + 9, y + 22, { width: w - 18 });
+  };
+  let y = 122;
+  row("Activo", body?.asset?.name, left, y); row("Familia", body?.familyName, right, y); y += 52;
+  row("Fecha", body?.inspection?.date, left, y); row("Resultado", body?.inspection?.result, right, y); y += 52;
+  row("Inspector", body?.inspection?.inspector, left, y); row("Aprobador / revisor", body?.inspection?.approver || body?.inspection?.reviewer, right, y); y += 52;
+  row("Proyecto / obra", body?.inspection?.project || body?.asset?.location, left, y); row("Registro adjunto", body?.inspection?.documentName, right, y); y += 62;
+  doc.font("Helvetica-Bold").fontSize(13).text("Checklist", left, y); y += 20;
+  doc.font("Helvetica").fontSize(9);
+  const answers = body?.inspection?.answers || [];
+  if (!answers.length) doc.text("Sin respuestas registradas.", left, y);
+  for (const item of answers) {
+    const label = pdfText(String(item?.[0] || "").replace(/^result-/, "Punto "));
+    const value = pdfText(item?.[1]);
+    if (doc.y > 700) doc.addPage();
+    doc.font("Helvetica").text(label, left, doc.y, { width: 350, continued: true });
+    doc.font("Helvetica-Bold").text(`  ${value}`, { width: 120 });
+  }
+  doc.moveDown();
+  doc.font("Helvetica-Bold").fontSize(13).text("Observaciones");
+  doc.font("Helvetica").fontSize(10).text(pdfText(body?.inspection?.notes || "Sin observaciones."), { width: 500 });
+  const evidence = dataUrlBuffer(body?.evidenceImage);
+  if (evidence) {
+    doc.moveDown();
+    doc.font("Helvetica-Bold").fontSize(13).text("Imagen adjunta de respaldo");
+    try { doc.image(evidence, { fit: [500, 260], align: "center" }); } catch { doc.font("Helvetica").text("No se pudo insertar la imagen adjunta."); }
+  }
+  if (doc.y > 620) doc.addPage();
+  doc.moveDown();
+  doc.font("Helvetica-Bold").fontSize(13).text("Firmas");
+  const sigY = doc.y + 16;
+  drawSignature(doc, left, sigY, "Firma inspector", body?.inspection?.inspector, body?.inspectorSignature);
+  drawSignature(doc, right, sigY, "Firma aprobador / revisor", body?.inspection?.approver || body?.inspection?.reviewer, body?.approverSignature);
+  doc.y = sigY + 112;
+  doc.font("Helvetica").fontSize(8).fillColor("#50635a").text(`Documento generado automáticamente por la aplicación el ${new Date().toLocaleString("es-CL")}. Si falta una firma digital, el espacio queda disponible para firma manual.`, left, doc.y, { width: 500 });
+  doc.end();
+  return done;
 }
 
 async function uploadFileObject(body) {
@@ -330,6 +405,24 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       console.error("Error subiendo archivo:", error.message);
       return json(res, 400, { error: error.message || "No se pudo guardar el archivo" });
+    }
+  }
+
+  if (url.pathname === "/api/inspection/pdf" && req.method === "POST") {
+    try {
+      const body = await readJson(req);
+      const pdf = await createInspectionPdf(body);
+      const code = safeName(body?.asset?.code || "inspeccion");
+      const date = safeName(body?.inspection?.date || new Date().toISOString().slice(0, 10));
+      res.writeHead(200, {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `attachment; filename="Inspeccion_${code}_${date}.pdf"`,
+        "Cache-Control": "no-store"
+      });
+      return res.end(pdf);
+    } catch (error) {
+      console.error("Error generando PDF de inspección:", error.message);
+      return json(res, 400, { error: error.message || "No se pudo generar el PDF de inspección" });
     }
   }
 
