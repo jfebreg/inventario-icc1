@@ -11,6 +11,14 @@ const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; cha
 const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined }) : null;
 const maxFileBytes = Number(process.env.MAX_FILE_BYTES || 8_000_000);
 
+function supabaseBaseUrl() {
+  return String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "").replace(/\/rest\/v1$/i, "");
+}
+
+function storageConfigured() {
+  return Boolean(supabaseBaseUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET);
+}
+
 function json(res, status, value) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(value));
@@ -63,10 +71,10 @@ async function uploadFileObject(body) {
   let storagePath = "";
   let publicUrl = "";
 
-  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET) {
+  if (storageConfigured()) {
     provider = "supabase";
     storagePath = `${category}/${new Date().toISOString().slice(0, 10)}/${id}-${filename}`;
-    const endpoint = `${process.env.SUPABASE_URL.replace(/\/$/, "")}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
+    const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -78,7 +86,7 @@ async function uploadFileObject(body) {
       body: data
     });
     if (!response.ok) throw new Error(`No se pudo subir a Supabase Storage: ${await response.text()}`);
-    publicUrl = `${process.env.SUPABASE_URL.replace(/\/$/, "")}/storage/v1/object/${process.env.SUPABASE_BUCKET}/${storagePath}`;
+    publicUrl = `${supabaseBaseUrl()}/storage/v1/object/${process.env.SUPABASE_BUCKET}/${storagePath}`;
   }
 
   await pool.query(`INSERT INTO inventory_file_objects (id, filename, mime_type, category, ref, size_bytes, provider, storage_path, public_url, data_base64, payload)
@@ -228,7 +236,35 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/api/health") {
-    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), openaiConfigured: Boolean(process.env.OPENAI_API_KEY), fileStorageConfigured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET) });
+    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), openaiConfigured: Boolean(process.env.OPENAI_API_KEY), fileStorageConfigured: storageConfigured() });
+  }
+
+  if (url.pathname === "/api/storage/status") {
+    if (!pool) return json(res, 503, { ok: false, database: false, error: "DATABASE_URL no configurada" });
+    const status = {
+      ok: false,
+      database: true,
+      supabaseConfigured: storageConfigured(),
+      bucket: process.env.SUPABASE_BUCKET || "",
+      baseUrl: supabaseBaseUrl(),
+      urlWasRestEndpoint: /\/rest\/v1\/?$/i.test(String(process.env.SUPABASE_URL || "")),
+      recentFiles: []
+    };
+    try {
+      const recent = await pool.query("SELECT id, filename, provider, storage_path, size_bytes, created_at FROM inventory_file_objects ORDER BY created_at DESC LIMIT 10");
+      status.recentFiles = recent.rows;
+      if (storageConfigured()) {
+        const endpoint = `${supabaseBaseUrl()}/storage/v1/bucket/${encodeURIComponent(process.env.SUPABASE_BUCKET)}`;
+        const response = await fetch(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } });
+        status.supabaseReachable = response.ok;
+        if (!response.ok) status.supabaseError = await response.text();
+      }
+      status.ok = Boolean(status.database && (!status.supabaseConfigured || status.supabaseReachable));
+      return json(res, 200, status);
+    } catch (error) {
+      status.error = error.message;
+      return json(res, 400, status);
+    }
   }
 
   if (url.pathname === "/api/state" && req.method === "GET") {
@@ -292,6 +328,7 @@ const server = http.createServer(async (req, res) => {
       const result = await uploadFileObject(body);
       return json(res, 200, result);
     } catch (error) {
+      console.error("Error subiendo archivo:", error.message);
       return json(res, 400, { error: error.message || "No se pudo guardar el archivo" });
     }
   }
@@ -303,8 +340,8 @@ const server = http.createServer(async (req, res) => {
       const result = await pool.query("SELECT * FROM inventory_file_objects WHERE id = $1", [id]);
       const row = result.rows[0];
       if (!row) return json(res, 404, { error: "Archivo no encontrado" });
-      if (row.provider === "supabase" && row.storage_path && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET) {
-        const endpoint = `${process.env.SUPABASE_URL.replace(/\/$/, "")}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${String(row.storage_path).split("/").map(encodeURIComponent).join("/")}`;
+      if (row.provider === "supabase" && row.storage_path && storageConfigured()) {
+        const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${String(row.storage_path).split("/").map(encodeURIComponent).join("/")}`;
         const response = await fetch(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } });
         if (!response.ok) throw new Error("No se pudo leer archivo desde Supabase");
         const body = Buffer.from(await response.arrayBuffer());
