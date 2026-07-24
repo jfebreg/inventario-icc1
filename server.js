@@ -123,18 +123,41 @@ async function createInspectionPdf(body) {
   row("Fecha", body?.inspection?.date, left, y); row("Resultado", body?.inspection?.result, right, y); y += 52;
   row("Inspector", body?.inspection?.inspector, left, y); row("Aprobador / revisor", body?.inspection?.approver || body?.inspection?.reviewer, right, y); y += 52;
   row("Proyecto / obra", body?.inspection?.project || body?.asset?.location, left, y); row("Registro adjunto", body?.inspection?.documentName, right, y); y += 62;
-  doc.font("Helvetica-Bold").fontSize(13).text("Checklist", left, y); y += 20;
-  doc.font("Helvetica").fontSize(9);
+  doc.font("Helvetica-Bold").fontSize(13).fillColor("#10251c").text("Checklist de inspección", left, y); y += 22;
   const answers = body?.inspection?.answers || [];
   if (!answers.length) doc.text("Sin respuestas registradas.", left, y);
-  for (const item of answers) {
+  else {
+    const tableX = left, colItem = 300, colResult = 88, colNote = 112, rowH = 28;
+    const drawHeader = () => {
+      if (doc.y > 720) doc.addPage();
+      const hy = doc.y;
+      doc.roundedRect(tableX, hy, 500, rowH, 6).fillAndStroke("#eef7f1", "#d7e2dc");
+      doc.fillColor("#10251c").font("Helvetica-Bold").fontSize(8.5);
+      doc.text("Punto revisado", tableX + 10, hy + 9, { width: colItem - 16 });
+      doc.text("Resultado", tableX + colItem + 8, hy + 9, { width: colResult - 12, align: "center" });
+      doc.text("Observación", tableX + colItem + colResult + 8, hy + 9, { width: colNote - 12 });
+      doc.y = hy + rowH;
+    };
+    drawHeader();
+    answers.forEach((item, idx) => {
     const label = pdfText(inspectionItemLabel(item));
     const value = pdfText(item?.result || item?.value || item?.[1]);
     const note = pdfText(item?.note || item?.[3] || "");
-    if (doc.y > 700) doc.addPage();
-    doc.font("Helvetica").text(label, left, doc.y, { width: 345, continued: true });
-    doc.font("Helvetica-Bold").text(`  ${value}`, { width: 130 });
-    if (note !== "—") doc.font("Helvetica").fontSize(8).fillColor("#50635a").text(`Observación: ${note}`, left + 12, doc.y, { width: 480 }).fontSize(9).fillColor("#10251c");
+      if (doc.y > 720) drawHeader();
+      const y0 = doc.y, fill = idx % 2 === 0 ? "#ffffff" : "#f8fbf9";
+      const labelH = doc.heightOfString(label, { width: colItem - 18 });
+      const noteText = note === "—" ? "" : note;
+      const noteH = doc.heightOfString(noteText || "—", { width: colNote - 18 });
+      const h = Math.max(30, labelH + 16, noteH + 16);
+      doc.rect(tableX, y0, 500, h).fillAndStroke(fill, "#d7e2dc");
+      doc.fillColor("#10251c").font("Helvetica").fontSize(9).text(label, tableX + 10, y0 + 8, { width: colItem - 18 });
+      const badgeColor = value === "Cumple" ? "#d8f7df" : value === "No cumple" ? "#ffe0e0" : "#eef1f0";
+      const badgeText = value === "Cumple" ? "#006b3a" : value === "No cumple" ? "#b42318" : "#50635a";
+      doc.roundedRect(tableX + colItem + 15, y0 + 7, colResult - 30, 17, 8).fill(badgeColor);
+      doc.fillColor(badgeText).font("Helvetica-Bold").fontSize(8).text(value, tableX + colItem + 15, y0 + 11, { width: colResult - 30, align: "center" });
+      doc.fillColor("#50635a").font("Helvetica").fontSize(8).text(noteText || "—", tableX + colItem + colResult + 10, y0 + 8, { width: colNote - 18 });
+      doc.y = y0 + h;
+    });
   }
   doc.moveDown();
   doc.font("Helvetica-Bold").fontSize(13).text("Observaciones");
