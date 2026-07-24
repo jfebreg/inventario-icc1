@@ -101,14 +101,16 @@ function drawSignature(doc, x, y, title, name, dataUrl) {
 
 async function createInspectionPdf(body) {
   const chunks = [];
+  const organization = body?.organization || { name: "Ingeniería y Construcción Chile", rut: "76.267.071-2", address: "Panamá 8854, La Florida, Santiago", label: "Control de Activos" };
   const doc = new PDFDocument({ size: "A4", margin: 42, info: { Title: `Inspección ${body?.asset?.code || ""}` } });
   doc.on("data", c => chunks.push(c));
   const done = new Promise(resolve => doc.on("end", () => resolve(Buffer.concat(chunks))));
   const logoPath = join(root, "logo-icc.jpg");
   try { doc.image(logoPath, 42, 36, { fit: [62, 62] }); } catch {}
   doc.font("Helvetica-Bold").fontSize(17).text("Registro de inspección", 118, 42);
-  doc.font("Helvetica").fontSize(9).text("ICC Piping · Control de Activos", 118, 64);
-  doc.font("Helvetica-Bold").fontSize(13).fillColor("#006b3a").text(pdfText(body?.asset?.code), 118, 82);
+  doc.font("Helvetica").fontSize(9).text(`${pdfText(organization.name)} · ${pdfText(organization.label || "Control de Activos")}`, 118, 64);
+  doc.font("Helvetica").fontSize(8).fillColor("#50635a").text(`RUT ${pdfText(organization.rut)} · ${pdfText(organization.address)}`, 118, 76, { width: 390 });
+  doc.font("Helvetica-Bold").fontSize(13).fillColor("#006b3a").text(pdfText(body?.asset?.code), 118, 92);
   doc.fillColor("#10251c").moveDown(2);
   const left = 42, right = 306, w = 235;
   const row = (label, value, x, y) => {
