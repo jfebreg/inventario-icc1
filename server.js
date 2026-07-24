@@ -108,11 +108,13 @@ async function createInspectionPdf(body) {
   const answers = body?.inspection?.answers || [];
   if (!answers.length) doc.text("Sin respuestas registradas.", left, y);
   for (const item of answers) {
-    const label = pdfText(String(item?.[0] || "").replace(/^result-/, "Punto "));
-    const value = pdfText(item?.[1]);
+    const label = pdfText(item?.item || item?.label || item?.[2] || String(item?.[0] || "").replace(/^result-/, "Punto "));
+    const value = pdfText(item?.result || item?.value || item?.[1]);
+    const note = pdfText(item?.note || item?.[3] || "");
     if (doc.y > 700) doc.addPage();
-    doc.font("Helvetica").text(label, left, doc.y, { width: 350, continued: true });
-    doc.font("Helvetica-Bold").text(`  ${value}`, { width: 120 });
+    doc.font("Helvetica").text(label, left, doc.y, { width: 345, continued: true });
+    doc.font("Helvetica-Bold").text(`  ${value}`, { width: 130 });
+    if (note !== "—") doc.font("Helvetica").fontSize(8).fillColor("#50635a").text(`Observación: ${note}`, left + 12, doc.y, { width: 480 }).fontSize(9).fillColor("#10251c");
   }
   doc.moveDown();
   doc.font("Helvetica-Bold").fontSize(13).text("Observaciones");
@@ -120,8 +122,10 @@ async function createInspectionPdf(body) {
   const evidence = dataUrlBuffer(body?.evidenceImage);
   if (evidence) {
     doc.moveDown();
+    if (doc.y > 430) doc.addPage();
     doc.font("Helvetica-Bold").fontSize(13).text("Imagen adjunta de respaldo");
-    try { doc.image(evidence, { fit: [500, 260], align: "center" }); } catch { doc.font("Helvetica").text("No se pudo insertar la imagen adjunta."); }
+    const imageY = doc.y + 8;
+    try { doc.image(evidence, left, imageY, { fit: [500, 260], align: "center" }); doc.y = imageY + 275; } catch { doc.font("Helvetica").text("No se pudo insertar la imagen adjunta."); }
   }
   if (doc.y > 620) doc.addPage();
   doc.moveDown();
