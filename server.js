@@ -70,6 +70,24 @@ function pdfText(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim() || "—";
 }
 
+const defaultInspectionItems = [
+  "Etiqueta o marcaje legible (WLL)",
+  "Sin cortes, desgaste o deformaciones",
+  "Sin corrosión excesiva",
+  "Uso acorde al ángulo de izaje",
+  "Ganchos con seguro operativo",
+  "Sin fisuras, deformaciones o desgaste",
+  "Capacidad compatible con la carga"
+];
+
+function inspectionItemLabel(item) {
+  const raw = String(item?.item || item?.label || item?.[2] || String(item?.[0] || "")).trim();
+  const direct = raw.match(/^Punto\s+(\d+)$/i);
+  const resultKey = raw.match(/^result-(\d+)$/i);
+  const idx = direct ? Number(direct[1]) : resultKey ? Number(resultKey[1]) : -1;
+  return defaultInspectionItems[idx] || raw.replace(/^result-/, "Punto ") || "Punto revisado";
+}
+
 function drawSignature(doc, x, y, title, name, dataUrl) {
   doc.font("Helvetica-Bold").fontSize(10).fillColor("#10251c").text(title, x, y, { width: 210 });
   const img = dataUrlBuffer(dataUrl);
@@ -108,7 +126,7 @@ async function createInspectionPdf(body) {
   const answers = body?.inspection?.answers || [];
   if (!answers.length) doc.text("Sin respuestas registradas.", left, y);
   for (const item of answers) {
-    const label = pdfText(item?.item || item?.label || item?.[2] || String(item?.[0] || "").replace(/^result-/, "Punto "));
+    const label = pdfText(inspectionItemLabel(item));
     const value = pdfText(item?.result || item?.value || item?.[1]);
     const note = pdfText(item?.note || item?.[3] || "");
     if (doc.y > 700) doc.addPage();
@@ -134,7 +152,7 @@ async function createInspectionPdf(body) {
   drawSignature(doc, left, sigY, "Firma inspector", body?.inspection?.inspector, body?.inspectorSignature);
   drawSignature(doc, right, sigY, "Firma aprobador / revisor", body?.inspection?.approver || body?.inspection?.reviewer, body?.approverSignature);
   doc.y = sigY + 112;
-  doc.font("Helvetica").fontSize(8).fillColor("#50635a").text(`Documento generado automáticamente por la aplicación el ${new Date().toLocaleString("es-CL")}. Si falta una firma digital, el espacio queda disponible para firma manual.`, left, doc.y, { width: 500 });
+  doc.font("Helvetica").fontSize(8).fillColor("#50635a").text(`Documento generado automáticamente por la aplicación el ${new Date().toLocaleString("es-CL")}.`, left, doc.y, { width: 500 });
   doc.end();
   return done;
 }
