@@ -5,12 +5,22 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import QRCode from "qrcode";
 import PDFDocument from "pdfkit";
+import { createClient } from "@supabase/supabase-js";
+import { timingSafeEqual } from "node:crypto";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const port = Number(process.env.PORT || 3000);
 const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".jpg": "image/jpeg", ".png": "image/png", ".md": "text/markdown; charset=utf-8" };
 const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined }) : null;
 const maxFileBytes = Number(process.env.MAX_FILE_BYTES || 8_000_000);
+const initialAdmin = {
+  legacyUserId: "julio-febre",
+  name: "Julio Febre",
+  email: "jfebreg@msn.com",
+  role: "Administrador central",
+  costCenter: "Bodega Central",
+  initials: "JF"
+};
 
 function supabaseBaseUrl() {
   return String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "").replace(/\/rest\/v1$/i, "");
@@ -18,6 +28,22 @@ function supabaseBaseUrl() {
 
 function storageConfigured() {
   return Boolean(supabaseBaseUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.SUPABASE_BUCKET);
+}
+
+function authConfigured() {
+  return Boolean(supabaseBaseUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY && (process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY));
+}
+
+const supabaseAdmin = supabaseBaseUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(supabaseBaseUrl(), process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false }
+    })
+  : null;
+
+function safeTokenEqual(actual, expected) {
+  const a = Buffer.from(String(actual || ""));
+  const b = Buffer.from(String(expected || ""));
+  return a.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
 
 function json(res, status, value) {
@@ -242,39 +268,332 @@ async function createNormalizedTables(client) {
   await client.query(`CREATE TABLE IF NOT EXISTS inventory_file_objects (id TEXT PRIMARY KEY, filename TEXT, mime_type TEXT, category TEXT, ref TEXT, size_bytes NUMERIC, provider TEXT, storage_path TEXT, public_url TEXT, data_base64 TEXT, payload JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
 }
 
-async function syncNormalizedTables(client, state, savedBy = "Sistema") {
-  await client.query(`DELETE FROM inventory_asset_stock`);
-  await client.query(`DELETE FROM inventory_workers`);
-  await client.query(`DELETE FROM inventory_worker_signatures`);
-  await client.query(`DELETE FROM inventory_inspection_templates`);
-  await client.query(`DELETE FROM inventory_ai_results`);
-  await client.query(`DELETE FROM inventory_documents`);
-  await client.query(`DELETE FROM inventory_inspections`);
-  await client.query(`DELETE FROM inventory_assets`);
-  await client.query(`DELETE FROM inventory_users`);
-  await client.query(`DELETE FROM inventory_cost_centers`);
-  await client.query(`DELETE FROM inventory_families`);
+async function createAuthAndRealtimeTables(client) {
+  await client.query(`CREATE TABLE IF NOT EXISTS inventory_auth_settings (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    migration_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    bootstrap_used BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await client.query(`INSERT INTO inventory_auth_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
+  await client.query(`CREATE TABLE IF NOT EXISTS inventory_user_profiles (
+    id TEXT PRIMARY KEY,
+    auth_user_id UUID UNIQUE,
+    legacy_user_id TEXT UNIQUE,
+    name TEXT NOT NULL,
+    email TEXT,
+    initials TEXT,
+    role TEXT NOT NULL DEFAULT 'Usuario',
+    cost_center TEXT NOT NULL DEFAULT 'Bodega Central',
+    admin BOOLEAN NOT NULL DEFAULT FALSE,
+    permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    invitation_status TEXT NOT NULL DEFAULT 'Pendiente correo',
+    invited_at TIMESTAMPTZ,
+    activated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await client.query(`CREATE INDEX IF NOT EXISTS inventory_user_profiles_center_idx ON inventory_user_profiles(cost_center)`);
+  await client.query(`CREATE TABLE IF NOT EXISTS inventory_worker_enrollments (
+    id TEXT PRIMARY KEY,
+    rut TEXT,
+    name TEXT NOT NULL,
+    company TEXT,
+    job_title TEXT,
+    cost_center TEXT NOT NULL,
+    email TEXT,
+    phone TEXT,
+    signature_file_id TEXT,
+    signature_data TEXT,
+    status TEXT NOT NULL DEFAULT 'Firma pendiente',
+    access_profile_id TEXT,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS inventory_worker_enrollments_rut_idx ON inventory_worker_enrollments ((UPPER(REPLACE(REPLACE(rut,'.',''),'-','')))) WHERE rut IS NOT NULL AND BTRIM(rut) <> ''`);
+  await client.query(`CREATE INDEX IF NOT EXISTS inventory_worker_enrollments_center_idx ON inventory_worker_enrollments(cost_center)`);
+  await client.query(`CREATE TABLE IF NOT EXISTS inventory_tasks (
+    id TEXT PRIMARY KEY,
+    task_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT,
+    priority TEXT NOT NULL DEFAULT 'Media',
+    status TEXT NOT NULL DEFAULT 'Pendiente',
+    center_name TEXT,
+    assignee_auth_user_id UUID,
+    entity_type TEXT,
+    entity_id TEXT,
+    due_at TIMESTAMPTZ,
+    created_by UUID,
+    resolved_at TIMESTAMPTZ,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await client.query(`CREATE INDEX IF NOT EXISTS inventory_tasks_center_status_idx ON inventory_tasks(center_name, status)`);
+  await client.query(`CREATE TABLE IF NOT EXISTS inventory_notifications (
+    id TEXT PRIMARY KEY,
+    recipient_auth_user_id UUID,
+    center_name TEXT,
+    notification_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    severity TEXT NOT NULL DEFAULT 'info',
+    entity_type TEXT,
+    entity_id TEXT,
+    read_at TIMESTAMPTZ,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await client.query(`CREATE INDEX IF NOT EXISTS inventory_notifications_recipient_idx ON inventory_notifications(recipient_auth_user_id, read_at)`);
 
+  await client.query(`CREATE OR REPLACE FUNCTION public.inventory_is_admin()
+    RETURNS BOOLEAN LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = public
+    AS $$ SELECT COALESCE((SELECT admin AND active FROM public.inventory_user_profiles WHERE auth_user_id = auth.uid()), FALSE) $$`);
+  await client.query(`CREATE OR REPLACE FUNCTION public.inventory_user_center()
+    RETURNS TEXT LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = public
+    AS $$ SELECT cost_center FROM public.inventory_user_profiles WHERE auth_user_id = auth.uid() AND active LIMIT 1 $$`);
+
+  const serverOnlyTables = [
+    "inventory_app_state", "inventory_families", "inventory_cost_centers", "inventory_users",
+    "inventory_assets", "inventory_asset_stock", "inventory_movements", "inventory_workers",
+    "inventory_worker_signatures", "inventory_inspections", "inventory_documents", "inventory_ai_results",
+    "inventory_inspection_templates", "inventory_audit_log", "inventory_state_versions", "inventory_file_objects"
+  ];
+  for (const table of serverOnlyTables) {
+    await client.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+    await client.query(`REVOKE ALL ON ${table} FROM anon, authenticated`);
+  }
+  for (const table of ["inventory_user_profiles", "inventory_worker_enrollments", "inventory_tasks", "inventory_notifications"]) {
+    await client.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+    await client.query(`REVOKE ALL ON ${table} FROM anon, authenticated`);
+    await client.query(`GRANT SELECT ON ${table} TO authenticated`);
+  }
+  await client.query(`DROP POLICY IF EXISTS inventory_profiles_read ON inventory_user_profiles`);
+  await client.query(`CREATE POLICY inventory_profiles_read ON inventory_user_profiles FOR SELECT TO authenticated
+    USING (auth_user_id = auth.uid() OR public.inventory_is_admin())`);
+  await client.query(`DROP POLICY IF EXISTS inventory_workers_read ON inventory_worker_enrollments`);
+  await client.query(`CREATE POLICY inventory_workers_read ON inventory_worker_enrollments FOR SELECT TO authenticated
+    USING (public.inventory_is_admin() OR cost_center = public.inventory_user_center())`);
+  await client.query(`DROP POLICY IF EXISTS inventory_tasks_read ON inventory_tasks`);
+  await client.query(`CREATE POLICY inventory_tasks_read ON inventory_tasks FOR SELECT TO authenticated
+    USING (public.inventory_is_admin() OR assignee_auth_user_id = auth.uid() OR center_name = public.inventory_user_center())`);
+  await client.query(`DROP POLICY IF EXISTS inventory_notifications_read ON inventory_notifications`);
+  await client.query(`CREATE POLICY inventory_notifications_read ON inventory_notifications FOR SELECT TO authenticated
+    USING (public.inventory_is_admin() OR recipient_auth_user_id = auth.uid() OR (recipient_auth_user_id IS NULL AND center_name = public.inventory_user_center()))`);
+
+  for (const table of ["inventory_tasks", "inventory_notifications"]) {
+    try {
+      await client.query(`ALTER PUBLICATION supabase_realtime ADD TABLE ${table}`);
+    } catch (error) {
+      if (!/already|publication.*does not exist/i.test(error.message)) throw error;
+    }
+  }
+}
+
+function defaultPermissions(role, admin = false) {
+  if (admin || role === "Administrador central") return ["view", "inspect", "approve", "move", "receive", "terrain", "print", "workers", "admin", "ai", "audit"];
+  if (role === "Responsable centro de costo") return ["view", "inspect", "approve", "move", "receive", "terrain", "print", "workers"];
+  return ["view", "inspect"];
+}
+
+async function migrateLegacyIdentityData(client) {
+  const stateResult = await client.query("SELECT payload FROM inventory_app_state WHERE id = 1");
+  const state = stateResult.rows[0]?.payload || {};
+  const legacyUsers = Array.isArray(state.users) ? state.users : [];
+  for (const user of legacyUsers) {
+    const role = user.role || (user.admin ? "Administrador central" : "Usuario");
+    await client.query(`INSERT INTO inventory_user_profiles
+      (id, legacy_user_id, name, email, initials, role, cost_center, admin, permissions, active, invitation_status, updated_at)
+      VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8::jsonb,TRUE,$9,NOW())
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, initials=EXCLUDED.initials, role=EXCLUDED.role,
+      cost_center=EXCLUDED.cost_center, admin=EXCLUDED.admin, permissions=EXCLUDED.permissions, updated_at=NOW()`,
+      [String(user.id), user.name || "Usuario", user.email || "", user.initials || "", role, user.costCenter || "Bodega Central", Boolean(user.admin), asJson(defaultPermissions(role, user.admin)), user.email ? "Pendiente invitación" : "Pendiente correo"]);
+  }
+  await client.query(`INSERT INTO inventory_user_profiles
+    (id, legacy_user_id, name, email, initials, role, cost_center, admin, permissions, active, invitation_status, updated_at)
+    VALUES ($1,$1,$2,$3,$4,$5,$6,TRUE,$7::jsonb,TRUE,'Administrador inicial',NOW())
+    ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, email=EXCLUDED.email, role=EXCLUDED.role,
+    cost_center=EXCLUDED.cost_center, admin=TRUE, permissions=EXCLUDED.permissions, active=TRUE, updated_at=NOW()`,
+    [initialAdmin.legacyUserId, initialAdmin.name, initialAdmin.email, initialAdmin.initials, initialAdmin.role, initialAdmin.costCenter, asJson(defaultPermissions(initialAdmin.role, true))]);
+
+  for (const center of state.costCenters || []) {
+    for (const raw of center.workers || []) {
+      const worker = parseWorkerLine(raw, center);
+      const signature = state.workerSignatures?.[worker.name] || "";
+      await client.query(`INSERT INTO inventory_worker_enrollments
+        (id, name, cost_center, email, phone, signature_data, status, payload, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,NOW())
+        ON CONFLICT (id) DO UPDATE SET email=EXCLUDED.email, phone=EXCLUDED.phone,
+        signature_data=CASE WHEN inventory_worker_enrollments.signature_data='' THEN EXCLUDED.signature_data ELSE inventory_worker_enrollments.signature_data END,
+        status=CASE WHEN inventory_worker_enrollments.signature_data<>'' OR EXCLUDED.signature_data<>'' THEN 'Activo' ELSE inventory_worker_enrollments.status END,
+        updated_at=NOW()`,
+        [worker.id, worker.name, center.name, worker.email, worker.phone, signature, signature ? "Activo" : "Firma pendiente", asJson({ legacy: true, raw })]);
+    }
+  }
+}
+
+async function authSettings() {
+  if (!pool) return { migration_complete: false, bootstrap_used: false };
+  const result = await pool.query("SELECT * FROM inventory_auth_settings WHERE id = 1");
+  return result.rows[0] || { migration_complete: false, bootstrap_used: false };
+}
+
+async function requestProfile(req) {
+  if (!authConfigured() || !supabaseAdmin) return null;
+  const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !data?.user) return null;
+  const result = await pool.query("SELECT * FROM inventory_user_profiles WHERE auth_user_id=$1 AND active=TRUE", [data.user.id]);
+  const profile = result.rows[0];
+  return profile ? { ...profile, authUser: data.user } : null;
+}
+
+async function findAuthUserByEmail(email) {
+  if (!supabaseAdmin) return null;
+  const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
+  if (error) throw error;
+  return data.users.find(user => String(user.email || "").toLowerCase() === String(email || "").toLowerCase()) || null;
+}
+
+async function inviteProfile(profile, email) {
+  const redirectTo = `${String(process.env.APP_BASE_URL || "").replace(/\/+$/, "") || "https://inventario-icc1.onrender.com"}/?auth=invite`;
+  let authUser = await findAuthUserByEmail(email);
+  if (!authUser) {
+    const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      redirectTo,
+      data: { name: profile.name, legacy_user_id: profile.legacy_user_id }
+    });
+    if (error) throw error;
+    authUser = data.user;
+  } else {
+    const { error } = await supabaseAdmin.auth.resetPasswordForEmail(email, { redirectTo });
+    if (error) throw error;
+  }
+  await pool.query(`UPDATE inventory_user_profiles SET auth_user_id=$1, email=$2, invitation_status=$3,
+    invited_at=COALESCE(invited_at,NOW()), updated_at=NOW() WHERE id=$4`,
+    [authUser.id, email, authUser.email_confirmed_at ? "Activo" : "Invitación enviada", profile.id]);
+  return authUser;
+}
+
+function profileCan(profile, permission) {
+  if (!profile) return false;
+  if (profile.admin) return true;
+  const permissions = Array.isArray(profile.permissions) ? profile.permissions : [];
+  return permissions.includes(permission);
+}
+
+function assetBelongsToCenter(asset, center) {
+  if (!asset || !center) return false;
+  return asset.location === center || Number(asset.stocks?.[center] || 0) > 0;
+}
+
+function stateForProfile(state, profile) {
+  if (!profile || profile.admin) return state;
+  const center = profile.cost_center;
+  const visibleAssets = (state.assets || []).filter(asset => assetBelongsToCenter(asset, center));
+  const ids = new Set(visibleAssets.map(asset => asset.id));
+  const codes = new Set(visibleAssets.map(asset => asset.code));
+  const costCenter = (state.costCenters || []).find(item => item.name === center);
+  const workerNames = new Set((costCenter?.workers || []).map(raw => parseWorkerLine(raw, costCenter).name));
+  return {
+    ...state,
+    users: (state.users || []).filter(user => user.id === profile.legacy_user_id || user.name === profile.name),
+    costCenters: [costCenter, (state.costCenters || []).find(item => item.name === "En tránsito")].filter(Boolean),
+    assets: visibleAssets,
+    movements: (state.movements || []).filter(item => item.from === center || item.to === center || codes.has(item.code)),
+    inspections: (state.inspections || []).filter(item => ids.has(item.assetId)),
+    documents: (state.documents || []).filter(item => item.center === center || codes.has(item.code)),
+    assignments: (state.assignments || []).filter(item => item.from === center || item.center === center || codes.has(item.code)),
+    workerSignatures: Object.fromEntries(Object.entries(state.workerSignatures || {}).filter(([name]) => workerNames.has(name))),
+    auditLog: (state.auditLog || []).filter(item => item.user === profile.name).slice(0, 200)
+  };
+}
+
+function mergeCollectionById(target, incoming, canUse, fallbackPrefix) {
+  const result = [...(target || [])];
+  const index = new Map(result.map((item, idx) => [String(item.id || `${fallbackPrefix}-${idx}-${item.code || ""}-${item.date || ""}`), idx]));
+  for (const [idx, item] of (incoming || []).entries()) {
+    if (!canUse(item)) continue;
+    const id = String(item.id || `${fallbackPrefix}-${idx}-${item.code || ""}-${item.date || ""}`);
+    if (index.has(id)) result[index.get(id)] = item;
+    else {
+      index.set(id, result.length);
+      result.push(item);
+    }
+  }
+  return result;
+}
+
+function mergeStateForProfile(current, incoming, profile) {
+  if (!profile || profile.admin) return incoming;
+  const center = profile.cost_center;
+  const merged = structuredClone(current);
+  const permittedIds = new Set((current.assets || []).filter(asset => assetBelongsToCenter(asset, center)).map(asset => asset.id));
+  const permittedCodes = new Set((current.assets || []).filter(asset => permittedIds.has(asset.id)).map(asset => asset.code));
+  const canOperate = profileCan(profile, "move") || profileCan(profile, "inspect");
+  if (canOperate) {
+    merged.assets = mergeCollectionById(current.assets, incoming.assets, asset => permittedIds.has(asset.id) || (profileCan(profile, "move") && asset.location === center), "asset");
+    merged.movements = mergeCollectionById(current.movements, incoming.movements, item => item.from === center || item.to === center || permittedCodes.has(item.code), "movement");
+    merged.inspections = mergeCollectionById(current.inspections, incoming.inspections, item => permittedIds.has(item.assetId), "inspection");
+    merged.documents = mergeCollectionById(current.documents, incoming.documents, item => item.center === center || permittedCodes.has(item.code), "document");
+    merged.assignments = mergeCollectionById(current.assignments, incoming.assignments, item => item.from === center || item.center === center || permittedCodes.has(item.code), "assignment");
+  }
+  if (profileCan(profile, "inspect") || profileCan(profile, "workers")) {
+    const incomingCenter = (incoming.costCenters || []).find(item => item.name === center);
+    const currentIndex = (merged.costCenters || []).findIndex(item => item.name === center);
+    if (incomingCenter && currentIndex >= 0) {
+      merged.costCenters[currentIndex] = {
+        ...merged.costCenters[currentIndex],
+        inspectors: incomingCenter.inspectors || merged.costCenters[currentIndex].inspectors,
+        approvers: incomingCenter.approvers || merged.costCenters[currentIndex].approvers,
+        workers: incomingCenter.workers || merged.costCenters[currentIndex].workers,
+        safetyAdvisorName: incomingCenter.safetyAdvisorName ?? merged.costCenters[currentIndex].safetyAdvisorName,
+        safetyAdvisorSignature: incomingCenter.safetyAdvisorSignature ?? merged.costCenters[currentIndex].safetyAdvisorSignature
+      };
+    }
+    const allowedNames = new Set((incomingCenter?.workers || []).map(raw => parseWorkerLine(raw, incomingCenter).name));
+    merged.workerSignatures = { ...(current.workerSignatures || {}) };
+    for (const [name, signature] of Object.entries(incoming.workerSignatures || {})) {
+      if (allowedNames.has(name)) merged.workerSignatures[name] = signature;
+    }
+  }
+  merged.auditLog = mergeCollectionById(current.auditLog, incoming.auditLog, item => item.user === profile.name, "audit");
+  return merged;
+}
+
+async function syncNormalizedTables(client, state, savedBy = "Sistema") {
   for (const f of state.families || []) {
-    await client.query(`INSERT INTO inventory_families (id, name, prefix, serial, inspection, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,NOW())`, [f.id, f.name, f.prefix, Boolean(f.serial), f.inspection || "", asJson(f)]);
+    await client.query(`INSERT INTO inventory_families (id, name, prefix, serial, inspection, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, prefix=EXCLUDED.prefix, serial=EXCLUDED.serial, inspection=EXCLUDED.inspection, payload=EXCLUDED.payload, updated_at=NOW()`, [f.id, f.name, f.prefix, Boolean(f.serial), f.inspection || "", asJson(f)]);
   }
   for (const c of state.costCenters || []) {
-    await client.query(`INSERT INTO inventory_cost_centers (id, name, safety_advisor_name, payload, updated_at) VALUES ($1,$2,$3,$4::jsonb,NOW())`, [c.id || c.name, c.name, c.safetyAdvisorName || "", asJson(c)]);
+    await client.query(`INSERT INTO inventory_cost_centers (id, name, safety_advisor_name, payload, updated_at) VALUES ($1,$2,$3,$4::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, safety_advisor_name=EXCLUDED.safety_advisor_name, payload=EXCLUDED.payload, updated_at=NOW()`, [c.id || c.name, c.name, c.safetyAdvisorName || "", asJson(c)]);
     for (const raw of c.workers || []) {
       const w = parseWorkerLine(raw, c);
-      await client.query(`INSERT INTO inventory_workers (id, cost_center_id, cost_center_name, name, email, phone, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,NOW())`, [w.id, c.id || c.name, c.name, w.name, w.email, w.phone, asJson({ raw, ...w })]);
+      await client.query(`INSERT INTO inventory_workers (id, cost_center_id, cost_center_name, name, email, phone, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,NOW())
+        ON CONFLICT (id) DO UPDATE SET cost_center_id=EXCLUDED.cost_center_id, cost_center_name=EXCLUDED.cost_center_name, name=EXCLUDED.name, email=EXCLUDED.email, phone=EXCLUDED.phone, payload=EXCLUDED.payload, updated_at=NOW()`, [w.id, c.id || c.name, c.name, w.name, w.email, w.phone, asJson({ raw, ...w })]);
     }
   }
   for (const u of state.users || []) {
-    await client.query(`INSERT INTO inventory_users (id, name, initials, role, cost_center, admin, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,NOW())`, [u.id, u.name, u.initials || "", u.role || "", u.costCenter || "", Boolean(u.admin), asJson(u)]);
+    await client.query(`INSERT INTO inventory_users (id, name, initials, role, cost_center, admin, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, initials=EXCLUDED.initials, role=EXCLUDED.role, cost_center=EXCLUDED.cost_center, admin=EXCLUDED.admin, payload=EXCLUDED.payload, updated_at=NOW()`, [u.id, u.name, u.initials || "", u.role || "", u.costCenter || "", Boolean(u.admin), asJson(u)]);
   }
   for (const [name, signature] of Object.entries(state.workerSignatures || {})) {
-    await client.query(`INSERT INTO inventory_worker_signatures (worker_name, signature_data, has_signature, updated_at) VALUES ($1,$2,$3,NOW())`, [name, signature || "", Boolean(signature)]);
+    await client.query(`INSERT INTO inventory_worker_signatures (worker_name, signature_data, has_signature, updated_at) VALUES ($1,$2,$3,NOW())
+      ON CONFLICT (worker_name) DO UPDATE SET signature_data=EXCLUDED.signature_data, has_signature=EXCLUDED.has_signature, updated_at=NOW()`, [name, signature || "", Boolean(signature)]);
   }
   for (const a of state.assets || []) {
-    await client.query(`INSERT INTO inventory_assets (id, code, base_code, unit_no, unit_count, name, family_id, type, serial, brand, status, location, responsible, stock, minimum, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,NOW())`, [a.id, a.code, a.baseCode || a.code, Number(a.unitNo || 1), Number(a.unitCount || 1), a.name, a.family, a.type, a.serial || "", a.brand || "", a.status || "", a.location || "", a.responsible || "", Number(a.stock || 0), Number(a.minimum || 0), asJson(a)]);
+    await client.query(`INSERT INTO inventory_assets (id, code, base_code, unit_no, unit_count, name, family_id, type, serial, brand, status, location, responsible, stock, minimum, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET code=EXCLUDED.code, base_code=EXCLUDED.base_code, unit_no=EXCLUDED.unit_no, unit_count=EXCLUDED.unit_count, name=EXCLUDED.name, family_id=EXCLUDED.family_id, type=EXCLUDED.type, serial=EXCLUDED.serial, brand=EXCLUDED.brand, status=EXCLUDED.status, location=EXCLUDED.location, responsible=EXCLUDED.responsible, stock=EXCLUDED.stock, minimum=EXCLUDED.minimum, payload=EXCLUDED.payload, updated_at=NOW()`, [a.id, a.code, a.baseCode || a.code, Number(a.unitNo || 1), Number(a.unitCount || 1), a.name, a.family, a.type, a.serial || "", a.brand || "", a.status || "", a.location || "", a.responsible || "", Number(a.stock || 0), Number(a.minimum || 0), asJson(a)]);
     for (const [center, qty] of Object.entries(a.stocks || {})) {
-      await client.query(`INSERT INTO inventory_asset_stock (asset_id, center_name, quantity, updated_at) VALUES ($1,$2,$3,NOW())`, [a.id, center, Number(qty || 0)]);
+      await client.query(`INSERT INTO inventory_asset_stock (asset_id, center_name, quantity, updated_at) VALUES ($1,$2,$3,NOW())
+        ON CONFLICT (asset_id, center_name) DO UPDATE SET quantity=EXCLUDED.quantity, updated_at=NOW()`, [a.id, center, Number(qty || 0)]);
     }
   }
   for (const [idx, m] of (state.movements || []).entries()) {
@@ -282,21 +601,101 @@ async function syncNormalizedTables(client, state, savedBy = "Sistema") {
     await client.query(`INSERT INTO inventory_movements (id, movement_date, code, action, user_name, from_location, to_location, quantity, status, detail, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT (id) DO NOTHING`, [id, m.date || "", m.code || "", m.action || "", m.user || "", m.from || "", m.to || "", Number(m.qty || 1), m.status || "", m.detail || "", asJson(m)]);
   }
   for (const i of state.inspections || []) {
-    await client.query(`INSERT INTO inventory_inspections (id, asset_id, inspection_date, inspector, approver, result, notes, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,NOW())`, [i.id, i.assetId || "", i.date || "", i.inspector || "", i.approver || "", i.result || "", i.notes || "", asJson(i)]);
+    await client.query(`INSERT INTO inventory_inspections (id, asset_id, inspection_date, inspector, approver, result, notes, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET asset_id=EXCLUDED.asset_id, inspection_date=EXCLUDED.inspection_date, inspector=EXCLUDED.inspector, approver=EXCLUDED.approver, result=EXCLUDED.result, notes=EXCLUDED.notes, payload=EXCLUDED.payload, updated_at=NOW()`, [i.id, i.assetId || "", i.date || "", i.inspector || "", i.approver || "", i.result || "", i.notes || "", asJson(i)]);
   }
   for (const d of state.documents || []) {
-    await client.query(`INSERT INTO inventory_documents (id, name, type, kind, source, draft_id, size_bytes, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [d.id, d.name || "", d.type || "", d.kind || "", d.source || "", d.draftId || "", Number(d.size || d.size_bytes || 0), asJson(d)]);
+    await client.query(`INSERT INTO inventory_documents (id, name, type, kind, source, draft_id, size_bytes, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, type=EXCLUDED.type, kind=EXCLUDED.kind, source=EXCLUDED.source, draft_id=EXCLUDED.draft_id, size_bytes=EXCLUDED.size_bytes, payload=EXCLUDED.payload`, [d.id, d.name || "", d.type || "", d.kind || "", d.source || "", d.draftId || "", Number(d.size || d.size_bytes || 0), asJson(d)]);
   }
   for (const r of state.aiDrafts || []) {
-    await client.query(`INSERT INTO inventory_ai_results (id, kind, center_name, filename, status, model, result, payload) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)`, [r.id, r.kind || "", r.center || "", r.filename || "", r.status || "", r.model || "", asJson(r.result || {}), asJson(r)]);
+    await client.query(`INSERT INTO inventory_ai_results (id, kind, center_name, filename, status, model, result, payload) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)
+      ON CONFLICT (id) DO UPDATE SET kind=EXCLUDED.kind, center_name=EXCLUDED.center_name, filename=EXCLUDED.filename, status=EXCLUDED.status, model=EXCLUDED.model, result=EXCLUDED.result, payload=EXCLUDED.payload`, [r.id, r.kind || "", r.center || "", r.filename || "", r.status || "", r.model || "", asJson(r.result || {}), asJson(r)]);
   }
   for (const t of state.inspectionTemplates || []) {
-    await client.query(`INSERT INTO inventory_inspection_templates (id, name, family, source_draft, payload) VALUES ($1,$2,$3,$4,$5::jsonb)`, [t.id, t.name || "", t.family || "", t.sourceDraft || "", asJson(t)]);
+    await client.query(`INSERT INTO inventory_inspection_templates (id, name, family, source_draft, payload) VALUES ($1,$2,$3,$4,$5::jsonb)
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, family=EXCLUDED.family, source_draft=EXCLUDED.source_draft, payload=EXCLUDED.payload`, [t.id, t.name || "", t.family || "", t.sourceDraft || "", asJson(t)]);
   }
   for (const a of state.auditLog || []) {
     await client.query(`INSERT INTO inventory_audit_log (id, event_date, user_name, action, detail, payload) VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`, [a.id, a.date || new Date().toISOString(), a.user || "", a.action || "", a.detail || "", asJson(a)]);
   }
   await client.query(`INSERT INTO inventory_state_versions (saved_by, asset_count, movement_count, document_count, payload) VALUES ($1,$2,$3,$4,$5::jsonb)`, [savedBy || "Sistema", (state.assets || []).length, (state.movements || []).length, (state.documents || []).length, asJson({ savedAt: new Date().toISOString(), savedBy: savedBy || "Sistema", assetCount: (state.assets || []).length, movementCount: (state.movements || []).length })]);
+}
+
+async function syncOperationalTasks(client, state) {
+  const tasks = [];
+  const assetById = new Map((state.assets || []).map(asset => [asset.id, asset]));
+  const add = (task) => tasks.push({
+    priority: "Media",
+    center: "Bodega Central",
+    detail: "",
+    entityType: "",
+    entityId: "",
+    dueAt: null,
+    ...task
+  });
+  for (const inspection of state.inspections || []) {
+    const asset = assetById.get(inspection.assetId);
+    const center = asset?.location || inspection.project || "Bodega Central";
+    if (inspection.result === "No aprobado" && !inspection.correctionDate) {
+      add({ id: `inspection-${inspection.id}`, type: "Inspección rechazada", title: `Inspección pendiente: ${asset?.code || inspection.assetId}`, detail: inspection.notes || "Requiere revisión y definición de plazo.", priority: "Alta", center, entityType: "inspection", entityId: inspection.id, dueAt: inspection.correctionDue || null });
+    }
+    if (inspection.correctionDue && !inspection.correctionDate) {
+      const overdue = new Date(`${inspection.correctionDue}T23:59:59`) < new Date();
+      add({ id: `correction-${inspection.id}`, type: "Corrección", title: `${overdue ? "Corrección vencida" : "Corrección pendiente"}: ${asset?.code || inspection.assetId}`, detail: inspection.approvalInstruction || inspection.notes || "Levantamiento pendiente.", priority: overdue ? "Crítica" : "Alta", center, entityType: "inspection", entityId: inspection.id, dueAt: inspection.correctionDue });
+    }
+  }
+  for (const asset of state.assets || []) {
+    if (String(asset.status || "").toLowerCase() === "bloqueado") {
+      add({ id: `blocked-${asset.id}`, type: "Activo bloqueado", title: `Activo bloqueado: ${asset.code}`, detail: asset.name, priority: "Crítica", center: asset.location || "Bodega Central", entityType: "asset", entityId: asset.id });
+    }
+    if (asset.type === "Consumible" && Number(asset.minimum || 0) > 0 && Number(asset.stock || 0) <= Number(asset.minimum || 0)) {
+      add({ id: `stock-${asset.id}`, type: "Stock bajo", title: `Stock bajo: ${asset.code}`, detail: `${asset.name}. Stock ${asset.stock || 0}; mínimo ${asset.minimum}.`, priority: Number(asset.stock || 0) === 0 ? "Crítica" : "Alta", center: asset.location || "Bodega Central", entityType: "asset", entityId: asset.id });
+    }
+  }
+  for (const movement of state.movements || []) {
+    if (movement.status === "En tránsito") {
+      add({ id: `transfer-${movement.id || movement.code}-${movement.date || ""}`, type: "Recepción pendiente", title: `Traslado pendiente: ${movement.code}`, detail: `${movement.from || "Origen"} → ${movement.to || "Destino"} · ${movement.qty || 1} unidad(es).`, priority: "Alta", center: movement.to || "Bodega Central", entityType: "movement", entityId: movement.id || movement.code });
+    }
+  }
+  for (const assignment of state.assignments || []) {
+    if (/Pendiente aceptación/i.test(assignment.status || "")) {
+      add({ id: `epp-${assignment.id}`, type: "Aceptación EPP", title: `Aceptación pendiente: ${assignment.code}`, detail: `${assignment.worker} · ${assignment.qty || 1} unidad(es).`, priority: "Alta", center: assignment.from || assignment.center || "Bodega Central", entityType: "assignment", entityId: assignment.id });
+    }
+  }
+  for (const document of state.documents || []) {
+    if (/Pendiente archivo|Error/i.test(document.status || "") || document.uploadError) {
+      add({ id: `file-${document.id}`, type: "Documento pendiente", title: `Archivo pendiente: ${document.name}`, detail: document.uploadError || "El archivo obligatorio no quedó almacenado.", priority: "Alta", center: document.center || "Bodega Central", entityType: "document", entityId: document.id });
+    }
+  }
+
+  const openIds = [];
+  for (const task of tasks) {
+    openIds.push(task.id);
+    const responsible = await client.query(`SELECT auth_user_id FROM inventory_user_profiles
+      WHERE active=TRUE AND auth_user_id IS NOT NULL AND (cost_center=$1 OR admin=TRUE)
+      ORDER BY admin ASC, updated_at DESC LIMIT 1`, [task.center]);
+    const assignee = responsible.rows[0]?.auth_user_id || null;
+    await client.query(`INSERT INTO inventory_tasks
+      (id, task_type, title, detail, priority, status, center_name, assignee_auth_user_id, entity_type, entity_id, due_at, payload, updated_at)
+      VALUES ($1,$2,$3,$4,$5,'Pendiente',$6,$7,$8,$9,$10,$11::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET task_type=EXCLUDED.task_type, title=EXCLUDED.title, detail=EXCLUDED.detail,
+      priority=EXCLUDED.priority, center_name=EXCLUDED.center_name, assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,
+      entity_type=EXCLUDED.entity_type, entity_id=EXCLUDED.entity_id, due_at=EXCLUDED.due_at,
+      status=CASE WHEN inventory_tasks.status='En proceso' THEN 'En proceso' ELSE 'Pendiente' END, resolved_at=NULL, updated_at=NOW()`,
+      [task.id, task.type, task.title, task.detail, task.priority, task.center, assignee, task.entityType, task.entityId, task.dueAt, asJson(task)]);
+    await client.query(`INSERT INTO inventory_notifications
+      (id, recipient_auth_user_id, center_name, notification_type, title, body, severity, entity_type, entity_id, payload)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+      ON CONFLICT (id) DO NOTHING`,
+      [`notification-${task.id}`, assignee, task.center, task.type, task.title, task.detail, task.priority === "Crítica" ? "critical" : "warning", task.entityType, task.entityId, asJson(task)]);
+  }
+  if (openIds.length) {
+    await client.query(`UPDATE inventory_tasks SET status='Resuelta', resolved_at=COALESCE(resolved_at,NOW()), updated_at=NOW()
+      WHERE status <> 'Resuelta' AND NOT (id = ANY($1::text[]))`, [openIds]);
+  } else {
+    await client.query(`UPDATE inventory_tasks SET status='Resuelta', resolved_at=COALESCE(resolved_at,NOW()), updated_at=NOW() WHERE status <> 'Resuelta'`);
+  }
 }
 
 async function analyzeWithOpenAI(body) {
@@ -346,6 +745,10 @@ async function setupDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
     await createNormalizedTables(client);
+    await createAuthAndRealtimeTables(client);
+    await migrateLegacyIdentityData(client);
+    const stateResult = await client.query("SELECT payload FROM inventory_app_state WHERE id=1");
+    if (stateResult.rows[0]?.payload) await syncOperationalTasks(client, stateResult.rows[0].payload);
   } catch (error) {
     console.error("Base de datos no disponible al iniciar; la app seguirá funcionando en modo temporal.", error.message);
   }
@@ -358,7 +761,253 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/api/health") {
-    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), openaiConfigured: Boolean(process.env.OPENAI_API_KEY), fileStorageConfigured: storageConfigured() });
+    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), openaiConfigured: Boolean(process.env.OPENAI_API_KEY), fileStorageConfigured: storageConfigured(), authConfigured: authConfigured() });
+  }
+
+  if (url.pathname === "/api/public-config") {
+    const settings = await authSettings();
+    return json(res, 200, {
+      supabaseUrl: supabaseBaseUrl(),
+      supabasePublishableKey: process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || "",
+      authConfigured: authConfigured(),
+      migrationComplete: Boolean(settings.migration_complete),
+      bootstrapUsed: Boolean(settings.bootstrap_used),
+      appBaseUrl: process.env.APP_BASE_URL || "https://inventario-icc1.onrender.com",
+      initialAdmin
+    });
+  }
+
+  if (url.pathname === "/api/auth/bootstrap" && req.method === "POST") {
+    if (!authConfigured()) return json(res, 503, { error: "Supabase Auth aún no está configurado en Render." });
+    if (!process.env.AUTH_BOOTSTRAP_TOKEN) return json(res, 503, { error: "AUTH_BOOTSTRAP_TOKEN no está configurado en Render." });
+    try {
+      const body = await readJson(req);
+      if (!safeTokenEqual(body.token, process.env.AUTH_BOOTSTRAP_TOKEN)) return json(res, 403, { error: "Código de activación incorrecto." });
+      const result = await pool.query("SELECT * FROM inventory_user_profiles WHERE id=$1", [initialAdmin.legacyUserId]);
+      const profile = result.rows[0];
+      if (!profile) return json(res, 500, { error: "No se pudo preparar el perfil de Julio Febre." });
+      await inviteProfile(profile, initialAdmin.email);
+      await pool.query("UPDATE inventory_auth_settings SET bootstrap_used=TRUE, updated_at=NOW() WHERE id=1");
+      return json(res, 200, { ok: true, message: `Invitación enviada a ${initialAdmin.email}.` });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo enviar la invitación inicial." });
+    }
+  }
+
+  if (url.pathname === "/api/public/acceptance" && req.method === "GET") {
+    if (!pool) return json(res, 503, { error: "Base de datos no configurada." });
+    const token = url.searchParams.get("token");
+    const result = await pool.query("SELECT payload FROM inventory_app_state WHERE id=1");
+    const current = result.rows[0]?.payload || {};
+    const assignment = (current.assignments || []).find(item => item.token === token);
+    const asset = (current.assets || []).find(item => item.id === assignment?.assetId || item.code === assignment?.code);
+    if (!assignment || !asset) return json(res, 404, { error: "No encontramos el cargo." });
+    return json(res, 200, { assignment, asset: { id: asset.id, code: asset.code, name: asset.name, type: asset.type } });
+  }
+
+  if (url.pathname === "/api/public/acceptance" && req.method === "POST") {
+    if (!pool) return json(res, 503, { error: "Base de datos no configurada." });
+    const client = await pool.connect();
+    try {
+      const body = await readJson(req);
+      await client.query("BEGIN");
+      const result = await client.query("SELECT payload FROM inventory_app_state WHERE id=1 FOR UPDATE");
+      const current = result.rows[0]?.payload || {};
+      const assignment = (current.assignments || []).find(item => item.token === body.token);
+      const asset = (current.assets || []).find(item => item.id === assignment?.assetId || item.code === assignment?.code);
+      if (!assignment || !asset) throw new Error("No encontramos el cargo.");
+      if (assignment.status === "Aceptado") throw new Error("Este cargo ya fue aceptado.");
+      const today = new Date().toISOString().slice(0, 10);
+      assignment.status = "Aceptado";
+      assignment.acceptedDate = today;
+      assignment.acceptedBy = String(body.acceptedBy || assignment.worker);
+      assignment.confirmationSent = false;
+      asset.status = "A cargo de trabajador";
+      asset.responsible = assignment.worker;
+      current.movements = current.movements || [];
+      current.movements.unshift({ id: `m${Date.now()}`, date: today, code: asset.code, action: "Aceptación de cargo EPP", user: assignment.acceptedBy, from: assignment.from, to: assignment.worker, qty: assignment.qty, status: "Aceptado", detail: `Trabajador acepta cargo digitalmente. Producto: ${asset.name}.` });
+      await client.query("UPDATE inventory_app_state SET payload=$1::jsonb, updated_at=NOW() WHERE id=1", [asJson(current)]);
+      await syncNormalizedTables(client, current, assignment.acceptedBy);
+      await syncOperationalTasks(client, current);
+      await client.query("COMMIT");
+      return json(res, 200, { ok: true, message: "Cargo aceptado correctamente." });
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch {}
+      return json(res, 400, { error: error.message || "No se pudo aceptar el cargo." });
+    } finally {
+      client.release();
+    }
+  }
+
+  let apiProfile = null;
+  if (url.pathname === "/api/session/profile") {
+    apiProfile = await requestProfile(req);
+    if (!apiProfile) return json(res, 401, { error: "Sesión inválida o usuario sin perfil activo." });
+    if (apiProfile.admin) {
+      await pool.query(`UPDATE inventory_user_profiles SET invitation_status='Activo', activated_at=COALESCE(activated_at,NOW()), updated_at=NOW() WHERE id=$1`, [apiProfile.id]);
+      await pool.query("UPDATE inventory_auth_settings SET migration_complete=TRUE, bootstrap_used=TRUE, updated_at=NOW() WHERE id=1");
+    }
+    return json(res, 200, { profile: apiProfile, migrationComplete: apiProfile.admin ? true : Boolean((await authSettings()).migration_complete) });
+  }
+
+  const publicApi = new Set(["/api/health", "/api/public-config", "/api/auth/bootstrap", "/api/public/acceptance", "/api/qr"]);
+  if (url.pathname.startsWith("/api/") && !publicApi.has(url.pathname)) {
+    const settings = await authSettings();
+    if (authConfigured() && settings.migration_complete) {
+      apiProfile = await requestProfile(req);
+      if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión nuevamente." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/users" && req.method === "GET") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede gestionar usuarios." });
+    const result = await pool.query(`SELECT id, legacy_user_id, auth_user_id, name, email, initials, role, cost_center, admin, permissions, active, invitation_status, invited_at, activated_at
+      FROM inventory_user_profiles ORDER BY admin DESC, name`);
+    return json(res, 200, { users: result.rows });
+  }
+
+  if (url.pathname === "/api/admin/users/invite" && req.method === "POST") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede invitar usuarios." });
+    try {
+      const body = await readJson(req);
+      const email = String(body.email || "").trim().toLowerCase();
+      if (!email || !email.includes("@")) return json(res, 400, { error: "Ingresa un correo válido." });
+      const id = String(body.id || body.legacyUserId || `user-${Date.now()}`);
+      const role = body.role || "Usuario";
+      const admin = role === "Administrador central";
+      await pool.query(`INSERT INTO inventory_user_profiles
+        (id, legacy_user_id, name, email, initials, role, cost_center, admin, permissions, active, invitation_status, updated_at)
+        VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8::jsonb,TRUE,'Pendiente invitación',NOW())
+        ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, email=EXCLUDED.email, initials=EXCLUDED.initials,
+        role=EXCLUDED.role, cost_center=EXCLUDED.cost_center, admin=EXCLUDED.admin, permissions=EXCLUDED.permissions,
+        active=TRUE, updated_at=NOW()`,
+        [id, body.name || email, email, body.initials || "", role, body.costCenter || "Bodega Central", admin, asJson(body.permissions || defaultPermissions(role, admin))]);
+      const profileResult = await pool.query("SELECT * FROM inventory_user_profiles WHERE id=$1", [id]);
+      await inviteProfile(profileResult.rows[0], email);
+      return json(res, 200, { ok: true, message: `Invitación enviada a ${email}.` });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo invitar al usuario." });
+    }
+  }
+
+  if (url.pathname.startsWith("/api/admin/users/") && req.method === "PATCH") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede modificar usuarios." });
+    try {
+      const id = decodeURIComponent(url.pathname.replace("/api/admin/users/", ""));
+      const body = await readJson(req);
+      const current = await pool.query("SELECT * FROM inventory_user_profiles WHERE id=$1", [id]);
+      if (!current.rows[0]) return json(res, 404, { error: "Usuario no encontrado." });
+      const role = body.role || current.rows[0].role;
+      const admin = role === "Administrador central";
+      const active = body.active !== false;
+      const email = String(body.email ?? current.rows[0].email ?? "").trim().toLowerCase();
+      await pool.query(`UPDATE inventory_user_profiles SET name=$1, email=$2, initials=$3, role=$4, cost_center=$5, admin=$6,
+        permissions=$7::jsonb, active=$8, invitation_status=CASE WHEN $8 THEN invitation_status ELSE 'Deshabilitado' END, updated_at=NOW() WHERE id=$9`,
+        [body.name || current.rows[0].name, email, body.initials ?? current.rows[0].initials, role, body.costCenter || current.rows[0].cost_center, admin, asJson(body.permissions || defaultPermissions(role, admin)), active, id]);
+      if (current.rows[0].auth_user_id && supabaseAdmin) {
+        await supabaseAdmin.auth.admin.updateUserById(current.rows[0].auth_user_id, { email: email || undefined, ban_duration: active ? "none" : "876000h" });
+      }
+      return json(res, 200, { ok: true });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el usuario." });
+    }
+  }
+
+  if (url.pathname === "/api/workers" && req.method === "GET") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión." });
+    const params = apiProfile.admin ? [] : [apiProfile.cost_center];
+    const result = await pool.query(`SELECT * FROM inventory_worker_enrollments ${apiProfile.admin ? "" : "WHERE cost_center=$1"} ORDER BY cost_center, name`, params);
+    return json(res, 200, { workers: result.rows });
+  }
+
+  if (url.pathname === "/api/workers" && req.method === "POST") {
+    if (!profileCan(apiProfile, "workers")) return json(res, 403, { error: "Tu perfil no puede enrolar trabajadores." });
+    try {
+      const body = await readJson(req);
+      const center = body.costCenter || apiProfile.cost_center;
+      if (!apiProfile.admin && center !== apiProfile.cost_center) return json(res, 403, { error: "Sólo puedes enrolar en tu centro de costo." });
+      if (!String(body.name || "").trim()) return json(res, 400, { error: "El nombre es obligatorio." });
+      const id = String(body.id || `worker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
+      const status = body.signatureFileId || body.signatureData ? "Activo" : "Firma pendiente";
+      await pool.query(`INSERT INTO inventory_worker_enrollments
+        (id, rut, name, company, job_title, cost_center, email, phone, signature_file_id, signature_data, status, payload, created_by, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,NOW())
+        ON CONFLICT (id) DO UPDATE SET rut=EXCLUDED.rut, name=EXCLUDED.name, company=EXCLUDED.company,
+        job_title=EXCLUDED.job_title, cost_center=EXCLUDED.cost_center, email=EXCLUDED.email, phone=EXCLUDED.phone,
+        signature_file_id=EXCLUDED.signature_file_id, signature_data=EXCLUDED.signature_data, status=EXCLUDED.status,
+        payload=EXCLUDED.payload, updated_at=NOW()`,
+        [id, body.rut || "", body.name.trim(), body.company || "", body.jobTitle || "", center, body.email || "", body.phone || "", body.signatureFileId || "", body.signatureData || "", status, asJson(body), apiProfile.auth_user_id]);
+      if (body.createAccess && body.email) {
+        const accessId = `access-${id}`;
+        const role = "Usuario";
+        await pool.query(`INSERT INTO inventory_user_profiles
+          (id, legacy_user_id, name, email, initials, role, cost_center, admin, permissions, active, invitation_status, updated_at)
+          VALUES ($1,$1,$2,$3,$4,$5,$6,FALSE,$7::jsonb,TRUE,'Pendiente invitación',NOW())
+          ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, email=EXCLUDED.email, cost_center=EXCLUDED.cost_center, active=TRUE, updated_at=NOW()`,
+          [accessId, body.name.trim(), body.email, body.initials || "", role, center, asJson(defaultPermissions(role, false))]);
+        const accessResult = await pool.query("SELECT * FROM inventory_user_profiles WHERE id=$1", [accessId]);
+        await inviteProfile(accessResult.rows[0], body.email);
+        await pool.query("UPDATE inventory_worker_enrollments SET access_profile_id=$1 WHERE id=$2", [accessId, id]);
+      }
+      return json(res, 200, { ok: true, id, status });
+    } catch (error) {
+      const duplicateRut = error.code === "23505";
+      return json(res, 400, { error: duplicateRut ? "Ya existe un trabajador con ese RUT." : error.message || "No se pudo enrolar al trabajador." });
+    }
+  }
+
+  if (url.pathname.startsWith("/api/workers/") && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "workers")) return json(res, 403, { error: "Tu perfil no puede modificar trabajadores." });
+    const id = decodeURIComponent(url.pathname.replace("/api/workers/", ""));
+    const body = await readJson(req);
+    const current = await pool.query("SELECT * FROM inventory_worker_enrollments WHERE id=$1", [id]);
+    if (!current.rows[0]) return json(res, 404, { error: "Trabajador no encontrado." });
+    if (!apiProfile.admin && current.rows[0].cost_center !== apiProfile.cost_center) return json(res, 403, { error: "Trabajador de otro centro de costo." });
+    const status = body.active === false ? "Inactivo" : (body.signatureFileId || body.signatureData || current.rows[0].signature_file_id || current.rows[0].signature_data ? "Activo" : "Firma pendiente");
+    await pool.query(`UPDATE inventory_worker_enrollments SET rut=$1, name=$2, company=$3, job_title=$4, email=$5, phone=$6,
+      signature_file_id=$7, signature_data=$8, status=$9, updated_at=NOW() WHERE id=$10`,
+      [body.rut ?? current.rows[0].rut, body.name || current.rows[0].name, body.company ?? current.rows[0].company, body.jobTitle ?? current.rows[0].job_title, body.email ?? current.rows[0].email, body.phone ?? current.rows[0].phone, body.signatureFileId ?? current.rows[0].signature_file_id, body.signatureData ?? current.rows[0].signature_data, status, id]);
+    return json(res, 200, { ok: true, status });
+  }
+
+  if (url.pathname === "/api/tasks" && req.method === "GET") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión." });
+    const result = await pool.query(`SELECT * FROM inventory_tasks
+      WHERE ($1::boolean OR assignee_auth_user_id=$2 OR center_name=$3)
+      ORDER BY CASE priority WHEN 'Crítica' THEN 1 WHEN 'Alta' THEN 2 ELSE 3 END, due_at NULLS LAST, created_at DESC`,
+      [Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
+    return json(res, 200, { tasks: result.rows });
+  }
+
+  if (url.pathname.startsWith("/api/tasks/") && req.method === "PATCH") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión." });
+    const id = decodeURIComponent(url.pathname.replace("/api/tasks/", ""));
+    const body = await readJson(req);
+    const allowed = ["Pendiente", "En proceso", "Resuelta"];
+    if (!allowed.includes(body.status)) return json(res, 400, { error: "Estado de tarea inválido." });
+    const result = await pool.query(`UPDATE inventory_tasks SET status=$1, resolved_at=CASE WHEN $1='Resuelta' THEN NOW() ELSE NULL END, updated_at=NOW()
+      WHERE id=$2 AND ($3::boolean OR assignee_auth_user_id=$4 OR center_name=$5) RETURNING id`,
+      [body.status, id, Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
+    if (!result.rowCount) return json(res, 404, { error: "Tarea no encontrada o sin permiso." });
+    return json(res, 200, { ok: true });
+  }
+
+  if (url.pathname === "/api/notifications" && req.method === "GET") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión." });
+    const result = await pool.query(`SELECT * FROM inventory_notifications
+      WHERE ($1::boolean OR recipient_auth_user_id=$2 OR (recipient_auth_user_id IS NULL AND center_name=$3))
+      ORDER BY created_at DESC LIMIT 100`, [Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
+    return json(res, 200, { notifications: result.rows });
+  }
+
+  if (url.pathname.startsWith("/api/notifications/") && req.method === "PATCH") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión." });
+    const id = decodeURIComponent(url.pathname.replace("/api/notifications/", ""));
+    const result = await pool.query(`UPDATE inventory_notifications SET read_at=NOW() WHERE id=$1 AND
+      ($2::boolean OR recipient_auth_user_id=$3 OR (recipient_auth_user_id IS NULL AND center_name=$4)) RETURNING id`,
+      [id, Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
+    if (!result.rowCount) return json(res, 404, { error: "Notificación no encontrada." });
+    return json(res, 200, { ok: true });
   }
 
   if (url.pathname === "/api/storage/status") {
@@ -393,7 +1042,8 @@ const server = http.createServer(async (req, res) => {
     if (!pool) return json(res, 503, { error: "DATABASE_URL no configurada" });
     try {
       const result = await pool.query("SELECT payload FROM inventory_app_state WHERE id = 1");
-      return json(res, 200, { state: result.rows[0]?.payload || null });
+      const current = result.rows[0]?.payload || null;
+      return json(res, 200, { state: current ? stateForProfile(current, apiProfile) : null });
     } catch (error) {
       return json(res, 503, { error: "Base de datos no disponible", detail: error.message });
     }
@@ -406,9 +1056,12 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!body.state || typeof body.state !== "object") return json(res, 400, { error: "Estado de inventario inválido" });
       await client.query("BEGIN");
+      const currentResult = await client.query("SELECT payload FROM inventory_app_state WHERE id=1 FOR UPDATE");
+      const nextState = mergeStateForProfile(currentResult.rows[0]?.payload || {}, body.state, apiProfile);
       await client.query(`INSERT INTO inventory_app_state (id, payload, updated_at) VALUES (1, $1::jsonb, NOW())
-        ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, [JSON.stringify(body.state)]);
-      await syncNormalizedTables(client, body.state, body.savedBy || "Sistema");
+        ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, [JSON.stringify(nextState)]);
+      await syncNormalizedTables(client, nextState, apiProfile?.name || body.savedBy || "Sistema");
+      await syncOperationalTasks(client, nextState);
       await client.query("COMMIT");
       return json(res, 200, { ok: true, normalized: true });
     } catch (error) {
@@ -424,8 +1077,10 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readJson(req);
       if (!body.state || typeof body.state !== "object") return json(res, 400, { error: "Estado de inventario inválido" });
+      const currentResult = await pool.query("SELECT payload FROM inventory_app_state WHERE id=1");
+      const nextState = mergeStateForProfile(currentResult.rows[0]?.payload || {}, body.state, apiProfile);
       await pool.query(`INSERT INTO inventory_app_state (id, payload, updated_at) VALUES (1, $1::jsonb, NOW())
-        ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, [JSON.stringify(body.state)]);
+        ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, [JSON.stringify(nextState)]);
       return json(res, 200, { ok: true });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo guardar" });
@@ -510,6 +1165,16 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname.startsWith("/api/")) {
     return json(res, 404, { error: "API aún no implementada" });
+  }
+
+  if (url.pathname === "/vendor/supabase.js") {
+    try {
+      const body = await readFile(join(root, "node_modules", "@supabase", "supabase-js", "dist", "umd", "supabase.js"));
+      res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=86400" });
+      return res.end(body);
+    } catch {
+      return json(res, 500, { error: "No se pudo cargar el cliente Supabase." });
+    }
   }
 
   const relative = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname).replace(/^[/\\]+/, "");

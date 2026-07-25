@@ -1,12 +1,14 @@
-﻿{
+{
   "name": "inventario-icc1",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check app.js && node --check supabase-auth.js && node --check server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
     "pdfkit": "^0.15.2",
     "pg": "^8.13.1",
     "qrcode": "^1.5.4"
