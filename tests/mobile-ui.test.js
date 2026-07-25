@@ -17,6 +17,15 @@ test("el inicio móvil oculta el resumen completo", () => {
   assert.match(app, /mobile-dashboard-actions/);
   assert.match(app, /desktop-dashboard-full/);
   assert.match(css, /\.desktop-dashboard-full\{display:none\}/);
+  assert.match(app, /window\.matchMedia\?\.\('\(max-width: 900px\)'\)\.matches/);
+});
+
+test("el QR conserva y precarga el producto durante autenticación", () => {
+  assert.match(app, /icc-pending-qr-code/);
+  assert.match(app, /function scannedAsset\(\)/);
+  assert.match(app, /value="\$\{htmlSafe\(code\)\}"/);
+  assert.match(app, /Producto identificado por QR/);
+  assert.match(app, /if\(!a\)\{route='scan';return true\}/);
 });
 
 test("el menú móvil tiene fondo y cierre explícito", () => {
