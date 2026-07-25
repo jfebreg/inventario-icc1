@@ -9,16 +9,19 @@ import { createClient } from "@supabase/supabase-js";
 import { timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
+  createCustodyAssignment,
   createTransfer,
   dispatchTransfer,
   ensureDefaultOrganization,
   listCanonicalItems,
+  listCustodyAssignments,
   listTransfers,
   listWarehouses,
   logisticsHealth,
   postStockMovement,
   reconcileLegacyState,
   receiveTransfer,
+  returnCustodyAssignment,
   runLogisticsMigrations,
   stockSnapshot
 } from "./lib/logistics.js";
@@ -1075,12 +1078,16 @@ const server = http.createServer(async (req, res) => {
     if (!profileCan(dashboardProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
-      const [schema, items, warehouses, stock, transfers, reconciliation] = await Promise.all([
+      const [schema, items, warehouses, stock, transfers, custody, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
         stockSnapshot(pool, dashboardProfile, { itemId: "" }),
         listTransfers(pool, dashboardProfile),
+        listCustodyAssignments(pool, dashboardProfile, { status: "active" }),
+        pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
+          ${dashboardProfile.admin ? "" : "WHERE cost_center=$1"}
+          ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows),
         dashboardProfile.admin ? reconcileLegacyState(pool) : Promise.resolve(null)
       ]);
       return json(res, 200, {
@@ -1095,6 +1102,8 @@ const server = http.createServer(async (req, res) => {
         warehouses,
         stock,
         transfers,
+        custody,
+        workers,
         reconciliation
       });
     } catch (error) {
@@ -1177,6 +1186,53 @@ const server = http.createServer(async (req, res) => {
       return json(res, result.replayed ? 200 : 201, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo registrar el movimiento." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/custody" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar entregas a terreno." });
+    try {
+      return json(res, 200, {
+        assignments: await listCustodyAssignments(pool, apiProfile, {
+          status: url.searchParams.get("status") || ""
+        })
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las entregas a terreno." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/custody" && req.method === "POST") {
+    if (!profileCan(apiProfile, "terrain")) return json(res, 403, { error: "Tu perfil no puede entregar productos a terreno." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
+        return json(res, 403, { error: "Sólo puedes entregar desde una bodega de tu centro." });
+      }
+      const result = await createCustodyAssignment(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, result.replayed ? 200 : 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar la entrega a terreno." });
+    }
+  }
+
+  const custodyReturn = url.pathname.match(/^\/api\/v1\/custody\/([^/]+)\/return$/);
+  if (custodyReturn && req.method === "POST") {
+    if (!profileCan(apiProfile, "terrain")) return json(res, 403, { error: "Tu perfil no puede registrar devoluciones desde terreno." });
+    try {
+      const assignmentId = decodeURIComponent(custodyReturn[1]);
+      const current = await pool.query("SELECT warehouse_id FROM logistics_custody_assignments WHERE id=$1", [assignmentId]);
+      if (!current.rows[0]) return json(res, 404, { error: "Entrega a terreno no encontrada." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, current.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La entrega pertenece a otra bodega." });
+      }
+      const result = await returnCustodyAssignment(pool, assignmentId, await readJson(req), apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar la devolución." });
     }
   }
 
