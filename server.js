@@ -471,6 +471,15 @@ async function requestProfile(req) {
   return profile ? { ...profile, authUser: data.user } : null;
 }
 
+async function requestLegacyProfile(req) {
+  if (!pool) return null;
+  const legacyUserId = String(req.headers["x-legacy-user-id"] || "").trim();
+  if (!legacyUserId) return null;
+  const result = await pool.query(`SELECT * FROM inventory_user_profiles
+    WHERE active=TRUE AND (id=$1 OR legacy_user_id=$1) LIMIT 1`, [legacyUserId]);
+  return result.rows[0] || null;
+}
+
 async function findAuthUserByEmail(email) {
   if (!supabaseAdmin) return null;
   const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
@@ -903,6 +912,10 @@ const server = http.createServer(async (req, res) => {
     if (authConfigured() && settings.migration_complete) {
       apiProfile = await requestProfile(req);
       if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión nuevamente." });
+    } else {
+      apiProfile = await requestProfile(req);
+      if (!apiProfile) apiProfile = await requestLegacyProfile(req);
+      if (!apiProfile) return json(res, 401, { error: "Debes identificarte para usar la API durante la migracion." });
     }
   }
 

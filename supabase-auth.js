@@ -23,9 +23,13 @@
   async function apiFetch(input, init = {}) {
     const url = typeof input === "string" ? input : input.url;
     const sameOriginApi = String(url || "").startsWith("/api/") || String(url || "").startsWith(location.origin + "/api/");
-    if (!sameOriginApi || !auth.session?.access_token) return nativeFetch(input, init);
+    if (!sameOriginApi) return nativeFetch(input, init);
     const headers = new Headers(init.headers || (typeof input !== "string" ? input.headers : undefined) || {});
-    headers.set("Authorization", `Bearer ${auth.session.access_token}`);
+    if (auth.session?.access_token) headers.set("Authorization", `Bearer ${auth.session.access_token}`);
+    else {
+      const legacyUserId = localStorage.getItem("control-activos-session") || localStorage.getItem("control-activos-user") || "";
+      if (legacyUserId) headers.set("X-Legacy-User-Id", legacyUserId);
+    }
     return nativeFetch(input, { ...init, headers });
   }
 
