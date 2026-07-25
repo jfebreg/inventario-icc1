@@ -36,3 +36,8 @@ test("los reintentos no duplican entregas", () => {
   assert.match(migration, /logistics_custody_external_reference_idx/);
   assert.match(logistics, /external_reference=\$2/);
 });
+
+test("el bloqueo de bodega no intenta bloquear el lado opcional del centro de costo", () => {
+  assert.match(logistics, /FOR SHARE OF w/);
+  assert.doesNotMatch(logistics, /w\.active=TRUE FOR SHARE`/);
+});
