@@ -1048,16 +1048,27 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/v1/logistics/dashboard" && req.method === "GET") {
-    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
+    let dashboardProfile = apiProfile;
+    if (!dashboardProfile) {
+      const settings = await authSettings();
+      if (settings.migration_complete) return json(res, 401, { error: "Debes iniciar sesion nuevamente." });
+      const legacyUserId = String(req.headers["x-legacy-user-id"] || "");
+      if (legacyUserId) {
+        const legacyProfile = await pool.query(`SELECT * FROM inventory_user_profiles
+          WHERE active=TRUE AND (id=$1 OR legacy_user_id=$1) LIMIT 1`, [legacyUserId]);
+        dashboardProfile = legacyProfile.rows[0] || null;
+      }
+    }
+    if (!profileCan(dashboardProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
-        listCanonicalItems(pool, apiProfile, { search: "" }),
-        listWarehouses(pool, apiProfile),
-        stockSnapshot(pool, apiProfile, { itemId: "" }),
-        listTransfers(pool, apiProfile),
-        apiProfile.admin ? reconcileLegacyState(pool) : Promise.resolve(null)
+        listCanonicalItems(pool, dashboardProfile, { search: "" }),
+        listWarehouses(pool, dashboardProfile),
+        stockSnapshot(pool, dashboardProfile, { itemId: "" }),
+        listTransfers(pool, dashboardProfile),
+        dashboardProfile.admin ? reconcileLegacyState(pool) : Promise.resolve(null)
       ]);
       return json(res, 200, {
         ok: true,
