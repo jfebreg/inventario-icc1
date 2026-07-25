@@ -34,3 +34,9 @@ test("el menú móvil tiene fondo y cierre explícito", () => {
   assert.match(app, /sidebar \[data-route\]/);
   assert.match(css, /\.app-shell\.menu-open \.menu-backdrop\{display:block\}/);
 });
+
+test("las acciones móviles incluyen entrega a terreno", () => {
+  assert.match(app, /function renderMobileTerrainShortcut/);
+  assert.match(app, /data-mobile-terrain/);
+  assert.match(app, /deliveryModal\(a\.id\)/);
+});

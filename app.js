@@ -68,6 +68,8 @@ new MutationObserver(()=>queueMicrotask(renderAssignmentDocs)).observe(document.
 new MutationObserver(()=>queueMicrotask(renderEppFlag)).observe(document.getElementById('view'),{childList:true,subtree:true});
 new MutationObserver(()=>queueMicrotask(renderEppAdminPanel)).observe(document.getElementById('view'),{childList:true,subtree:true});
 new MutationObserver(()=>queueMicrotask(renderLogisticsPanel)).observe(document.getElementById('view'),{childList:true,subtree:true});
+new MutationObserver(()=>queueMicrotask(renderMobileTerrainShortcut)).observe(document.getElementById('view'),{childList:true,subtree:true});
+function renderMobileTerrainShortcut(){if(!window.matchMedia?.('(max-width: 900px)').matches)return;let a=scannedAsset();if(route==='dashboard'){let grid=$('.mobile-dashboard-actions .grid');if(grid&&!grid.querySelector('[data-mobile-terrain]'))grid.insertAdjacentHTML('afterbegin',`<button class="button quick-action primary" data-mobile-terrain>${a?`Entrega a terreno · ${htmlSafe(a.name)}`:'Entrega a terreno'}</button>`)}if(route==='scan'&&a){let summary=$('.scan-product-summary');if(summary&&!summary.querySelector('[data-mobile-terrain]'))summary.insertAdjacentHTML('beforeend',`<button type="button" class="button" data-mobile-terrain>Entrega a terreno</button>`)}}
 function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
 function normalizeCode(value){let text=String(value||'').toUpperCase().trim(),m=text.match(/^([A-Z]+)[\s-]*0*(\d+)(?:[\s-]+0*(\d+))?$/);if(m)return `${m[1]}-${Number(m[2])}${m[3]?`-${Number(m[3])}`:''}`;let raw=text.replace(/[^A-Z0-9]/g,''),plain=raw.match(/^([A-Z]+)0*([0-9]+)$/);return plain?`${plain[1]}-${Number(plain[2])}`:raw}
 function assetBaseCode(a){return a?.baseCode||String(a?.code||'').replace(/^([A-Z]+-\d{6})-\d+$/,'$1')}
@@ -252,7 +254,7 @@ document.addEventListener('submit',e=>{if(e.target.id!=='acceptCargoForm')return
 $('#modal').addEventListener('click',e=>{if(e.target.dataset.close!==undefined||e.target===$('#modal'))closeModal()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
 function closeMobileMenu(){let sidebar=$('.sidebar'),shell=$('.app-shell');sidebar?.classList.remove('open');shell?.classList.remove('menu-open');document.body.classList.remove('menu-open')}
-document.addEventListener('click',e=>{if(e.target.id==='menuButton'){setTimeout(()=>{let open=$('.sidebar')?.classList.contains('open');$('.app-shell')?.classList.toggle('menu-open',open);document.body.classList.toggle('menu-open',open)},0);return}if(e.target.id==='menuBackdrop'||e.target.closest?.('.sidebar [data-route]'))closeMobileMenu()});
+document.addEventListener('click',e=>{let terrain=e.target.closest?.('[data-mobile-terrain]');if(terrain){let a=scannedAsset();if(a){if(requirePerm('terrain'))deliveryModal(a.id)}else{route='scan';render();toast('Escanea o ingresa el código y abre sus opciones para realizar la entrega.')}return}if(e.target.id==='menuButton'){setTimeout(()=>{let open=$('.sidebar')?.classList.contains('open');$('.app-shell')?.classList.toggle('menu-open',open);document.body.classList.toggle('menu-open',open)},0);return}if(e.target.id==='menuBackdrop'||e.target.closest?.('.sidebar [data-route]'))closeMobileMenu()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeMobileMenu()});
 document.addEventListener('click',e=>{if(e.target.dataset.correct)correctionModal(e.target.dataset.correct)},true);
 document.addEventListener('click',e=>{if(e.target.dataset.downloadAssignment)downloadAssignment(e.target.dataset.downloadAssignment)},true);
@@ -308,7 +310,6 @@ window.addEventListener('icc-realtime',()=>{renderRealtimeCounter();if(route==='
 window.addEventListener('icc-public-accepted',e=>{$('#view').innerHTML=`<div class="card auth-card"><h1 class="page-title">Entrega aceptada</h1><p class="page-subtitle">${htmlSafe(e.detail||'El registro fue guardado correctamente.')}</p></div>`;toast(e.detail||'Cargo aceptado.')});
 async function startApplication(){render();await window.ICCAuth.init(applyAuthenticatedUser);let params=new URLSearchParams(location.search),accept=params.get('accept');if(accept&&!window.ICCAuth.profile){window.acceptanceToken=accept;route='accept';try{let res=await fetch(`/api/public/acceptance?token=${encodeURIComponent(accept)}`),payload=await res.json();if(res.ok)window.publicAcceptance=payload}catch{}render();return}if(window.ICCAuth.profile&&!window.ICCAuth.passwordSetup){applyAuthenticatedUser(window.ICCAuth.appUser());return}if(!window.ICCAuth.configured||!window.ICCAuth.migrationComplete){await loadRemoteState();openAssetFromUrl()}else{activeUserId='';route='login'}render()}
 startApplication();
-
 
 
 
