@@ -1047,6 +1047,37 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { notifications: result.rows });
   }
 
+  if (url.pathname === "/api/v1/logistics/dashboard" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
+    if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
+    try {
+      const [schema, items, warehouses, stock, transfers, reconciliation] = await Promise.all([
+        logisticsHealth(pool),
+        listCanonicalItems(pool, apiProfile, { search: "" }),
+        listWarehouses(pool, apiProfile),
+        stockSnapshot(pool, apiProfile, { itemId: "" }),
+        listTransfers(pool, apiProfile),
+        apiProfile.admin ? reconcileLegacyState(pool) : Promise.resolve(null)
+      ]);
+      return json(res, 200, {
+        ok: true,
+        status: {
+          ok: true,
+          organizationId: logisticsOrganizationId,
+          schema,
+          migration: logisticsStartup
+        },
+        items,
+        warehouses,
+        stock,
+        transfers,
+        reconciliation
+      });
+    } catch (error) {
+      return json(res, 500, { error: error.message || "No se pudo preparar el panel logistico." });
+    }
+  }
+
   if (url.pathname === "/api/v1/logistics/status" && req.method === "GET") {
     if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logístico todavía no está disponible." });
