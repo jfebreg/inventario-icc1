@@ -17,6 +17,7 @@ import {
   listWarehouses,
   logisticsHealth,
   postStockMovement,
+  reconcileLegacyState,
   receiveTransfer,
   runLogisticsMigrations,
   stockSnapshot
@@ -1058,6 +1059,15 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (error) {
       return json(res, 500, { error: error.message || "No se pudo consultar el modelo logístico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/reconciliation" && req.method === "GET") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede revisar la conciliación." });
+    try {
+      return json(res, 200, await reconcileLegacyState(pool));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo conciliar el inventario." });
     }
   }
 

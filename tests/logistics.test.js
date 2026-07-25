@@ -45,3 +45,11 @@ test("la migración contiene las invariantes esenciales", async () => {
   assert.match(migration, /quantity_received <= quantity_dispatched/);
   assert.match(migration, /ENABLE ROW LEVEL SECURITY/);
 });
+
+test("el puente legado conserva una relación única con cada operación canónica", async () => {
+  const migration = await readFile(new URL("../migrations/002_legacy_bridge.sql", import.meta.url), "utf8");
+  assert.match(migration, /logistics_legacy_links/);
+  assert.match(migration, /UNIQUE \(organization_id, legacy_type, legacy_id\)/);
+  assert.match(migration, /logistics_transfer_lines_identity_idx/);
+  assert.match(migration, /ENABLE ROW LEVEL SECURITY/);
+});

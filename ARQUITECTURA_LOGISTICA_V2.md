@@ -34,6 +34,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 ## API V1 disponible
 
 - `GET /api/v1/logistics/status`
+- `GET /api/v1/reconciliation` — sólo administrador.
 - `GET /api/v1/items`
 - `GET /api/v1/warehouses`
 - `GET /api/v1/stock`
@@ -73,3 +74,13 @@ Después de publicar, revisar `/api/health`. Debe indicar:
 ## Próximo corte de migración
 
 La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/api/v1`. Durante ese período se compararán automáticamente los saldos antiguos con el libro mayor. Sólo después de lograr conciliación completa se dejará `inventory_app_state` como respaldo de lectura.
+
+## Segunda etapa implementada
+
+- Reportes y Configuración muestran el estado del libro mayor V2.
+- El administrador puede comparar saldos anteriores y canónicos.
+- Los movimientos desde la pantalla principal se publican primero en V2.
+- Las salidas entre bodegas crean traslado y despacho formal.
+- Las recepciones confirman el traslado V2, incluyendo los pendientes migrados.
+- Si V2 rechaza una operación, el estado anterior no se modifica.
+- Los movimientos guardan la referencia canónica para conservar trazabilidad entre ambos modelos.
