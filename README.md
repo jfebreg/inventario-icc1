@@ -17,3 +17,15 @@ Funciones incluidas:
 - Listas editables y carga masiva de inspectores/aprobadores por centro de costo.
 - Inspección móvil con registro digital obligatorio.
 - Gestión de incumplimientos: aprobador define plazo, estado amarillo durante el período y bloqueo automático al vencer.
+
+## Modelo logístico V2
+
+La aplicación incluye ahora un modelo transaccional en paralelo al estado anterior:
+
+- catálogo maestro y unidades físicas serializadas;
+- bodegas y ubicaciones jerárquicas;
+- libro mayor inalterable y saldos por ubicación;
+- traslados con despacho, tránsito y recepción parcial;
+- auditoría, documentos e inspecciones versionadas.
+
+Consulte `ARQUITECTURA_LOGISTICA_V2.md` para conocer el despliegue y las rutas de la API.

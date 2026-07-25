@@ -7,12 +7,29 @@ import QRCode from "qrcode";
 import PDFDocument from "pdfkit";
 import { createClient } from "@supabase/supabase-js";
 import { timingSafeEqual } from "node:crypto";
+import {
+  backfillLegacyState,
+  createTransfer,
+  dispatchTransfer,
+  ensureDefaultOrganization,
+  listCanonicalItems,
+  listTransfers,
+  listWarehouses,
+  logisticsHealth,
+  postStockMovement,
+  receiveTransfer,
+  runLogisticsMigrations,
+  stockSnapshot
+} from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const port = Number(process.env.PORT || 3000);
 const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".jpg": "image/jpeg", ".png": "image/png", ".md": "text/markdown; charset=utf-8" };
 const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined }) : null;
 const maxFileBytes = Number(process.env.MAX_FILE_BYTES || 8_000_000);
+let logisticsReady = false;
+let logisticsOrganizationId = "";
+let logisticsStartup = null;
 const initialAdmin = {
   legacyUserId: "julio-febre",
   name: "Julio Febre",
@@ -487,6 +504,25 @@ function profileCan(profile, permission) {
   return permissions.includes(permission);
 }
 
+async function profileMayAccessWarehouse(profile, warehouseId) {
+  if (!profile || !warehouseId) return false;
+  if (profile.admin) return true;
+  const result = await pool.query(`SELECT 1 FROM logistics_warehouses w
+    JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
+    WHERE w.id=$1 AND cc.name=$2 AND w.active=TRUE`, [warehouseId, profile.cost_center]);
+  return Boolean(result.rowCount);
+}
+
+async function profileMayAccessLocation(profile, locationId) {
+  if (!profile || !locationId) return false;
+  if (profile.admin) return true;
+  const result = await pool.query(`SELECT 1 FROM logistics_locations loc
+    JOIN logistics_warehouses w ON w.id=loc.warehouse_id
+    JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
+    WHERE loc.id=$1 AND cc.name=$2 AND loc.active=TRUE`, [locationId, profile.cost_center]);
+  return Boolean(result.rowCount);
+}
+
 function assetBelongsToCenter(asset, center) {
   if (!asset || !center) return false;
   return asset.location === center || Number(asset.stocks?.[center] || 0) > 0;
@@ -749,6 +785,12 @@ async function setupDatabase() {
     await migrateLegacyIdentityData(client);
     const stateResult = await client.query("SELECT payload FROM inventory_app_state WHERE id=1");
     if (stateResult.rows[0]?.payload) await syncOperationalTasks(client, stateResult.rows[0].payload);
+    await runLogisticsMigrations(pool, join(root, "migrations"));
+    const organization = await ensureDefaultOrganization(pool);
+    logisticsOrganizationId = organization.id;
+    logisticsStartup = await backfillLegacyState(pool);
+    logisticsOrganizationId = logisticsStartup.organizationId || logisticsOrganizationId;
+    logisticsReady = true;
   } catch (error) {
     console.error("Base de datos no disponible al iniciar; la app seguirá funcionando en modo temporal.", error.message);
   }
@@ -761,7 +803,11 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/api/health") {
-    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), openaiConfigured: Boolean(process.env.OPENAI_API_KEY), fileStorageConfigured: storageConfigured(), authConfigured: authConfigured() });
+    let logistics = null;
+    if (pool && logisticsReady) {
+      try { logistics = await logisticsHealth(pool); } catch {}
+    }
+    return json(res, 200, { ok: true, service: "inventario-icc", databaseConfigured: Boolean(pool), normalizedTables: Boolean(pool), logisticsReady, logistics, logisticsStartup, openaiConfigured: Boolean(process.env.OPENAI_API_KEY), fileStorageConfigured: storageConfigured(), authConfigured: authConfigured() });
   }
 
   if (url.pathname === "/api/public-config") {
@@ -998,6 +1044,124 @@ const server = http.createServer(async (req, res) => {
       WHERE ($1::boolean OR recipient_auth_user_id=$2 OR (recipient_auth_user_id IS NULL AND center_name=$3))
       ORDER BY created_at DESC LIMIT 100`, [Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
     return json(res, 200, { notifications: result.rows });
+  }
+
+  if (url.pathname === "/api/v1/logistics/status" && req.method === "GET") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión." });
+    if (!logisticsReady) return json(res, 503, { error: "El modelo logístico todavía no está disponible." });
+    try {
+      return json(res, 200, {
+        ok: true,
+        organizationId: logisticsOrganizationId,
+        schema: await logisticsHealth(pool),
+        migration: logisticsStartup
+      });
+    } catch (error) {
+      return json(res, 500, { error: error.message || "No se pudo consultar el modelo logístico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/items" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar artículos." });
+    try {
+      const items = await listCanonicalItems(pool, apiProfile, { search: url.searchParams.get("search") || "" });
+      return json(res, 200, { items });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar los artículos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/warehouses" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar bodegas." });
+    try {
+      return json(res, 200, { warehouses: await listWarehouses(pool, apiProfile) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las bodegas." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/stock" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar stock." });
+    try {
+      const stock = await stockSnapshot(pool, apiProfile, { itemId: url.searchParams.get("itemId") || "" });
+      return json(res, 200, { stock });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar el stock." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/stock/movements" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede mover inventario." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && ["ADJUSTMENT", "REVERSAL", "OPENING"].includes(String(body.movementType || "").toUpperCase())) {
+        return json(res, 403, { error: "Sólo el administrador puede ajustar, abrir o revertir stock." });
+      }
+      if (!apiProfile.admin) {
+        if (body.fromLocationId && !(await profileMayAccessLocation(apiProfile, body.fromLocationId))) {
+          return json(res, 403, { error: "No puedes retirar stock desde otra bodega." });
+        }
+        if (!body.fromLocationId && body.toLocationId && !(await profileMayAccessLocation(apiProfile, body.toLocationId))) {
+          return json(res, 403, { error: "No puedes ingresar stock en otra bodega." });
+        }
+      }
+      const result = await postStockMovement(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, result.replayed ? 200 : 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar el movimiento." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/transfers" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar traslados." });
+    try {
+      return json(res, 200, { transfers: await listTransfers(pool, apiProfile) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar los traslados." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/transfers" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede crear traslados." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.sourceWarehouseId))) {
+        return json(res, 403, { error: "Sólo puedes despachar desde una bodega de tu centro." });
+      }
+      const transfer = await createTransfer(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, { transfer });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear el traslado." });
+    }
+  }
+
+  const transferAction = url.pathname.match(/^\/api\/v1\/transfers\/([^/]+)\/(dispatch|receive)$/);
+  if (transferAction && req.method === "POST") {
+    const [, transferId, action] = transferAction;
+    const permission = action === "receive" ? "receive" : "move";
+    if (!profileCan(apiProfile, permission)) return json(res, 403, { error: "Tu perfil no puede completar esta operación." });
+    try {
+      const body = await readJson(req);
+      const transferResult = await pool.query("SELECT * FROM logistics_transfer_orders WHERE id=$1", [transferId]);
+      const transfer = transferResult.rows[0];
+      if (!transfer) return json(res, 404, { error: "Traslado no encontrado." });
+      const scopedWarehouse = action === "receive" ? transfer.destination_warehouse_id : transfer.source_warehouse_id;
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scopedWarehouse))) {
+        return json(res, 403, { error: `El ${action === "receive" ? "destino" : "origen"} no pertenece a tu centro.` });
+      }
+      const updated = action === "receive"
+        ? await receiveTransfer(pool, transferId, body, apiProfile.id)
+        : await dispatchTransfer(pool, transferId, body, apiProfile.id);
+      return json(res, 200, { transfer: updated });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el traslado." });
+    }
   }
 
   if (url.pathname.startsWith("/api/notifications/") && req.method === "PATCH") {
