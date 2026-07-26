@@ -6,7 +6,7 @@ import pg from "pg";
 import QRCode from "qrcode";
 import PDFDocument from "pdfkit";
 import { createClient } from "@supabase/supabase-js";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
   createInspectionRun,
@@ -20,6 +20,7 @@ import {
   listWarehouses,
   logisticsHealth,
   postStockMovement,
+  registerCanonicalDocument,
   registerCanonicalItem,
   reconcileLegacyState,
   receiveTransfer,
@@ -241,6 +242,7 @@ async function uploadFileObject(body) {
   const category = safeName(body.category || "documentos");
   const ref = String(body.ref || "");
   const { mimeType, data, base64 } = decodeDataUrl(body.dataUrl);
+  const sha256 = createHash("sha256").update(data).digest("hex");
   let provider = "postgres";
   let storagePath = "";
   let publicUrl = "";
@@ -266,9 +268,9 @@ async function uploadFileObject(body) {
   await pool.query(`INSERT INTO inventory_file_objects (id, filename, mime_type, category, ref, size_bytes, provider, storage_path, public_url, data_base64, payload)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
     ON CONFLICT (id) DO UPDATE SET filename=EXCLUDED.filename, mime_type=EXCLUDED.mime_type, category=EXCLUDED.category, ref=EXCLUDED.ref, size_bytes=EXCLUDED.size_bytes, provider=EXCLUDED.provider, storage_path=EXCLUDED.storage_path, public_url=EXCLUDED.public_url, data_base64=EXCLUDED.data_base64, payload=EXCLUDED.payload`,
-    [id, filename, mimeType, category, ref, data.length, provider, storagePath, publicUrl, provider === "postgres" ? base64 : "", asJson({ originalName: body.filename, uploadedBy: body.uploadedBy || "", code: body.code || "", center: body.center || "" })]);
+    [id, filename, mimeType, category, ref, data.length, provider, storagePath, publicUrl, provider === "postgres" ? base64 : "", asJson({ originalName: body.filename, uploadedBy: body.uploadedBy || "", code: body.code || "", center: body.center || "", sha256 })]);
 
-  return { id, filename, mimeType, size: data.length, provider, path: storagePath, publicUrl, downloadUrl: `/api/files/${encodeURIComponent(id)}` };
+  return { id, filename, mimeType, size: data.length, provider, path: storagePath, publicUrl, sha256, downloadUrl: `/api/files/${encodeURIComponent(id)}` };
 }
 
 function parseWorkerLine(raw, center) {
@@ -1496,11 +1498,27 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/files/upload" && req.method === "POST") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión para archivar documentos." });
     try {
       const body = await readJson(req);
       if (!body.filename || !body.dataUrl) return json(res, 400, { error: "Falta archivo" });
       const result = await uploadFileObject(body);
-      return json(res, 200, result);
+      let canonical = null;
+      if (logisticsReady) {
+        canonical = await registerCanonicalDocument(pool, {
+          organizationId: logisticsOrganizationId,
+          fileObjectId: result.id,
+          legacyId: body.documentLegacyId || result.id,
+          documentType: body.documentType || body.category || "OTHER",
+          documentNumber: body.documentNumber || "",
+          title: body.documentTitle || body.filename,
+          sha256: result.sha256,
+          entityType: body.entityType || (body.ref ? "legacy_record" : ""),
+          entityId: body.entityId || body.ref || "",
+          relationship: body.relationship || "EVIDENCE"
+        }, apiProfile.id);
+      }
+      return json(res, 200, { ...result, canonicalDocumentId: canonical?.document?.id || "" });
     } catch (error) {
       console.error("Error subiendo archivo:", error.message);
       return json(res, 400, { error: error.message || "No se pudo guardar el archivo" });

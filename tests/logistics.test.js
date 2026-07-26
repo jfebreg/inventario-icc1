@@ -155,3 +155,20 @@ test("la confirmación de facturas ingresa consumibles en V2 sin duplicar línea
   assert.match(app, /await registerPurchaseLineV2/);
   assert.match(app, /✓ ingresado V2/);
 });
+
+test("los archivos quedan identificados y vinculados como documentos V2", async () => {
+  const [app, server, logistics] = await Promise.all([
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../server.js", import.meta.url), "utf8"),
+    readFile(new URL("../lib/logistics.js", import.meta.url), "utf8")
+  ]);
+  assert.match(logistics, /export async function registerCanonicalDocument/);
+  assert.match(logistics, /logistics_document_links/);
+  assert.match(logistics, /DOCUMENT_REGISTERED/);
+  assert.match(server, /createHash\("sha256"\)/);
+  assert.match(server, /registerCanonicalDocument\(pool/);
+  assert.match(server, /canonicalDocumentId/);
+  assert.match(app, /function canonicalDocumentLink/);
+  assert.match(app, /CORRECTION_EVIDENCE/);
+  assert.match(app, /doc\.sha256=payload\.sha256/);
+});
