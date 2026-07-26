@@ -13,6 +13,7 @@ import {
   createInspectionRun,
   createCustodyAssignment,
   createInboundReceipt,
+  createMaterialRequest,
   createPurchaseRequisition,
   createTransfer,
   dispatchTransfer,
@@ -21,6 +22,7 @@ import {
   listCycleCounts,
   listCustodyAssignments,
   listInboundReceipts,
+  listMaterialRequests,
   listPurchaseRequisitions,
   listReplenishmentSuggestions,
   listSuppliers,
@@ -41,6 +43,7 @@ import {
   stockSnapshot,
   updateCycleCount,
   updateInboundReceipt,
+  updateMaterialRequest,
   updatePurchaseRequisition,
   updateInspectionRun,
   upsertReplenishmentPolicy
@@ -1169,7 +1172,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, workers, reconciliation] = await Promise.all([
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
@@ -1181,6 +1184,12 @@ const server = http.createServer(async (req, res) => {
         listInboundReceipts(pool, dashboardProfile),
         listReplenishmentSuggestions(pool, dashboardProfile),
         listPurchaseRequisitions(pool, dashboardProfile),
+        listMaterialRequests(pool, dashboardProfile),
+        pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
+          FROM logistics_warehouses warehouse
+          LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+          WHERE warehouse.organization_id=$1 AND warehouse.active=TRUE
+          ORDER BY center.name,warehouse.name`, [logisticsOrganizationId]).then(result => result.rows),
         pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
           ${dashboardProfile.admin ? "" : "WHERE cost_center=$1"}
           ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows),
@@ -1204,6 +1213,8 @@ const server = http.createServer(async (req, res) => {
         inboundReceipts,
         replenishmentSuggestions,
         purchaseRequisitions,
+        materialRequests,
+        warehouseDirectory,
         workers,
         reconciliation
       });
@@ -1442,6 +1453,64 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/material-requests" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar solicitudes internas." });
+    try {
+      return json(res, 200, { materialRequests: await listMaterialRequests(pool, apiProfile) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las solicitudes internas." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/material-requests" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede solicitar materiales." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.requestingWarehouseId))) {
+        return json(res, 403, { error: "Sólo puedes solicitar materiales para una bodega de tu centro." });
+      }
+      const result = await createMaterialRequest(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear la solicitud interna." });
+    }
+  }
+
+  const materialRequestAction = url.pathname.match(/^\/api\/v1\/material-requests\/([^/]+)$/);
+  if (materialRequestAction && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = action === "APPROVE" ? "approve" : "move";
+      if (!profileCan(apiProfile, permission)) {
+        return json(res, 403, { error: "Tu perfil no puede completar esta etapa de la solicitud." });
+      }
+      const scope = (await pool.query(`SELECT requesting_warehouse_id,fulfillment_warehouse_id
+        FROM logistics_material_requests WHERE id=$1`, [materialRequestAction[1]])).rows[0];
+      if (!scope) return json(res, 404, { error: "Solicitud interna no encontrada." });
+      if (!apiProfile.admin) {
+        const operational = ["ALLOCATE", "START_PICK", "ISSUE"].includes(action);
+        const warehouseId = operational ? scope.fulfillment_warehouse_id : scope.requesting_warehouse_id;
+        if (!(await profileMayAccessWarehouse(apiProfile, warehouseId))) {
+          return json(res, 403, {
+            error: operational
+              ? "La preparación corresponde a otra bodega."
+              : "La solicitud pertenece a otro centro de costo."
+          });
+        }
+      }
+      const result = await updateMaterialRequest(pool, materialRequestAction[1], action, {
+        ...body, allowSelfApproval: Boolean(apiProfile.admin)
+      }, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud interna." });
     }
   }
 
