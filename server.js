@@ -26,6 +26,7 @@ import {
   registerCanonicalItem,
   reconcileLegacyState,
   receiveTransfer,
+  receiveLot,
   registerItemFamily,
   registerWarehouse,
   returnCustodyAssignment,
@@ -1259,6 +1260,24 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       const conflict = error.code === "23505";
       return json(res, conflict ? 409 : 400, { error: conflict ? "El código o número de serie ya existe." : (error.message || "No se pudo registrar el artículo.") });
+    }
+  }
+
+  if (url.pathname === "/api/v1/lots/receive" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede ingresar lotes." });
+    try {
+      const body = await readJson(req);
+      if (!body.toLocationId) return json(res, 400, { error: "Selecciona la bodega de recepción." });
+      if (!apiProfile.admin && !(await profileMayAccessLocation(apiProfile, body.toLocationId))) {
+        return json(res, 403, { error: "Sólo puedes ingresar lotes en una bodega de tu centro." });
+      }
+      const result = await receiveLot(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, result.replayed ? 200 : 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar el lote." });
     }
   }
 
