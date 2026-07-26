@@ -47,3 +47,10 @@ test("el QR muestra stock y ubicación oficiales del libro mayor V2", () => {
   assert.match(app, /Libro mayor V2/);
   assert.match(css, /\.canonical-qr-status/);
 });
+
+test("el inventario móvil convierte la tabla en fichas legibles", () => {
+  assert.match(app, /table\.classList\.add\('inventory-table'\)/);
+  assert.match(app, /dataset\.label=label/);
+  assert.match(css, /\.inventory-table thead\{display:none\}/);
+  assert.match(css, /content:attr\(data-label\)/);
+});
