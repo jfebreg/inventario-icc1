@@ -24,6 +24,7 @@ import {
   listCycleCounts,
   listCustodyAssignments,
   listInboundReceipts,
+  listInventoryAnalytics,
   listMaterialRequests,
   listMaintenance,
   listPurchaseRequisitions,
@@ -47,6 +48,7 @@ import {
   stockSnapshot,
   suggestPutawayLocations,
   updateCycleCount,
+  updateItemCost,
   updateInboundReceipt,
   updateMaterialRequest,
   updateWorkOrder,
@@ -1179,7 +1181,8 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, warehouseDirectory, workers, reconciliation] = await Promise.all([
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics,
+        warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
@@ -1193,6 +1196,7 @@ const server = http.createServer(async (req, res) => {
         listPurchaseRequisitions(pool, dashboardProfile),
         listMaterialRequests(pool, dashboardProfile),
         listMaintenance(pool, dashboardProfile),
+        listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1223,12 +1227,24 @@ const server = http.createServer(async (req, res) => {
         purchaseRequisitions,
         materialRequests,
         maintenance,
+        inventoryAnalytics,
         warehouseDirectory,
         workers,
         reconciliation
       });
     } catch (error) {
       return json(res, 500, { error: error.message || "No se pudo preparar el panel logistico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-analytics" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar analítica de inventario." });
+    }
+    try {
+      return json(res, 200, await listInventoryAnalytics(pool, apiProfile, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo calcular la analítica de inventario." });
     }
   }
 
@@ -1263,6 +1279,23 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { items });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron consultar los artículos." });
+    }
+  }
+
+  const itemCostRoute = url.pathname.match(/^\/api\/v1\/items\/([^/]+)\/cost$/);
+  if (itemCostRoute && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede modificar costos." });
+    }
+    try {
+      const body = await readJson(req);
+      const item = await updateItemCost(pool, itemCostRoute[1], {
+        ...body,
+        organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 200, { item });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el costo." });
     }
   }
 
