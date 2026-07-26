@@ -144,3 +144,14 @@ test("las familias se configuran primero en el catálogo maestro V2", async () =
   assert.match(app, /await saveFamilyV2\(obj\)/);
   assert.match(app, /Guardando familia V2/);
 });
+
+test("la confirmación de facturas ingresa consumibles en V2 sin duplicar líneas", async () => {
+  const app = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  assert.match(app, /async function registerPurchaseLineV2/);
+  assert.match(app, /movementType:'RECEIPT'/);
+  assert.match(app, /idempotencyKey:`ai-receipt:\$\{draftId\}:\$\{lineIndex\}`/);
+  assert.match(app, /if\(a\.type==='Activo'\)throw new Error/);
+  assert.match(app, /confirmed=new Set\(d\.confirmedLines\|\|\[\]\)/);
+  assert.match(app, /await registerPurchaseLineV2/);
+  assert.match(app, /✓ ingresado V2/);
+});
