@@ -1530,6 +1530,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/state" && req.method === "PUT") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "La restauración heredada está reservada al administrador." });
+    }
     if (!pool) return json(res, 503, { error: "DATABASE_URL no configurada" });
     try {
       const body = await readJson(req);
