@@ -14,7 +14,9 @@ import {
   createCustodyAssignment,
   createInboundReceipt,
   createMaterialRequest,
+  createMaintenancePlan,
   createPurchaseRequisition,
+  createWorkOrder,
   createTransfer,
   dispatchTransfer,
   ensureDefaultOrganization,
@@ -23,6 +25,7 @@ import {
   listCustodyAssignments,
   listInboundReceipts,
   listMaterialRequests,
+  listMaintenance,
   listPurchaseRequisitions,
   listReplenishmentSuggestions,
   listSuppliers,
@@ -46,6 +49,7 @@ import {
   updateCycleCount,
   updateInboundReceipt,
   updateMaterialRequest,
+  updateWorkOrder,
   updatePurchaseRequisition,
   updateStorageLocation,
   updateInspectionRun,
@@ -1175,7 +1179,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, warehouseDirectory, workers, reconciliation] = await Promise.all([
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
@@ -1188,6 +1192,7 @@ const server = http.createServer(async (req, res) => {
         listReplenishmentSuggestions(pool, dashboardProfile),
         listPurchaseRequisitions(pool, dashboardProfile),
         listMaterialRequests(pool, dashboardProfile),
+        listMaintenance(pool, dashboardProfile),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1217,6 +1222,7 @@ const server = http.createServer(async (req, res) => {
         replenishmentSuggestions,
         purchaseRequisitions,
         materialRequests,
+        maintenance,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1514,6 +1520,68 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud interna." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/maintenance" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar mantenimiento." });
+    try {
+      return json(res, 200, await listMaintenance(pool, apiProfile));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar mantenimiento." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/maintenance/plans" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede configurar planes." });
+    try {
+      const body = await readJson(req);
+      const plan = await createMaintenancePlan(pool, {
+        ...body, organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, { plan });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el plan de mantenimiento." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/maintenance/work-orders" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede crear órdenes de trabajo." });
+    try {
+      const body = await readJson(req);
+      if (body.warehouseId && !apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
+        return json(res, 403, { error: "Sólo puedes crear órdenes para tu centro de costo." });
+      }
+      const result = await createWorkOrder(pool, {
+        ...body, organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear la orden de trabajo." });
+    }
+  }
+
+  const workOrderAction = url.pathname.match(/^\/api\/v1\/maintenance\/work-orders\/([^/]+)$/);
+  if (workOrderAction && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = action === "APPROVE" ? "approve" : "move";
+      if (!profileCan(apiProfile, permission)) {
+        return json(res, 403, { error: "Tu perfil no puede completar esta etapa del mantenimiento." });
+      }
+      const scope = (await pool.query("SELECT warehouse_id FROM logistics_work_orders WHERE id=$1",
+        [workOrderAction[1]])).rows[0];
+      if (!scope) return json(res, 404, { error: "Orden de trabajo no encontrada." });
+      if (scope.warehouse_id && !apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.warehouse_id))) {
+        return json(res, 403, { error: "La orden pertenece a otro centro de costo." });
+      }
+      const result = await updateWorkOrder(pool, workOrderAction[1], action, {
+        ...body, allowSelfApproval: Boolean(apiProfile.admin)
+      }, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la orden de trabajo." });
     }
   }
 

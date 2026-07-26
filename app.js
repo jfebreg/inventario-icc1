@@ -54,7 +54,7 @@ let requestedQrCode=qrCodeFromUrl||sessionStorage.getItem('icc-pending-qr-code')
 if(qrCodeFromUrl)sessionStorage.setItem('icc-pending-qr-code',qrCodeFromUrl);
 window.scannedAssetCode=requestedQrCode;
 let activeUserId=''; let route='login'; let assetFilter=''; let familyFilter='all';
-let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],workers:[],reconciliation:null,error:''};
+let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],maintenance:{plans:[],workOrders:[]},workers:[],reconciliation:null,error:''};
 let quickLogisticsLoading=false;
 let lastOperationalRefresh=0;
 let stateRevision=null;
@@ -116,7 +116,7 @@ async function refreshOperationalData(force=false){if(!activeUserId||!['quick','
 setInterval(()=>{if(document.visibilityState==='visible')refreshOperationalData()},30000);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refreshOperationalData()});
 window.addEventListener('focus',()=>refreshOperationalData());
-function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED','APPROVED','RECEIVED','ISSUED'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE','DRAFT','SUBMITTED','ORDERED','PARTIALLY_RECEIVED','ALLOCATED','PICKING'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
+function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED','APPROVED','RECEIVED','ISSUED','COMPLETED','AVAILABLE'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE','DRAFT','SUBMITTED','ORDERED','PARTIALLY_RECEIVED','ALLOCATED','PICKING','OPEN','IN_PROGRESS','WAITING_PARTS','REPAIR','MAINTENANCE','COUNTING'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED','BLOCKED'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
 function normalizeCode(value){let text=String(value||'').toUpperCase().trim(),m=text.match(/^([A-Z]+)[\s-]*0*(\d+)(?:[\s-]+0*(\d+))?$/);if(m)return `${m[1]}-${Number(m[2])}${m[3]?`-${Number(m[3])}`:''}`;let raw=text.replace(/[^A-Z0-9]/g,''),plain=raw.match(/^([A-Z]+)0*([0-9]+)$/);return plain?`${plain[1]}-${Number(plain[2])}`:raw}
 function assetBaseCode(a){return a?.baseCode||String(a?.code||'').replace(/^([A-Z]+-\d{6})-\d+$/,'$1')}
 function codeMatches(a,b){return normalizeCode(a)===normalizeCode(b)}
@@ -140,7 +140,7 @@ async function evidenceImageForInspection(id){let d=state.documents.find(x=>x.re
 async function downloadInspection(id){let i=state.inspections.find(x=>x.id===id),a=state.assets.find(x=>x.id===i?.assetId);if(!i||!a)return toast('No encontramos la inspección.');try{toast('Generando PDF de inspección...');let evidenceImage=await evidenceImageForInspection(id),res=await fetch('/api/inspection/pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({organization:org(),asset:a,familyName:family(a.family)?.name||'',inspection:i,inspectorSignature:signatureForPerson(i.inspector),approverSignature:signatureForPerson(i.approver||i.reviewer),evidenceImage})});if(!res.ok){let p=await res.json().catch(()=>({}));throw new Error(p.error||'No se pudo generar PDF')}let blob=await res.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`Inspeccion_${a.code}_${i.date}.pdf`;link.click();URL.revokeObjectURL(url)}catch(err){toast(err.message||'No se pudo generar el PDF.');downloadGeneratedHtml(`Inspeccion_${a.code}_${i.date}`,inspectionReportHtml(i,a))}}
 function downloadDocument(id){let d=state.documents.find(x=>x.id===id);if(!d)return toast('No encontramos el documento.');let i=state.inspections.find(x=>x.id===d.ref);if(i)return downloadInspection(i.id);if(d.content)return downloadGeneratedHtml(d.name||'documento',d.content);toast('Este registro aún no tiene archivo descargable.')}
 async function downloadStoredFile(href,name='archivo'){let res=await fetch(href);if(!res.ok){let payload=await res.json().catch(()=>({}));throw new Error(payload.error||'No se pudo descargar el archivo.')}let blob=await res.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=name;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}
-function canonicalDocumentLink(doc){let ref=String(doc?.ref||''),inspection=state.inspections.find(i=>i.id===ref||`${i.id}-correction`===ref);if(inspection?.canonicalInspectionId)return{entityType:'inspection_run',entityId:inspection.canonicalInspectionId,relationship:ref.endsWith('-correction')?'CORRECTION_EVIDENCE':'EVIDENCE'};let assignment=state.assignments.find(x=>x.id===ref);if(assignment?.canonicalCustodyId)return{entityType:'custody_assignment',entityId:assignment.canonicalCustodyId,relationship:'EVIDENCE'};let draft=state.aiDrafts.find(x=>x.id===ref);if(draft)return{entityType:'ai_draft',entityId:draft.id,relationship:'SOURCE'};return{entityType:'legacy_record',entityId:ref||doc.id,relationship:'EVIDENCE'}}
+function canonicalDocumentLink(doc){let ref=String(doc?.ref||''),inspection=state.inspections.find(i=>i.id===ref||`${i.id}-correction`===ref);if(inspection?.canonicalInspectionId)return{entityType:'inspection_run',entityId:inspection.canonicalInspectionId,relationship:ref.endsWith('-correction')?'CORRECTION_EVIDENCE':'EVIDENCE'};let assignment=state.assignments.find(x=>x.id===ref);if(assignment?.canonicalCustodyId)return{entityType:'custody_assignment',entityId:assignment.canonicalCustodyId,relationship:'EVIDENCE'};let workOrder=(logisticsV2.maintenance?.workOrders||[]).find(x=>String(x.id)===ref);if(workOrder)return{entityType:'work_order',entityId:workOrder.id,relationship:'COMPLETION_EVIDENCE'};let draft=state.aiDrafts.find(x=>x.id===ref);if(draft)return{entityType:'ai_draft',entityId:draft.id,relationship:'SOURCE'};return{entityType:'legacy_record',entityId:ref||doc.id,relationship:'EVIDENCE'}}
 async function uploadDocumentFile(doc,file,extra={}){if(!doc||!file||!file.name)return;try{doc.status='Subiendo archivo';save();let dataUrl=await readFileData(file),link=canonicalDocumentLink(doc),res=await fetch('/api/files/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,dataUrl,category:doc.kind||'documentos',ref:doc.ref||doc.id,code:doc.code||extra.code||'',center:doc.center||extra.center||'',uploadedBy:activeUser()?.name||'Sistema',documentLegacyId:doc.id,documentType:doc.kind||'OTHER',documentTitle:doc.name||file.name,...link})}),payload=await res.json();if(!res.ok)throw new Error(payload.error||'No se pudo subir archivo');doc.fileId=payload.id;doc.canonicalDocumentId=payload.canonicalDocumentId||'';doc.sha256=payload.sha256||'';doc.storageProvider=payload.provider;doc.storagePath=payload.path||'';doc.downloadUrl=payload.downloadUrl;doc.status='Archivado';audit('Archivo V2 archivado',`${doc.name} · ${payload.provider} · SHA-256 ${doc.sha256}`);save();render()}catch(err){doc.status='Pendiente archivo';doc.uploadError=err.message;save();toast('Documento registrado, pero el archivo no se pudo archivar.')}} 
 function centerNames(){ensureInventoryModel();return state.costCenters.map(c=>c.name)}
 function centerOptions(selected){return centerNames().map(n=>`<option value="${n}" ${n===selected?'selected':''}>${n}</option>`).join('')}
@@ -250,7 +250,7 @@ function correctionModal(id){let i=state.inspections.find(x=>x.id===id),a=state.
 let securityUsers=[],enrolledWorkers=[],securityDataLoaded=false,securityDataLoading=false;
 async function loadSecurityData(force=false){if(!window.ICCAuth?.configured||!activeUserId||securityDataLoading||(!force&&securityDataLoaded))return;securityDataLoading=true;try{let calls=[fetch('/api/workers').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar trabajadores.')))];if(can('admin'))calls.push(fetch('/api/admin/users').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar usuarios.'))));let values=await Promise.all(calls);enrolledWorkers=values[0].workers||[];if(values[1])securityUsers=values[1].users||[];securityDataLoaded=true;if(route==='settings')render()}catch(err){toast(err.message)}finally{securityDataLoading=false}}
 async function logisticsFetch(url,options={}){let controller=new AbortController(),timer,timeout=new Promise((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(new Error(`La consulta ${url} tardó más de 20 segundos. Revisa el despliegue de Render y vuelve a intentar.`))},20000)});try{let request=fetch(url,{...options,signal:controller.signal}),res=await Promise.race([request,timeout]),payload=await res.json().catch(()=>({}));if(!res.ok)throw new Error(payload.error||`No se pudo consultar ${url} (HTTP ${res.status}).`);return payload}finally{clearTimeout(timer)}}
-async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],warehouseDirectory:bundle.warehouseDirectory||bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],suppliers:bundle.suppliers||[],inboundReceipts:bundle.inboundReceipts||[],replenishmentSuggestions:bundle.replenishmentSuggestions||[],purchaseRequisitions:bundle.purchaseRequisitions||[],materialRequests:bundle.materialRequests||[],workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
+async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],warehouseDirectory:bundle.warehouseDirectory||bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],suppliers:bundle.suppliers||[],inboundReceipts:bundle.inboundReceipts||[],replenishmentSuggestions:bundle.replenishmentSuggestions||[],purchaseRequisitions:bundle.purchaseRequisitions||[],materialRequests:bundle.materialRequests||[],maintenance:bundle.maintenance||{plans:[],workOrders:[]},workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
 function canonicalItemForAsset(a){let base=normalizeCode(assetBaseCode(a));return logisticsV2.items.find(item=>normalizeCode(item.sku)===base)||logisticsV2.items.find(item=>(item.units||[]).some(unit=>codeMatches(unit.unitCode,a.code)))}
 function canonicalUnitForAsset(item,a){return (item?.units||[]).find(unit=>codeMatches(unit.unitCode,a.code))||null}
 function canonicalWarehouse(name){let normalized=String(name||'').trim().toLowerCase();return logisticsV2.warehouses.find(w=>String(w.cost_center||w.name).trim().toLowerCase()===normalized)||null}
@@ -511,6 +511,75 @@ function newMaterialRequestModal(){
   </div><div class="access-box" style="margin-top:16px"><strong>Flujo controlado:</strong> la existencia se descuenta de la disponibilidad al reservar y del stock físico sólo al confirmar la entrega.</div>
   <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Crear solicitud</button></div></form>`);
 }
+function serialUnitOptions(selected=''){
+  return (logisticsV2.items||[]).flatMap(item=>(item.units||[]).map(unit=>`<option value="${unit.id}" ${unit.id===selected?'selected':''}>${htmlSafe(unit.unitCode)} · ${htmlSafe(item.name)} · ${htmlSafe(unit.status||'')}</option>`)).join('');
+}
+function maintenanceV2Markup(){
+  if(!logisticsV2.loaded||logisticsV2.error)return'';
+  let plans=logisticsV2.maintenance?.plans||[],orders=logisticsV2.maintenance?.workOrders||[],
+    open=orders.filter(x=>!['COMPLETED','CANCELLED'].includes(x.status)),today=new Date().toISOString().slice(0,10),
+    overdue=plans.filter(x=>String(x.next_due_at||'').slice(0,10)<=today).length;
+  return `<section class="card logistics-v2" style="margin-top:20px" data-maintenance>
+    <div class="heading-row"><div><p class="eyebrow">Gestión del ciclo de vida</p><h2 class="section-title">Mantenimiento de activos</h2>
+    <p class="page-subtitle">Planes preventivos, órdenes de trabajo, bloqueo operacional, repuestos, costos y trazabilidad.</p></div><div class="actions">${can('admin')?'<button class="button secondary" data-new-maintenance-plan>＋ Plan preventivo</button>':''}${can('move')?'<button class="button" data-new-work-order>＋ Orden de trabajo</button>':''}</div></div>
+    <div class="grid metrics"><div class="card"><div class="metric-label">Órdenes abiertas</div><div class="metric-value">${open.length}</div></div>
+    <div class="card"><div class="metric-label">Planes vencidos</div><div class="metric-value">${overdue}</div><div class="metric-foot ${overdue?'alert':''}">${overdue?'Requieren programación':'Planificación al día'}</div></div></div>
+    <h3 class="section-title">Órdenes de trabajo</h3>
+    ${orders.length?`<div class="table-wrap"><table><thead><tr><th>Orden / activo</th><th>Trabajo</th><th>Prioridad</th><th>Estado</th><th>Repuestos</th><th>Costos</th><th>Acciones</th></tr></thead><tbody>${orders.slice(0,60).map(x=>`<tr>
+      <td><strong>${htmlSafe(x.work_order_number)}</strong><br><span class="code">${htmlSafe(x.unit_code)}</span><br><small>${htmlSafe(x.item_name)} · ${htmlSafe(x.warehouse_name||'Sin bodega')}</small></td>
+      <td>${htmlSafe(x.title)}<br><small>${htmlSafe(x.work_type)}${x.inspection_id?' · originada por inspección':''}</small></td>
+      <td>${tag(x.priority)}</td><td>${tag(x.status)}<br><small>Equipo: ${htmlSafe(x.asset_status)}</small></td>
+      <td>${(x.parts||[]).length?(x.parts||[]).map(p=>`${htmlSafe(p.sku)} · ${p.quantityUsed}/${p.quantityPlanned}`).join('<br>'):'Sin repuestos'}</td>
+      <td>MO $${Number(x.labor_cost||0).toLocaleString('es-CL')}<br><small>Rep. $${Number(x.parts_cost||0).toLocaleString('es-CL')}</small></td>
+      <td><div class="actions">
+        ${x.status==='OPEN'&&can('approve')?`<button class="link-button" data-work-action="APPROVE" data-work-id="${x.id}">Aprobar</button>`:''}
+        ${x.status==='APPROVED'&&can('move')?`<button class="link-button" data-work-action="START" data-work-id="${x.id}">Iniciar</button>`:''}
+        ${x.status==='IN_PROGRESS'&&can('move')?`<button class="link-button" data-work-action="WAIT_PARTS" data-work-id="${x.id}">Esperar repuesto</button>`:''}
+        ${x.status==='WAITING_PARTS'&&can('move')?`<button class="link-button" data-work-action="RESUME" data-work-id="${x.id}">Reanudar</button>`:''}
+        ${['IN_PROGRESS','WAITING_PARTS'].includes(x.status)&&can('move')?`<button class="link-button" data-work-complete="${x.id}">Cerrar trabajo</button>`:''}
+        ${['OPEN','APPROVED'].includes(x.status)&&can('move')?`<button class="link-button" data-work-action="CANCEL" data-work-id="${x.id}">Cancelar</button>`:''}
+      </div></td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay órdenes de trabajo registradas.</p>'}
+    <h3 class="section-title" style="margin-top:22px">Planes preventivos</h3>
+    ${plans.length?`<div class="table-wrap"><table><thead><tr><th>Equipo</th><th>Plan</th><th>Frecuencia</th><th>Próxima ejecución</th><th>Estado</th></tr></thead><tbody>${plans.map(x=>`<tr><td><span class="code">${htmlSafe(x.unit_code)}</span><br>${htmlSafe(x.item_name)}</td><td>${htmlSafe(x.name)}<br><small>${htmlSafe(x.maintenance_type)}</small></td><td>Cada ${x.interval_days} días</td><td>${htmlSafe(String(x.next_due_at||'').slice(0,10))}</td><td>${String(x.next_due_at||'').slice(0,10)<=today?tag('VENCIDO'):tag('PROGRAMADO')}</td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay planes preventivos configurados.</p>'}
+  </section>`;
+}
+function maintenancePlanModal(){
+  let units=serialUnitOptions();if(!units)return toast('No hay activos serializados disponibles.');
+  modal('Nuevo plan preventivo',`<form id="maintenancePlanForm"><div class="form-grid"><label class="full">Equipo<select name="assetUnitId" required>${units}</select></label>
+    <label class="full">Nombre del plan<input name="name" required placeholder="Ej. mantención trimestral de soldadora"></label>
+    <label>Tipo<select name="maintenanceType"><option value="PREVENTIVE">Preventivo</option><option value="PREDICTIVE">Predictivo</option><option value="LEGAL">Exigencia legal</option></select></label>
+    <label>Intervalo (días)<input name="intervalDays" type="number" min="1" value="90" required></label>
+    <label>Próxima ejecución<input name="nextDueAt" type="date" required></label>
+    <label>Duración estimada (horas)<input name="estimatedDurationHours" type="number" min="0.1" step="0.1"></label>
+    <label class="full">Checklist, un punto por línea<textarea name="checklist" placeholder="Limpieza general&#10;Verificar cables y conexiones&#10;Prueba funcional"></textarea></label>
+  </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Guardar plan</button></div></form>`);
+}
+function workOrderModal(){
+  let units=serialUnitOptions(),warehouses=(logisticsV2.warehouses||[]).map(x=>`<option value="${x.id}">${htmlSafe(x.name)}</option>`).join(''),
+    parts=`<option value="">Sin repuesto planificado</option>${(logisticsV2.items||[]).filter(x=>x.tracking_type!=='SERIAL').map(x=>`<option value="${x.id}">${htmlSafe(x.sku)} · ${htmlSafe(x.name)}</option>`).join('')}`;
+  if(!units||!warehouses)return toast('Faltan equipos o bodegas para crear la orden.');
+  modal('Nueva orden de trabajo',`<form id="workOrderForm"><div class="form-grid"><label class="full">Equipo<select name="assetUnitId" required>${units}</select></label>
+    <label>Bodega responsable<select name="warehouseId" required>${warehouses}</select></label>
+    <label>Tipo<select name="workType"><option value="CORRECTIVE">Correctivo</option><option value="PREVENTIVE">Preventivo</option><option value="PREDICTIVE">Predictivo</option></select></label>
+    <label>Prioridad<select name="priority"><option value="MEDIUM">Media</option><option value="HIGH">Alta</option><option value="CRITICAL">Crítica</option><option value="LOW">Baja</option></select></label>
+    <label>Fecha límite<input name="dueAt" type="date"></label><label class="full">Título<input name="title" required placeholder="Trabajo requerido"></label>
+    <label class="full">Descripción<textarea name="description" required></textarea></label>
+    <label class="full">Repuesto previsto<select name="partItemId">${parts}</select></label><label>Cantidad repuesto<input name="partQuantity" type="number" min="0.0001" step="0.0001" value="1"></label>
+    <label>Costo unitario estimado<input name="partUnitCost" type="number" min="0" step="1" value="0"></label>
+    <label class="full"><input name="blocksOperation" type="checkbox" checked> Bloquear el equipo hasta cerrar el trabajo</label>
+  </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Crear orden</button></div></form>`);
+}
+function completeWorkOrderModal(id){
+  let order=(logisticsV2.maintenance?.workOrders||[]).find(x=>x.id===id);if(!order)return toast('No encontramos la orden.');
+  modal(`Cerrar orden · ${order.work_order_number}`,`<form id="completeWorkOrderForm" data-id="${id}"><div class="access-box"><strong>${htmlSafe(order.unit_code)} · ${htmlSafe(order.item_name)}</strong><div>${htmlSafe(order.title)}</div></div><div class="form-grid" style="margin-top:16px">
+    <label class="full">Trabajo realizado / resolución<textarea name="resolution" required placeholder="Describe diagnóstico, reparación, prueba y condición final"></textarea></label>
+    <label>Horas fuera de servicio<input name="downtimeHours" type="number" min="0" step="0.1" value="0"></label>
+    <label>Costo mano de obra<input name="laborCost" type="number" min="0" step="1" value="0"></label>
+    <label class="full">Observaciones<input name="notes" placeholder="Técnico, garantía o recomendaciones"></label>
+    <label class="full">Evidencia de cierre<input name="evidence" type="file" accept="application/pdf,image/*,.doc,.docx" required><small>Fotografía, informe técnico, orden firmada u otro respaldo.</small></label>
+  </div><div class="access-box" style="margin-top:16px">${order.inspection_id?'El equipo seguirá bloqueado hasta que el aprobador verifique el levantamiento de la inspección.':'Al cerrar, el equipo volverá a estado disponible.'}</div>
+  <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Cerrar orden y consumir repuestos</button></div></form>`);
+}
 function warehouseLocationsV2Markup(){
   if(!logisticsV2.loaded||logisticsV2.error)return'';
   let rows=(logisticsV2.warehouses||[]).flatMap(warehouse=>(warehouse.locations||[])
@@ -574,7 +643,7 @@ function printLocationLabel(id){
 }
 function custodyV2Markup(){let rows=logisticsV2.custody||[];if(!logisticsV2.loaded||logisticsV2.error)return'';return `<section class="card logistics-v2" style="margin-top:20px"><div class="heading-row"><div><p class="eyebrow">Responsabilidad individual</p><h2 class="section-title">Entregas activas a terreno</h2><p class="page-subtitle">Activos bajo custodia y EPP pendiente o aceptado. Los consumibles quedan en el libro mayor como consumo.</p></div><span class="tag ${rows.length?'warning':'ok'}">${rows.length} activa(s)</span></div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Producto</th><th>Trabajador</th><th>Bodega</th><th>Tipo</th><th>Estado</th><th>Fecha</th></tr></thead><tbody>${rows.map(x=>`<tr><td><strong>${htmlSafe(x.item_name)}</strong><br><span class="code">${htmlSafe(x.unit_code||x.sku)}${x.lot_number?` · Lote ${htmlSafe(x.lot_number)}`:''}</span></td><td>${htmlSafe(x.worker_name||'Sin identificar')}<br><small>${htmlSafe(x.worker_rut||x.worker_email||'')}</small></td><td>${htmlSafe(x.warehouse_name||x.cost_center||'—')}</td><td>${htmlSafe(x.assignment_type)}</td><td>${tag(x.status)}</td><td>${htmlSafe(String(x.created_at||'').slice(0,10))}</td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay activos o EPP actualmente asignados a trabajadores.</p>'}</section>`}
 function cycleCountMarkup(){if(!logisticsV2.loaded||logisticsV2.error)return'';let rows=logisticsV2.cycleCounts||[],open=rows.filter(x=>!['POSTED','CANCELLED'].includes(x.status));return `<section class="card logistics-v2" style="margin-top:20px" data-cycle-counts><div class="heading-row"><div><p class="eyebrow">Control de existencias</p><h2 class="section-title">Conteos cíclicos</h2><p class="page-subtitle">Conteo ciego de consumibles, aprobación independiente y ajuste automático del libro mayor.</p></div>${can('move')?'<button class="button" data-new-cycle-count>＋ Iniciar conteo</button>':''}</div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Conteo</th><th>Bodega</th><th>Estado</th><th>Líneas</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>${rows.slice(0,30).map(x=>{let action=x.status==='SUBMITTED'&&can('approve')?`<button class="link-button" data-cycle-action="APPROVE" data-cycle-id="${x.id}">Aprobar</button>`:x.status==='APPROVED'&&can('approve')?`<button class="link-button" data-cycle-action="POST" data-cycle-id="${x.id}">Contabilizar</button>`:['DRAFT','IN_PROGRESS'].includes(x.status)&&can('move')?`<button class="link-button" data-cycle-open="${x.id}">Contar</button>${x.status==='IN_PROGRESS'?`<button class="link-button" data-cycle-action="SUBMIT" data-cycle-id="${x.id}">Enviar</button>`:''}<button class="link-button" data-cycle-action="CANCEL" data-cycle-id="${x.id}">Cancelar</button>`:`<button class="link-button" data-cycle-open="${x.id}">Ver</button>`;return `<tr><td><strong>${htmlSafe(x.count_number)}</strong><br><small>${x.blind_count?'Conteo ciego':'Conteo informado'}</small></td><td>${htmlSafe(x.warehouse_name||x.cost_center)}</td><td>${tag(x.status)}</td><td>${(x.lines||[]).length}</td><td>${String(x.created_at||'').slice(0,10)}</td><td><div class="actions">${action}</div></td></tr>`}).join('')}</tbody></table></div>`:'<p class="empty">No hay conteos registrados.</p>'}${open.length?`<div class="access-box" style="margin-top:14px">${open.length} conteo(s) pendiente(s) de cierre.</div>`:''}</section>`}
-function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+warehouseLocationsV2Markup()+materialRequestsV2Markup()+replenishmentV2Markup()+inboundV2Markup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
+function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+maintenanceV2Markup()+warehouseLocationsV2Markup()+materialRequestsV2Markup()+replenishmentV2Markup()+inboundV2Markup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
 function newCycleCountModal(){let options=(logisticsV2.warehouses||[]).map(w=>`<option value="${w.id}">${htmlSafe(w.name)} · ${htmlSafe(w.cost_center||'')}</option>`).join('');modal('Iniciar conteo cíclico',`<form id="newCycleCountForm"><div class="form-grid"><label class="full">Bodega<select name="warehouseId" required>${options}</select></label><label class="full">Observación<input name="notes" placeholder="Ej. conteo semanal, sector o responsable"></label></div><div class="access-box" style="margin-top:16px">El conteo será ciego: el usuario no verá las cantidades esperadas hasta enviarlo a aprobación. En esta etapa se incluyen consumibles; los activos serializados se controlan individualmente.</div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Crear conteo</button></div></form>`)}
 function cycleCountModal(id){let count=(logisticsV2.cycleCounts||[]).find(x=>x.id===id);if(!count)return toast('No encontramos el conteo.');let editable=['DRAFT','IN_PROGRESS'].includes(count.status)&&can('move'),showExpected=!['DRAFT','IN_PROGRESS'].includes(count.status);modal(`Conteo · ${count.count_number}`,`<div class="access-box"><strong>${htmlSafe(count.warehouse_name)}</strong><div>Estado: ${htmlSafe(count.status)} · ${count.blind_count?'Conteo ciego':'Conteo informado'}</div></div><form id="cycleCountForm" data-id="${count.id}"><div class="table-wrap" style="margin-top:16px"><table><thead><tr><th>Producto</th><th>Ubicación</th>${showExpected?'<th>Esperado</th>':''}<th>Contado</th>${showExpected?'<th>Diferencia</th>':''}<th>Observación</th></tr></thead><tbody>${(count.lines||[]).map(line=>`<tr><td><strong>${htmlSafe(line.item_name)}</strong><br><span class="code">${htmlSafe(line.sku)}</span></td><td>${htmlSafe(line.location_name)}</td>${showExpected?`<td>${line.expected_quantity}</td>`:''}<td><input name="qty-${line.id}" type="number" min="0" step="0.0001" required ${editable?'':'readonly'} value="${line.counted_quantity??''}" style="min-width:100px"></td>${showExpected?`<td><strong>${Number(line.variance||0)>0?'+':''}${line.variance??0}</strong></td>`:''}<td><input name="note-${line.id}" ${editable?'':'readonly'} value="${htmlSafe(line.notes||'')}" placeholder="Opcional"></td></tr>`).join('')}</tbody></table></div><div class="form-actions"><button type="button" class="outline" data-close>Cerrar</button>${editable?'<button class="button">Guardar cantidades</button>':''}</div></form>`)}
 async function cycleCountAction(id,action,extra={}){let payload=await logisticsFetch(`/api/v1/cycle-counts/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});await loadLogisticsV2(true);toast(action==='SUBMIT'?'Conteo enviado a aprobación.':action==='APPROVE'?'Conteo aprobado.':action==='POST'?`Conteo contabilizado: ${payload.adjustedLines||0} ajuste(s).`:'Conteo actualizado.');return payload}
@@ -948,6 +1017,74 @@ document.addEventListener('submit',async e=>{
     await loadLogisticsV2(true);closeModal();toast(`Recepción ${result.receipt?.receipt_number||''} creada. El stock permanece bloqueado en cuarentena.`);render();
   }catch(err){toast(err.message||'No se pudo registrar la recepción.')}finally{unlock()}
 },true);
+document.addEventListener('click',async e=>{
+  let t=e.target.closest?.('[data-new-maintenance-plan],[data-new-work-order],[data-work-action],[data-work-complete]');if(!t)return;e.preventDefault();
+  if(t.dataset.newMaintenancePlan!==undefined)return maintenancePlanModal();
+  if(t.dataset.newWorkOrder!==undefined)return workOrderModal();
+  if(t.dataset.workComplete)return completeWorkOrderModal(t.dataset.workComplete);
+  let order=(logisticsV2.maintenance?.workOrders||[]).find(x=>x.id===t.dataset.workId),action=t.dataset.workAction,
+    labels={APPROVE:'aprobar',START:'iniciar el trabajo',WAIT_PARTS:'dejar en espera de repuestos',RESUME:'reanudar',CANCEL:'cancelar'};
+  if(!order||!confirm(`¿Deseas ${labels[action]||'actualizar'} la orden ${order.work_order_number}?`))return;
+  t.disabled=true;
+  try{
+    await logisticsFetch(`/api/v1/maintenance/work-orders/${encodeURIComponent(order.id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      action,notes:`${labels[action]||action} por ${activeUser().name}`
+    })});
+    await loadLogisticsV2(true);toast(`Orden ${order.work_order_number} actualizada.`);render();
+  }catch(err){toast(err.message||'No se pudo actualizar la orden.');t.disabled=false}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='maintenancePlanForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Guardando plan…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target);
+    await logisticsFetch('/api/v1/maintenance/plans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      organizationId:logisticsV2.status?.organizationId,assetUnitId:d.get('assetUnitId'),
+      name:d.get('name'),maintenanceType:d.get('maintenanceType'),intervalDays:Number(d.get('intervalDays')),
+      nextDueAt:d.get('nextDueAt'),estimatedDurationHours:Number(d.get('estimatedDurationHours')||0),
+      checklist:String(d.get('checklist')||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean)
+    })});
+    await loadLogisticsV2(true);closeModal();toast('Plan preventivo guardado.');render();
+  }catch(err){toast(err.message||'No se pudo guardar el plan.')}finally{unlock()}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='workOrderForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Creando orden…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target),partItemId=d.get('partItemId'),
+      parts=partItemId?[{itemId:partItemId,quantity:Number(d.get('partQuantity')),unitCost:Number(d.get('partUnitCost')||0)}]:[];
+    let result=await logisticsFetch('/api/v1/maintenance/work-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      organizationId:logisticsV2.status?.organizationId,assetUnitId:d.get('assetUnitId'),
+      warehouseId:d.get('warehouseId'),workType:d.get('workType'),priority:d.get('priority'),
+      dueAt:d.get('dueAt'),title:d.get('title'),description:d.get('description'),
+      blocksOperation:d.has('blocksOperation'),parts
+    })});
+    await loadLogisticsV2(true);closeModal();toast(`Orden ${result.workOrder?.work_order_number||''} creada. Equipo bloqueado según configuración.`);render();
+  }catch(err){toast(err.message||'No se pudo crear la orden.')}finally{unlock()}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='completeWorkOrderForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Cerrando orden…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target),order=(logisticsV2.maintenance?.workOrders||[]).find(x=>x.id===e.target.dataset.id),
+      evidence=d.get('evidence');
+    if(!order)throw new Error('No encontramos la orden de trabajo.');
+    await logisticsFetch(`/api/v1/maintenance/work-orders/${encodeURIComponent(e.target.dataset.id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      action:'COMPLETE',resolution:d.get('resolution'),downtimeHours:Number(d.get('downtimeHours')||0),
+      laborCost:Number(d.get('laborCost')||0),notes:d.get('notes')
+    })});
+    let document=addDocument('Cierre de mantenimiento',evidence.name,'Orden de trabajo',order.id,{
+      code:order.unit_code,center:order.cost_center||order.warehouse_name,status:'Pendiente archivo',
+      type:evidence.type||'',size:evidence.size||0
+    });
+    await persistState();
+    uploadDocumentFile(document,evidence,{code:order.unit_code,center:order.cost_center||order.warehouse_name});
+    await loadLogisticsV2(true);closeModal();toast('Orden cerrada y repuestos descontados del inventario.');render();
+  }catch(err){toast(err.message||'No se pudo cerrar la orden.')}finally{unlock()}
+},true);
 document.addEventListener('click',e=>{
   let t=e.target.closest?.('[data-new-location],[data-location-label],[data-location-edit],[data-print-location]');if(!t)return;e.preventDefault();
   if(t.dataset.newLocation!==undefined)return newLocationModal();
@@ -1079,7 +1216,7 @@ document.addEventListener('submit',async e=>{
 },true);
 $('#userSwitcher').onclick=()=>{activeUserId?logout():(route='login',render())};$('#profileButton').onclick=()=>{activeUserId?(route='settings',render()):(route='login',render())};
 async function loadRemoteState(){let res=await fetch('/api/state');if(!res.ok)return false;let payload=await res.json();if(payload?.state){state=repairTextState(payload.state);stateRevision=Number(payload.revision||0);localStorage.setItem(`${storageKey}-revision`,String(stateRevision));ensureInventoryModel();reconcileLegacyInspectionWorkflow();let authUser=window.ICCAuth?.appUser?.();if(authUser&&!state.users.some(u=>u.id===authUser.id))state.users.unshift(authUser);localStorage.setItem(storageKey,JSON.stringify(state));openAssetFromUrl();return true}return false}
-function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
+function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],maintenance:{plans:[],workOrders:[]},workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
 window.addEventListener('icc-auth-error',e=>toast(e.detail));
 window.addEventListener('icc-state-conflict',e=>toast(e.detail||'Los datos cambiaron en otra sesión. Actualiza la pantalla.'));
 window.addEventListener('icc-realtime',()=>{renderRealtimeCounter();if(route==='tasks')render()});
