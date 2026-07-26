@@ -66,3 +66,14 @@ test("los artículos nuevos se registran primero en el catálogo maestro V2", as
   assert.match(app, /await registerAssetV2/);
   assert.match(logistics, /item-opening:/);
 });
+
+test("agregar activos iguales crea las unidades primero en V2", async () => {
+  const app = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  const cloneStart = app.indexOf("if(e.target.id!=='cloneAssetForm')");
+  const cloneHandler = app.slice(cloneStart, cloneStart + 5000);
+  assert.notEqual(cloneStart, -1);
+  assert.match(cloneHandler, /Creando unidades V2/);
+  assert.match(cloneHandler, /await registerAssetV2/);
+  assert.match(cloneHandler, /await persistState/);
+  assert.match(cloneHandler, /await loadLogisticsV2/);
+});

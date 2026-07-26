@@ -362,7 +362,58 @@ document.addEventListener('submit',async e=>{
   }finally{unlock()}
 },true);
 document.addEventListener('submit',e=>{if(e.target.id!=='userForm')return;e.preventDefault();e.stopImmediatePropagation();let d=new FormData(e.target),id=e.target.dataset.id,old=id?state.users.find(x=>x.id===id):null,oldName=old?.name,role=d.get('role')||'Usuario',admin=role==='Administrador central',obj={id:id||`u${Date.now()}`,name:d.get('name'),costCenter:d.get('costCenter'),initials:String(d.get('initials')||'').toUpperCase(),pin:String(d.get('pin')||'1234'),admin,role},file=e.target.querySelector('input[type="file"]')?.files?.[0],finish=()=>{if(id)Object.assign(old,obj);else state.users.push(obj);if(oldName&&oldName!==obj.name&&state.workerSignatures?.[oldName]&&!state.workerSignatures[obj.name])state.workerSignatures[obj.name]=state.workerSignatures[oldName];audit('Usuario guardado',obj.name);save();$('#modal').className='modal-root';toast('Usuario guardado.');render()};if(file)readImage(file,data=>{state.workerSignatures[obj.name]=data;finish()});else finish()},true);
-document.addEventListener('submit',e=>{if(e.target.id!=='cloneAssetForm')return;e.preventDefault();e.stopImmediatePropagation();let base=state.assets.find(x=>x.id===e.target.dataset.id),d=new FormData(e.target),qty=Math.max(1,Number(d.get('qty')||1)),location=d.get('location')||base.location||'Bodega Central';if(!base)return toast('No encontramos el activo base.');let baseCode=assetBaseCode(base),unitOf=a=>Number(a.unitNo||(a.code===baseCode?1:((String(a.code).match(/^.+-(\d+)$/)||[])[1]||1))),siblings=state.assets.filter(a=>assetBaseCode(a)===baseCode),maxUnit=Math.max(1,...siblings.map(unitOf)),total=maxUnit+qty;state.assets.forEach(a=>{if(assetBaseCode(a)===baseCode){a.baseCode=baseCode;a.unitCount=total;if(!a.unitNo)a.unitNo=unitOf(a)}});let created=[];for(let i=1;i<=qty;i++){let unit=maxUnit+i,code=`${baseCode}-${unit}`,a={...base,id:`a${Date.now()}-${unit}`,code,baseCode,unitNo:unit,unitCount:total,serial:'',location,responsible:activeUser().name,status:'Operativo',stocks:{},stock:1};a.stocks[location]=1;delete a.custodyWorker;delete a.custodyEmail;state.assets.push(a);created.push(a);state.movements.unshift({id:`m${Date.now()}-${unit}`,date:new Date().toISOString().slice(0,10),code,action:'Ingreso a bodega',user:activeUser().name,from:'Activo igual',to:location,qty:1,status:'Recibido',detail:`Unidad ${unit} de ${total} creada desde ${base.code}`})}save();closeModal();toast(`Unidades creadas: ${created[0].code} a ${created[created.length-1].code}`);route='inventory';render()},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='cloneAssetForm')return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Creando unidades V2…');
+  if(!unlock)return;
+  let canonicalCreated=false;
+  try{
+    let base=state.assets.find(x=>x.id===e.target.dataset.id);
+    if(!base)throw new Error('No encontramos el activo base.');
+    let d=new FormData(e.target),qty=Math.max(1,Number(d.get('qty')||1)),
+      location=d.get('location')||base.location||'Bodega Central',
+      f=family(base.family);
+    if(!f)throw new Error('La familia del activo base ya no existe.');
+    let baseCode=assetBaseCode(base),
+      unitOf=a=>Number(a.unitNo||(a.code===baseCode?1:((String(a.code).match(/^.+-(\d+)$/)||[])[1]||1))),
+      siblings=state.assets.filter(a=>assetBaseCode(a)===baseCode),
+      maxUnit=Math.max(1,...siblings.map(unitOf)),total=maxUnit+qty,
+      stamp=Date.now(),created=[];
+    for(let i=1;i<=qty;i++){
+      let unit=maxUnit+i,code=`${baseCode}-${unit}`,
+        a={...base,id:`a${stamp}-${unit}`,code,baseCode,unitNo:unit,unitCount:total,serial:'',location,responsible:activeUser().name,status:'Operativo',stocks:{},stock:1};
+      a.stocks[location]=1;
+      delete a.custodyWorker;
+      delete a.custodyEmail;
+      created.push(a);
+    }
+    let technical={layers:base.layers||'',width:base.width||'',length:base.length||'',capacity:base.capacity||'',isEpp:Boolean(base.isEpp)};
+    await registerAssetV2({familyInfo:f,type:'Activo',baseCode,assets:created,location,technical,minimum:Number(base.minimum||0),initialStock:1});
+    canonicalCreated=true;
+    state.assets.forEach(a=>{
+      if(assetBaseCode(a)===baseCode){
+        a.baseCode=baseCode;
+        a.unitCount=total;
+        if(!a.unitNo)a.unitNo=unitOf(a);
+      }
+    });
+    for(const a of created){
+      state.assets.push(a);
+      state.movements.unshift({id:`m${stamp}-${a.unitNo}`,date:new Date().toISOString().slice(0,10),code:a.code,action:'Ingreso a bodega',user:activeUser().name,from:'Activo igual V2',to:location,qty:1,status:'Recibido',detail:`Unidad ${a.unitNo} de ${total} creada desde ${base.code}`});
+    }
+    audit('Unidades iguales V2 registradas',`${baseCode} · ${qty} unidad(es) · ${location}`);
+    await persistState();
+    await loadLogisticsV2(true);
+    closeModal();
+    toast(`Unidades V2 creadas: ${created[0].code} a ${created[created.length-1].code}`);
+    route='inventory';
+    render();
+  }catch(err){
+    toast(canonicalCreated?`Unidades creadas en V2; respaldo pendiente: ${err.message}`:(err.message||'No se pudieron crear las unidades.'));
+  }finally{unlock()}
+},true);
 async function uploadWorkerSignature(file,name,center){if(!file?.name)return{};let dataUrl=await readFileData(file),res=await fetch('/api/files/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,dataUrl,category:'firmas-trabajadores',ref:name,center,uploadedBy:activeUser().name})}),payload=await res.json();if(!res.ok)throw new Error(payload.error||'No se pudo guardar la firma.');return{signatureFileId:payload.id,signatureData:dataUrl}}
 async function saveWorkerPayload(payload,id){let res=await fetch(id?`/api/workers/${encodeURIComponent(id)}`:'/api/workers',{method:id?'PATCH':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),body=await res.json();if(!res.ok)throw new Error(body.error||'No se pudo guardar el trabajador.');return body}
 document.addEventListener('submit',async e=>{if(e.target.id!=='authUserForm')return;e.preventDefault();e.stopImmediatePropagation();let d=new FormData(e.target),id=e.target.dataset.id,payload={id:id||undefined,name:d.get('name'),email:d.get('email'),costCenter:d.get('costCenter'),role:d.get('role'),initials:String(d.get('initials')||'').toUpperCase()};try{let res=await fetch(id?`/api/admin/users/${encodeURIComponent(id)}`:'/api/admin/users/invite',{method:id?'PATCH':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),body=await res.json();if(!res.ok)throw new Error(body.error||'No se pudo guardar el usuario.');if(!id)toast(body.message||'Invitación enviada.');else toast('Usuario actualizado.');closeModal();securityDataLoaded=false;await loadSecurityData(true)}catch(err){toast(err.message)}},true);
