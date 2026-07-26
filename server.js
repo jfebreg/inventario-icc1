@@ -9,6 +9,7 @@ import { createClient } from "@supabase/supabase-js";
 import { timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
+  createInspectionRun,
   createCustodyAssignment,
   createTransfer,
   dispatchTransfer,
@@ -1162,6 +1163,33 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       const conflict = error.code === "23505";
       return json(res, conflict ? 409 : 400, { error: conflict ? "El código o número de serie ya existe." : (error.message || "No se pudo registrar el artículo.") });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspections" && req.method === "POST") {
+    if (!profileCan(apiProfile, "inspect")) return json(res, 403, { error: "Tu perfil no puede registrar inspecciones." });
+    try {
+      const body = await readJson(req);
+      if (!body.assetUnitId || !body.warehouseId) {
+        return json(res, 400, { error: "La inspección requiere una unidad y su bodega V2." });
+      }
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
+        return json(res, 403, { error: "Sólo puedes inspeccionar equipos de tu centro de costo." });
+      }
+      const currentLocation = await pool.query(`SELECT 1 FROM logistics_stock_balances b
+        JOIN logistics_locations loc ON loc.id=b.location_id
+        WHERE b.organization_id=$1 AND b.asset_unit_id=$2 AND loc.warehouse_id=$3 AND b.quantity>0`,
+        [body.organizationId || logisticsOrganizationId, body.assetUnitId, body.warehouseId]);
+      if (!currentLocation.rowCount) {
+        return json(res, 409, { error: "El equipo no figura disponible en la bodega seleccionada según el libro mayor V2." });
+      }
+      const result = await createInspectionRun(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, result.replayed ? 200 : 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar la inspección." });
     }
   }
 

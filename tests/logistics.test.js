@@ -77,3 +77,21 @@ test("agregar activos iguales crea las unidades primero en V2", async () => {
   assert.match(cloneHandler, /await persistState/);
   assert.match(cloneHandler, /await loadLogisticsV2/);
 });
+
+test("las inspecciones se registran primero con plantilla versionada en V2", async () => {
+  const [app, server, logistics] = await Promise.all([
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../server.js", import.meta.url), "utf8"),
+    readFile(new URL("../lib/logistics.js", import.meta.url), "utf8")
+  ]);
+  assert.match(logistics, /export async function createInspectionRun/);
+  assert.match(logistics, /logistics_inspection_template_versions/);
+  assert.match(logistics, /INSPECTION_SUBMITTED/);
+  assert.match(logistics, /legacy_type='inspection'/);
+  assert.match(server, /url\.pathname === "\/api\/v1\/inspections" && req\.method === "POST"/);
+  assert.match(server, /profileCan\(apiProfile, "inspect"\)/);
+  assert.match(app, /async function registerInspectionV2/);
+  const handler = app.slice(app.indexOf("if(e.target.id!=='inspectionForm')"), app.indexOf("if(e.target.id!=='organizationForm')"));
+  assert.match(handler, /await registerInspectionV2/);
+  assert.match(handler, /await persistState/);
+});
