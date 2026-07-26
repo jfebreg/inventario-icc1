@@ -112,3 +112,20 @@ test("plazos, correcciones y aprobaciones cierran el ciclo V2", async () => {
   assert.match(app, /data-verify-inspection/);
   assert.match(app, /data-approve-inspection/);
 });
+
+test("las bodegas nuevas nacen con ubicaciones operativas en V2", async () => {
+  const [app, server, logistics] = await Promise.all([
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../server.js", import.meta.url), "utf8"),
+    readFile(new URL("../lib/logistics.js", import.meta.url), "utf8")
+  ]);
+  assert.match(logistics, /export async function registerWarehouse/);
+  assert.match(logistics, /\["STORAGE", "Almacenamiento"\]/);
+  assert.match(logistics, /\["RECEIVING", "Recepción"\]/);
+  assert.match(logistics, /\["DISPATCH", "Despacho"\]/);
+  assert.match(server, /url\.pathname === "\/api\/v1\/warehouses" && req\.method === "POST"/);
+  assert.match(server, /profileCan\(apiProfile, "admin"\)/);
+  assert.match(app, /async function registerWarehouseV2/);
+  assert.match(app, /await registerWarehouseV2\(center\)/);
+  assert.match(app, /Creando bodega V2/);
+});

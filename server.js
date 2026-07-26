@@ -23,6 +23,7 @@ import {
   registerCanonicalItem,
   reconcileLegacyState,
   receiveTransfer,
+  registerWarehouse,
   returnCustodyAssignment,
   runLogisticsMigrations,
   stockSnapshot,
@@ -1230,6 +1231,20 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { warehouses: await listWarehouses(pool, apiProfile) });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron consultar las bodegas." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/warehouses" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede crear bodegas." });
+    try {
+      const body = await readJson(req);
+      const result = await registerWarehouse(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear la bodega." });
     }
   }
 
