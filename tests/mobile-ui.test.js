@@ -40,3 +40,10 @@ test("las acciones móviles incluyen entrega a terreno", () => {
   assert.match(app, /data-mobile-terrain/);
   assert.match(app, /deliveryModal\(a\.id\)/);
 });
+
+test("el QR muestra stock y ubicación oficiales del libro mayor V2", () => {
+  assert.match(app, /function canonicalStockContext/);
+  assert.match(app, /function renderCanonicalQrStatus/);
+  assert.match(app, /Libro mayor V2/);
+  assert.match(css, /\.canonical-qr-status/);
+});
