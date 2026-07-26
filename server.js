@@ -25,7 +25,8 @@ import {
   receiveTransfer,
   returnCustodyAssignment,
   runLogisticsMigrations,
-  stockSnapshot
+  stockSnapshot,
+  updateInspectionRun
 } from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -1190,6 +1191,36 @@ const server = http.createServer(async (req, res) => {
       return json(res, result.replayed ? 200 : 201, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo registrar la inspección." });
+    }
+  }
+
+  const inspectionAction = url.pathname.match(/^\/api\/v1\/inspections\/([^/]+)\/(deadline|correction|approve|verify)$/);
+  if (inspectionAction && req.method === "POST") {
+    const [, inspectionId, operation] = inspectionAction;
+    const permission = operation === "correction" ? "inspect" : "approve";
+    if (!profileCan(apiProfile, permission)) {
+      return json(res, 403, { error: "Tu perfil no puede completar esta etapa de la inspección." });
+    }
+    try {
+      const scope = await pool.query("SELECT warehouse_id FROM logistics_inspection_runs WHERE id=$1", [inspectionId]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Inspección V2 no encontrada." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La inspección pertenece a otro centro de costo." });
+      }
+      const actionByOperation = {
+        deadline: "SET_DEADLINE",
+        correction: "RECORD_CORRECTION",
+        approve: "APPROVE",
+        verify: "VERIFY_CORRECTION"
+      };
+      const body = await readJson(req);
+      const result = await updateInspectionRun(pool, inspectionId, {
+        ...body,
+        action: actionByOperation[operation]
+      }, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la inspección." });
     }
   }
 

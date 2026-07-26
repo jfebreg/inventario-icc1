@@ -95,3 +95,20 @@ test("las inspecciones se registran primero con plantilla versionada en V2", asy
   assert.match(handler, /await registerInspectionV2/);
   assert.match(handler, /await persistState/);
 });
+
+test("plazos, correcciones y aprobaciones cierran el ciclo V2", async () => {
+  const [app, server, logistics] = await Promise.all([
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../server.js", import.meta.url), "utf8"),
+    readFile(new URL("../lib/logistics.js", import.meta.url), "utf8")
+  ]);
+  assert.match(logistics, /export async function updateInspectionRun/);
+  assert.match(logistics, /SET_DEADLINE/);
+  assert.match(logistics, /RECORD_CORRECTION/);
+  assert.match(logistics, /VERIFY_CORRECTION/);
+  assert.match(server, /\/\(deadline\|correction\|approve\|verify\)/);
+  assert.match(app, /await updateInspectionV2\(i,'deadline'/);
+  assert.match(app, /await updateInspectionV2\(inspection,'correction'/);
+  assert.match(app, /data-verify-inspection/);
+  assert.match(app, /data-approve-inspection/);
+});
