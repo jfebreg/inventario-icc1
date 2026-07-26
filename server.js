@@ -9,12 +9,14 @@ import { createClient } from "@supabase/supabase-js";
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
+  createCycleCount,
   createInspectionRun,
   createCustodyAssignment,
   createTransfer,
   dispatchTransfer,
   ensureDefaultOrganization,
   listCanonicalItems,
+  listCycleCounts,
   listCustodyAssignments,
   listTransfers,
   listWarehouses,
@@ -29,6 +31,7 @@ import {
   returnCustodyAssignment,
   runLogisticsMigrations,
   stockSnapshot,
+  updateCycleCount,
   updateInspectionRun
 } from "./lib/logistics.js";
 
@@ -1154,13 +1157,14 @@ const server = http.createServer(async (req, res) => {
     if (!profileCan(dashboardProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
-      const [schema, items, warehouses, stock, transfers, custody, workers, reconciliation] = await Promise.all([
+      const [schema, items, warehouses, stock, transfers, custody, cycleCounts, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
         stockSnapshot(pool, dashboardProfile, { itemId: "" }),
         listTransfers(pool, dashboardProfile),
         listCustodyAssignments(pool, dashboardProfile, { status: "active" }),
+        listCycleCounts(pool, dashboardProfile),
         pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
           ${dashboardProfile.admin ? "" : "WHERE cost_center=$1"}
           ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows),
@@ -1179,6 +1183,7 @@ const server = http.createServer(async (req, res) => {
         stock,
         transfers,
         custody,
+        cycleCounts,
         workers,
         reconciliation
       });
@@ -1344,6 +1349,59 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { stock });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo consultar el stock." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/cycle-counts" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar conteos." });
+    try {
+      return json(res, 200, { cycleCounts: await listCycleCounts(pool, apiProfile) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar los conteos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/cycle-counts" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede iniciar conteos." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
+        return json(res, 403, { error: "Sólo puedes contar una bodega de tu centro." });
+      }
+      const result = await createCycleCount(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, {
+        error: conflict ? "El número de conteo ya existe." : (error.message || "No se pudo iniciar el conteo.")
+      });
+    }
+  }
+
+  const cycleCountAction = url.pathname.match(/^\/api\/v1\/cycle-counts\/([^/]+)$/);
+  if (cycleCountAction && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = ["APPROVE", "POST"].includes(action) ? "approve" : "move";
+      if (!profileCan(apiProfile, permission)) {
+        return json(res, 403, { error: "Tu perfil no puede completar esta etapa del conteo." });
+      }
+      const scope = await pool.query("SELECT warehouse_id FROM logistics_cycle_counts WHERE id=$1", [cycleCountAction[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Conteo no encontrado." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "El conteo pertenece a otro centro de costo." });
+      }
+      const result = await updateCycleCount(pool, cycleCountAction[1], action, {
+        ...body,
+        allowSelfApproval: Boolean(apiProfile.admin)
+      }, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el conteo." });
     }
   }
 
