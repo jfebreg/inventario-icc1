@@ -35,16 +35,19 @@ import {
   reconcileLegacyState,
   receiveTransfer,
   receiveLot,
+  registerStorageLocation,
   registerSupplier,
   registerItemFamily,
   registerWarehouse,
   returnCustodyAssignment,
   runLogisticsMigrations,
   stockSnapshot,
+  suggestPutawayLocations,
   updateCycleCount,
   updateInboundReceipt,
   updateMaterialRequest,
   updatePurchaseRequisition,
+  updateStorageLocation,
   updateInspectionRun,
   upsertReplenishmentPolicy
 } from "./lib/logistics.js";
@@ -1591,6 +1594,53 @@ const server = http.createServer(async (req, res) => {
       return json(res, 201, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo crear la bodega." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/putaway-suggestions" && req.method === "GET") {
+    if (!profileCan(apiProfile, "receive")) return json(res, 403, { error: "Tu perfil no puede consultar almacenamiento dirigido." });
+    try {
+      const warehouseId = url.searchParams.get("warehouseId") || "";
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, warehouseId))) {
+        return json(res, 403, { error: "La bodega pertenece a otro centro de costo." });
+      }
+      const suggestions = await suggestPutawayLocations(pool, apiProfile, {
+        organizationId: logisticsOrganizationId,
+        warehouseId,
+        itemId: url.searchParams.get("itemId") || "",
+        quantity: url.searchParams.get("quantity") || 1
+      });
+      return json(res, 200, { suggestions });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo sugerir una ubicación." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/locations" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede crear ubicaciones." });
+    try {
+      const body = await readJson(req);
+      const location = await registerStorageLocation(pool, {
+        ...body, organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, { location });
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, {
+        error: conflict ? "El código o QR de ubicación ya existe." : (error.message || "No se pudo crear la ubicación.")
+      });
+    }
+  }
+
+  const locationAction = url.pathname.match(/^\/api\/v1\/locations\/([^/]+)$/);
+  if (locationAction && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede modificar ubicaciones." });
+    try {
+      const body = await readJson(req);
+      const location = await updateStorageLocation(pool, locationAction[1], body, apiProfile.id);
+      return json(res, 200, { location });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo modificar la ubicación." });
     }
   }
 
