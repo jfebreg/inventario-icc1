@@ -54,7 +54,7 @@ let requestedQrCode=qrCodeFromUrl||sessionStorage.getItem('icc-pending-qr-code')
 if(qrCodeFromUrl)sessionStorage.setItem('icc-pending-qr-code',qrCodeFromUrl);
 window.scannedAssetCode=requestedQrCode;
 let activeUserId=''; let route='login'; let assetFilter=''; let familyFilter='all';
-let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],maintenance:{plans:[],workOrders:[]},inventoryAnalytics:{rows:[],summary:{}},workers:[],reconciliation:null,error:''};
+let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],maintenance:{plans:[],workOrders:[]},inventoryAnalytics:{rows:[],summary:{}},inventoryControl:{periods:[],adjustments:[]},workers:[],reconciliation:null,error:''};
 let quickLogisticsLoading=false;
 let lastOperationalRefresh=0;
 let stateRevision=null;
@@ -250,7 +250,7 @@ function correctionModal(id){let i=state.inspections.find(x=>x.id===id),a=state.
 let securityUsers=[],enrolledWorkers=[],securityDataLoaded=false,securityDataLoading=false;
 async function loadSecurityData(force=false){if(!window.ICCAuth?.configured||!activeUserId||securityDataLoading||(!force&&securityDataLoaded))return;securityDataLoading=true;try{let calls=[fetch('/api/workers').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar trabajadores.')))];if(can('admin'))calls.push(fetch('/api/admin/users').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar usuarios.'))));let values=await Promise.all(calls);enrolledWorkers=values[0].workers||[];if(values[1])securityUsers=values[1].users||[];securityDataLoaded=true;if(route==='settings')render()}catch(err){toast(err.message)}finally{securityDataLoading=false}}
 async function logisticsFetch(url,options={}){let controller=new AbortController(),timer,timeout=new Promise((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(new Error(`La consulta ${url} tardó más de 20 segundos. Revisa el despliegue de Render y vuelve a intentar.`))},20000)});try{let request=fetch(url,{...options,signal:controller.signal}),res=await Promise.race([request,timeout]),payload=await res.json().catch(()=>({}));if(!res.ok)throw new Error(payload.error||`No se pudo consultar ${url} (HTTP ${res.status}).`);return payload}finally{clearTimeout(timer)}}
-async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],warehouseDirectory:bundle.warehouseDirectory||bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],suppliers:bundle.suppliers||[],inboundReceipts:bundle.inboundReceipts||[],replenishmentSuggestions:bundle.replenishmentSuggestions||[],purchaseRequisitions:bundle.purchaseRequisitions||[],materialRequests:bundle.materialRequests||[],maintenance:bundle.maintenance||{plans:[],workOrders:[]},inventoryAnalytics:bundle.inventoryAnalytics||{rows:[],summary:{}},workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
+async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],warehouseDirectory:bundle.warehouseDirectory||bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],suppliers:bundle.suppliers||[],inboundReceipts:bundle.inboundReceipts||[],replenishmentSuggestions:bundle.replenishmentSuggestions||[],purchaseRequisitions:bundle.purchaseRequisitions||[],materialRequests:bundle.materialRequests||[],maintenance:bundle.maintenance||{plans:[],workOrders:[]},inventoryAnalytics:bundle.inventoryAnalytics||{rows:[],summary:{}},inventoryControl:bundle.inventoryControl||{periods:[],adjustments:[]},workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
 function canonicalItemForAsset(a){let base=normalizeCode(assetBaseCode(a));return logisticsV2.items.find(item=>normalizeCode(item.sku)===base)||logisticsV2.items.find(item=>(item.units||[]).some(unit=>codeMatches(unit.unitCode,a.code)))}
 function canonicalUnitForAsset(item,a){return (item?.units||[]).find(unit=>codeMatches(unit.unitCode,a.code))||null}
 function canonicalWarehouse(name){let normalized=String(name||'').trim().toLowerCase();return logisticsV2.warehouses.find(w=>String(w.cost_center||w.name).trim().toLowerCase()===normalized)||null}
@@ -685,7 +685,62 @@ function itemCostModal(itemId){
   </div><div class="access-box" style="margin-top:16px">Los movimientos futuros conservarán este costo. Las recepciones con precio actualizarán automáticamente el promedio móvil.</div>
   <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Guardar costo</button></div></form>`);
 }
-function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+inventoryAnalyticsMarkup()+maintenanceV2Markup()+warehouseLocationsV2Markup()+materialRequestsV2Markup()+replenishmentV2Markup()+inboundV2Markup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
+function inventoryControlMarkup(){
+  if(route!=='reports'||!logisticsV2.loaded||logisticsV2.error)return'';
+  let control=logisticsV2.inventoryControl||{periods:[],adjustments:[]},periods=control.periods||[],
+    adjustments=control.adjustments||[],open=periods.find(x=>x.status==='OPEN'),
+    pending=adjustments.filter(x=>['SUBMITTED','APPROVED'].includes(x.status));
+  return `<section class="card logistics-v2" style="margin-top:20px" data-inventory-control>
+    <div class="heading-row"><div><p class="eyebrow">Gobierno del inventario</p><h2 class="section-title">Períodos y ajustes controlados</h2>
+    <p class="page-subtitle">Segregación entre solicitud, aprobación y contabilización. Los meses cerrados no admiten movimientos retroactivos.</p></div>
+    <div class="actions">${can('move')?'<button class="button secondary" data-new-adjustment>＋ Solicitar ajuste</button>':''}${can('admin')?'<button class="button" data-new-period>＋ Abrir período</button>':''}</div></div>
+    <div class="grid metrics"><div class="card"><div class="metric-label">Período abierto</div><div class="metric-value">${htmlSafe(open?.period_code||'—')}</div></div>
+    <div class="card"><div class="metric-label">Ajustes pendientes</div><div class="metric-value">${pending.length}</div><div class="metric-foot ${pending.length?'alert':''}">${pending.length?'Requieren resolución':'Sin pendientes'}</div></div>
+    <div class="card"><div class="metric-label">Períodos cerrados</div><div class="metric-value">${periods.filter(x=>x.status==='CLOSED').length}</div></div></div>
+    ${periods.length?`<h3 style="margin-top:22px">Períodos contables</h3><div class="table-wrap"><table><thead><tr><th>Período</th><th>Fechas</th><th>Estado</th><th>Cierre</th><th></th></tr></thead><tbody>${periods.slice(0,18).map(x=>`<tr>
+      <td><strong>${htmlSafe(x.period_code)}</strong></td><td>${String(x.starts_on).slice(0,10)} a ${String(x.ends_on).slice(0,10)}</td><td>${tag(x.status)}</td>
+      <td>${x.closed_at?`${new Date(x.closed_at).toLocaleString('es-CL')}<br><small>${htmlSafe(x.closed_by_name||'')}</small>`:'—'}</td>
+      <td>${can('admin')&&x.status!=='CLOSED'?`<button class="link-button" data-close-period="${x.id}">Cerrar mes</button>`:'—'}</td></tr>`).join('')}</tbody></table></div>`:''}
+    <h3 style="margin-top:22px">Solicitudes de ajuste</h3>
+    ${adjustments.length?`<div class="table-wrap"><table><thead><tr><th>Solicitud</th><th>Artículo / ubicación</th><th>Diferencia</th><th>Motivo</th><th>Valor</th><th>Estado</th><th>Responsables</th><th>Acciones</th></tr></thead><tbody>${adjustments.slice(0,100).map(x=>`<tr>
+      <td><strong>${htmlSafe(x.adjustment_number)}</strong><br><small>${String(x.requested_at).slice(0,10)}</small></td>
+      <td>${htmlSafe(x.item_name)}<br><span class="code">${htmlSafe(x.unit_code||x.sku)}</span><br><small>${htmlSafe(x.warehouse_name)} · ${htmlSafe(x.location_name)}</small></td>
+      <td><strong>${Number(x.quantity_delta)>0?'+':''}${Number(x.quantity_delta).toLocaleString('es-CL')}</strong><br><small>Sistema: ${Number(x.system_quantity).toLocaleString('es-CL')}</small></td>
+      <td>${htmlSafe(x.reason_code)}<br><small>${htmlSafe(x.notes)}</small></td><td>${moneyV2(x.total_value_delta,x.currency)}</td>
+      <td>${tag(x.status)}</td><td><small>Solicita: ${htmlSafe(x.requested_by_name||'—')}<br>Aprueba: ${htmlSafe(x.approved_by_name||'—')}</small></td>
+      <td><div class="actions">${x.status==='SUBMITTED'&&can('approve')?`<button class="link-button" data-adjustment-action="APPROVE" data-adjustment-id="${x.id}">Aprobar</button><button class="link-button" data-adjustment-action="REJECT" data-adjustment-id="${x.id}">Rechazar</button>`:''}${x.status==='APPROVED'&&can('approve')?`<button class="link-button" data-adjustment-action="POST" data-adjustment-id="${x.id}">Contabilizar</button>`:''}${x.status==='SUBMITTED'&&x.requested_by===activeUserId?`<button class="link-button" data-adjustment-action="CANCEL" data-adjustment-id="${x.id}">Cancelar</button>`:''}</div></td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay solicitudes de ajuste.</p>'}
+  </section>`;
+}
+function inventoryPeriodModal(){
+  let now=new Date();
+  modal('Abrir período de inventario',`<form id="inventoryPeriodForm"><div class="form-grid">
+    <label>Año<input name="year" type="number" min="2020" max="2200" required value="${now.getFullYear()}"></label>
+    <label>Mes<input name="month" type="number" min="1" max="12" required value="${now.getMonth()+1}"></label>
+    <label class="full">Observación<input name="notes" placeholder="Ej. apertura operacional del mes"></label>
+  </div><div class="access-box" style="margin-top:16px">Al cerrar el período se guardará una fotografía valorizada y no se permitirán movimientos con fecha dentro de ese mes.</div>
+  <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Abrir período</button></div></form>`);
+}
+function inventoryAdjustmentModal(){
+  let items=(logisticsV2.items||[]).filter(x=>x.tracking_type==='NONE'),
+    locations=(logisticsV2.warehouses||[]).filter(w=>w.can_operate).flatMap(w=>(w.locations||[]).filter(x=>x.type==='STORAGE'||x.locationType==='STORAGE'||x.location_type==='STORAGE').map(x=>({...x,warehouseName:w.name})));
+  if(!items.length||!locations.length)return toast('No hay productos simples o ubicaciones disponibles para ajustar.');
+  modal('Solicitar ajuste de inventario',`<form id="inventoryAdjustmentForm"><div class="form-grid">
+    <label class="full">Artículo<select name="itemId" required>${items.map(x=>`<option value="${x.id}">${htmlSafe(x.sku)} · ${htmlSafe(x.name)}</option>`).join('')}</select></label>
+    <label class="full">Ubicación<select name="locationId" required>${locations.map(x=>`<option value="${x.id}">${htmlSafe(x.warehouseName)} · ${htmlSafe(x.code)} · ${htmlSafe(x.name)}</option>`).join('')}</select></label>
+    <label>Diferencia de cantidad<input name="quantityDelta" type="number" step="0.0001" required placeholder="Ej. -2 o 5"></label>
+    <label>Motivo<select name="reasonCode"><option value="COUNT_VARIANCE">Diferencia de conteo</option><option value="DAMAGE">Daño</option><option value="LOSS">Pérdida</option><option value="FOUND">Stock encontrado</option><option value="EXPIRY">Vencimiento</option><option value="DATA_CORRECTION">Corrección de datos</option><option value="OTHER">Otro</option></select></label>
+    <label class="full">Fundamento obligatorio<input name="notes" required placeholder="Explica el origen, documento y verificación realizada"></label>
+  </div><div class="access-box" style="margin-top:16px">Usa una cantidad negativa para disminuir y positiva para aumentar. El saldo no cambiará hasta que otra persona apruebe y contabilice.</div>
+  <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Enviar a aprobación</button></div></form>`);
+}
+function closeInventoryPeriodModal(id){
+  let period=(logisticsV2.inventoryControl?.periods||[]).find(x=>x.id===id);if(!period)return toast('No encontramos el período.');
+  modal(`Cerrar período · ${period.period_code}`,`<form id="closeInventoryPeriodForm" data-id="${id}"><div class="access-box warning-box"><strong>Cierre irreversible desde la aplicación</strong><div>Antes de cerrar deben estar resueltos todos los ajustes y conteos del período.</div></div><div class="form-grid" style="margin-top:16px">
+    <label class="full">Declaración<input name="declaration" required placeholder="Confirmo que saldos, conteos y ajustes fueron revisados"></label>
+    <label class="full">Observación de cierre<input name="notes" required placeholder="Responsable, documentación y excepciones revisadas"></label>
+  </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Cerrar y bloquear período</button></div></form>`);
+}
+function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+inventoryAnalyticsMarkup()+inventoryControlMarkup()+maintenanceV2Markup()+warehouseLocationsV2Markup()+materialRequestsV2Markup()+replenishmentV2Markup()+inboundV2Markup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
 function newCycleCountModal(){let options=(logisticsV2.warehouses||[]).map(w=>`<option value="${w.id}">${htmlSafe(w.name)} · ${htmlSafe(w.cost_center||'')}</option>`).join('');modal('Iniciar conteo cíclico',`<form id="newCycleCountForm"><div class="form-grid"><label class="full">Bodega<select name="warehouseId" required>${options}</select></label><label class="full">Observación<input name="notes" placeholder="Ej. conteo semanal, sector o responsable"></label></div><div class="access-box" style="margin-top:16px">El conteo será ciego: el usuario no verá las cantidades esperadas hasta enviarlo a aprobación. En esta etapa se incluyen consumibles; los activos serializados se controlan individualmente.</div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Crear conteo</button></div></form>`)}
 function cycleCountModal(id){let count=(logisticsV2.cycleCounts||[]).find(x=>x.id===id);if(!count)return toast('No encontramos el conteo.');let editable=['DRAFT','IN_PROGRESS'].includes(count.status)&&can('move'),showExpected=!['DRAFT','IN_PROGRESS'].includes(count.status);modal(`Conteo · ${count.count_number}`,`<div class="access-box"><strong>${htmlSafe(count.warehouse_name)}</strong><div>Estado: ${htmlSafe(count.status)} · ${count.blind_count?'Conteo ciego':'Conteo informado'}</div></div><form id="cycleCountForm" data-id="${count.id}"><div class="table-wrap" style="margin-top:16px"><table><thead><tr><th>Producto</th><th>Ubicación</th>${showExpected?'<th>Esperado</th>':''}<th>Contado</th>${showExpected?'<th>Diferencia</th>':''}<th>Observación</th></tr></thead><tbody>${(count.lines||[]).map(line=>`<tr><td><strong>${htmlSafe(line.item_name)}</strong><br><span class="code">${htmlSafe(line.sku)}</span></td><td>${htmlSafe(line.location_name)}</td>${showExpected?`<td>${line.expected_quantity}</td>`:''}<td><input name="qty-${line.id}" type="number" min="0" step="0.0001" required ${editable?'':'readonly'} value="${line.counted_quantity??''}" style="min-width:100px"></td>${showExpected?`<td><strong>${Number(line.variance||0)>0?'+':''}${line.variance??0}</strong></td>`:''}<td><input name="note-${line.id}" ${editable?'':'readonly'} value="${htmlSafe(line.notes||'')}" placeholder="Opcional"></td></tr>`).join('')}</tbody></table></div><div class="form-actions"><button type="button" class="outline" data-close>Cerrar</button>${editable?'<button class="button">Guardar cantidades</button>':''}</div></form>`)}
 async function cycleCountAction(id,action,extra={}){let payload=await logisticsFetch(`/api/v1/cycle-counts/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});await loadLogisticsV2(true);toast(action==='SUBMIT'?'Conteo enviado a aprobación.':action==='APPROVE'?'Conteo aprobado.':action==='POST'?`Conteo contabilizado: ${payload.adjustedLines||0} ajuste(s).`:'Conteo actualizado.');return payload}
@@ -720,6 +775,16 @@ async function registerMovementV2({legacyId,a,action,qty,from,to,status,notes}){
     if(remaining>0)throw new Error(`El traslado sólo tiene ${quantity-remaining} unidad(es) pendientes.`);
     await logisticsFetch(`/api/v1/transfers/${encodeURIComponent(pending.id)}/receive`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({idempotencyKey:`legacy-ui:${legacyId}:receive`,source:'QR',notes,lines})});
     logisticsV2.loaded=false;return{transferId:pending.id,kind:'receipt'}
+  }
+  if(action==='Ajuste de stock'){
+    if(!destinationLocation)throw new Error(`La bodega ${to} no tiene ubicación V2.`);
+    if(!notes)throw new Error('Explica el motivo del ajuste antes de enviarlo a aprobación.');
+    let result=await logisticsFetch('/api/v1/inventory-adjustments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      organizationId:payloadBase.organizationId,itemId:item.id,assetUnitId:unit?.id||null,
+      locationId:destinationLocation.id,quantityDelta:quantity,reasonCode:'DATA_CORRECTION',
+      notes,source:'QR'
+    })});
+    logisticsV2.loaded=false;return{adjustmentId:result.adjustment?.id,kind:'adjustment_request'}
   }
   let movementType=action==='Ingreso proveedor / compra'?'RECEIPT':action==='Ajuste de stock'?'ADJUSTMENT':action==='Devolución a bodega'?'CUSTODY_RETURN':'TRANSFER_RECEIPT',
     fromLocationId=action==='Ingreso proveedor / compra'||action==='Ajuste de stock'?null:sourceLocation?.id||null,
@@ -772,6 +837,7 @@ async function movementSubmit(e){
   if(!external&&action!=='Ajuste de stock'&&from!==to&&available<qty)return toast(`Stock V2 insuficiente en ${from}. Disponible: ${available}`);
   let stockBefore={from:stockAt(a,from),to:stockAt(a,to),transit:stockAt(a,'En tránsito'),total:totalStock(a)},legacyId=`m${Date.now()}`,v2=null;
   try{v2=await registerMovementV2({legacyId,a,action,qty,from,to,status,notes:obs})}catch(err){return toast(err.message||'No se pudo registrar en el libro mayor. No se modificó el inventario.')}
+  if(v2?.kind==='adjustment_request'){await loadLogisticsV2(true);toast('Ajuste enviado a aprobación. El stock aún no ha cambiado.');route='reports';render();return}
   if(action==='Ajuste de stock'||external){setStockAt(a,to,stockAt(a,to)+qty);a.location=to;a.status=a.type==='Consumible'&&a.stock<=Number(a.minimum||0)?'Stock bajo':'Disponible'}
   else{moveStock(a,from,to,qty,status)}
   let stockAfter={from:stockAt(a,from),to:stockAt(a,to),transit:stockAt(a,'En tránsito'),total:totalStock(a)};
@@ -1052,6 +1118,56 @@ document.addEventListener('submit',async e=>{
     await loadLogisticsV2(true);closeModal();toast('Costo actualizado y registrado en auditoría.');render();
   }catch(err){toast(err.message||'No se pudo guardar el costo.')}finally{unlock()}
 },true);
+document.addEventListener('click',async e=>{
+  let t=e.target.closest?.('[data-new-period],[data-new-adjustment],[data-close-period],[data-adjustment-action]');
+  if(!t)return;e.preventDefault();
+  if(t.dataset.newPeriod!==undefined)return inventoryPeriodModal();
+  if(t.dataset.newAdjustment!==undefined)return inventoryAdjustmentModal();
+  if(t.dataset.closePeriod)return closeInventoryPeriodModal(t.dataset.closePeriod);
+  let action=t.dataset.adjustmentAction,id=t.dataset.adjustmentId,notes='';
+  if(action==='REJECT'){notes=prompt('Indica el motivo del rechazo:')||'';if(!notes)return}
+  if(!confirm(action==='APPROVE'?'¿Aprobar esta diferencia de inventario?':action==='POST'?'¿Contabilizar el ajuste aprobado y modificar el stock?':action==='CANCEL'?'¿Cancelar esta solicitud?':'¿Continuar?'))return;
+  t.disabled=true;
+  try{
+    await logisticsFetch(`/api/v1/inventory-adjustments/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,notes})});
+    await loadLogisticsV2(true);toast(action==='POST'?'Ajuste contabilizado en el libro mayor.':'Solicitud de ajuste actualizada.');render();
+  }catch(err){toast(err.message||'No se pudo resolver el ajuste.');t.disabled=false}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='inventoryPeriodForm')return;e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Abriendo período…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target);
+    await logisticsFetch('/api/v1/inventory-periods',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      year:Number(d.get('year')),month:Number(d.get('month')),notes:d.get('notes')
+    })});
+    await loadLogisticsV2(true);closeModal();toast('Período de inventario abierto.');render();
+  }catch(err){toast(err.message||'No se pudo abrir el período.')}finally{unlock()}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='inventoryAdjustmentForm')return;e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Enviando ajuste…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target),delta=Number(d.get('quantityDelta'));
+    if(!delta)throw new Error('La diferencia no puede ser cero.');
+    await logisticsFetch('/api/v1/inventory-adjustments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      itemId:d.get('itemId'),locationId:d.get('locationId'),quantityDelta:delta,
+      reasonCode:d.get('reasonCode'),notes:d.get('notes'),source:'MANUAL'
+    })});
+    await loadLogisticsV2(true);closeModal();toast('Ajuste enviado a aprobación; el stock no cambió.');render();
+  }catch(err){toast(err.message||'No se pudo solicitar el ajuste.')}finally{unlock()}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='closeInventoryPeriodForm')return;e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Cerrando período…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target);
+    await logisticsFetch(`/api/v1/inventory-periods/${encodeURIComponent(e.target.dataset.id)}/close`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      declaration:d.get('declaration'),notes:d.get('notes')
+    })});
+    await loadLogisticsV2(true);closeModal();toast('Período cerrado y movimientos retroactivos bloqueados.');render();
+  }catch(err){toast(err.message||'No se pudo cerrar el período.')}finally{unlock()}
+},true);
 document.addEventListener('submit',async e=>{
   if(e.target.id!=='supplierForm')return;
   e.preventDefault();e.stopImmediatePropagation();
@@ -1278,7 +1394,7 @@ document.addEventListener('submit',async e=>{
 },true);
 $('#userSwitcher').onclick=()=>{activeUserId?logout():(route='login',render())};$('#profileButton').onclick=()=>{activeUserId?(route='settings',render()):(route='login',render())};
 async function loadRemoteState(){let res=await fetch('/api/state');if(!res.ok)return false;let payload=await res.json();if(payload?.state){state=repairTextState(payload.state);stateRevision=Number(payload.revision||0);localStorage.setItem(`${storageKey}-revision`,String(stateRevision));ensureInventoryModel();reconcileLegacyInspectionWorkflow();let authUser=window.ICCAuth?.appUser?.();if(authUser&&!state.users.some(u=>u.id===authUser.id))state.users.unshift(authUser);localStorage.setItem(storageKey,JSON.stringify(state));openAssetFromUrl();return true}return false}
-function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],maintenance:{plans:[],workOrders:[]},inventoryAnalytics:{rows:[],summary:{}},workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
+function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],warehouseDirectory:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],materialRequests:[],maintenance:{plans:[],workOrders:[]},inventoryAnalytics:{rows:[],summary:{}},inventoryControl:{periods:[],adjustments:[]},workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
 window.addEventListener('icc-auth-error',e=>toast(e.detail));
 window.addEventListener('icc-state-conflict',e=>toast(e.detail||'Los datos cambiaron en otra sesión. Actualiza la pantalla.'));
 window.addEventListener('icc-realtime',()=>{renderRealtimeCounter();if(route==='tasks')render()});

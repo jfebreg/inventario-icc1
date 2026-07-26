@@ -13,6 +13,8 @@ import {
   createInspectionRun,
   createCustodyAssignment,
   createInboundReceipt,
+  createInventoryAdjustment,
+  createInventoryPeriod,
   createMaterialRequest,
   createMaintenancePlan,
   createPurchaseRequisition,
@@ -25,6 +27,7 @@ import {
   listCustodyAssignments,
   listInboundReceipts,
   listInventoryAnalytics,
+  listInventoryControls,
   listMaterialRequests,
   listMaintenance,
   listPurchaseRequisitions,
@@ -50,11 +53,13 @@ import {
   updateCycleCount,
   updateItemCost,
   updateInboundReceipt,
+  updateInventoryAdjustment,
   updateMaterialRequest,
   updateWorkOrder,
   updatePurchaseRequisition,
   updateStorageLocation,
   updateInspectionRun,
+  closeInventoryPeriod,
   upsertReplenishmentPolicy
 } from "./lib/logistics.js";
 
@@ -567,6 +572,49 @@ async function profileMayAccessLocation(profile, locationId) {
     JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
     WHERE loc.id=$1 AND cc.name=$2 AND loc.active=TRUE`, [locationId, profile.cost_center]);
   return Boolean(result.rowCount);
+}
+
+async function syncInventoryAdjustmentTask(adjustmentId) {
+  const result = await pool.query(`SELECT adjustment.*,item.sku,item.name AS item_name,
+      warehouse.name AS warehouse_name,center.name AS cost_center
+    FROM logistics_inventory_adjustments adjustment
+    JOIN logistics_items item ON item.id=adjustment.item_id
+    JOIN logistics_warehouses warehouse ON warehouse.id=adjustment.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    WHERE adjustment.id=$1`, [adjustmentId]);
+  const adjustment = result.rows[0];
+  if (!adjustment) return;
+  const taskId = `inventory-adjustment-${adjustment.id}`;
+  if (!["SUBMITTED", "APPROVED"].includes(adjustment.status)) {
+    await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
+      updated_at=NOW() WHERE id=$1`, [taskId]);
+    return;
+  }
+  const responsible = await pool.query(`SELECT auth_user_id FROM inventory_user_profiles
+    WHERE active=TRUE AND auth_user_id IS NOT NULL AND id<>$1
+      AND (admin=TRUE OR permissions ? 'approve')
+      AND (admin=TRUE OR cost_center=$2)
+    ORDER BY admin DESC,updated_at DESC LIMIT 1`,
+  [adjustment.requested_by, adjustment.cost_center || "Bodega Central"]);
+  const assignee = responsible.rows[0]?.auth_user_id || null;
+  const title = adjustment.status === "SUBMITTED"
+    ? `Ajuste pendiente de aprobación: ${adjustment.adjustment_number}`
+    : `Ajuste pendiente de contabilización: ${adjustment.adjustment_number}`;
+  const detail = `${adjustment.sku} · ${adjustment.item_name} · ${Number(adjustment.quantity_delta) > 0 ? "+" : ""}${adjustment.quantity_delta} · ${adjustment.warehouse_name}`;
+  await pool.query(`INSERT INTO inventory_tasks
+    (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,entity_type,entity_id,payload,updated_at)
+    VALUES ($1,'Ajuste de inventario',$2,$3,'Alta','Pendiente',$4,$5,'inventory_adjustment',$6,$7::jsonb,NOW())
+    ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,status='Pendiente',
+      center_name=EXCLUDED.center_name,assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,
+      resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
+  [taskId, title, detail, adjustment.cost_center || "Bodega Central", assignee,
+    adjustment.id, JSON.stringify(adjustment)]);
+  await pool.query(`INSERT INTO inventory_notifications
+    (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+    VALUES ($1,$2,$3,'Ajuste de inventario',$4,$5,'warning','inventory_adjustment',$6,$7::jsonb)
+    ON CONFLICT (id) DO NOTHING`,
+  [`notification-${taskId}-${adjustment.status}`, assignee, adjustment.cost_center || "Bodega Central",
+    title, detail, adjustment.id, JSON.stringify(adjustment)]);
 }
 
 function sameCenter(left, right) {
@@ -1181,7 +1229,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1197,6 +1245,7 @@ const server = http.createServer(async (req, res) => {
         listMaterialRequests(pool, dashboardProfile),
         listMaintenance(pool, dashboardProfile),
         listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
+        listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1228,6 +1277,7 @@ const server = http.createServer(async (req, res) => {
         materialRequests,
         maintenance,
         inventoryAnalytics,
+        inventoryControl,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1245,6 +1295,87 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await listInventoryAnalytics(pool, apiProfile, logisticsOrganizationId));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo calcular la analítica de inventario." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-controls" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar el control de inventario." });
+    }
+    try {
+      return json(res, 200, await listInventoryControls(pool, apiProfile, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar el control de inventario." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-periods" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede abrir períodos." });
+    }
+    try {
+      const body = await readJson(req);
+      const period = await createInventoryPeriod(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, { period });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo abrir el período." });
+    }
+  }
+
+  const closePeriodRoute = url.pathname.match(/^\/api\/v1\/inventory-periods\/([^/]+)\/close$/);
+  if (closePeriodRoute && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede cerrar períodos." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, await closeInventoryPeriod(pool, closePeriodRoute[1], body, apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo cerrar el período." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-adjustments" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) {
+      return json(res, 403, { error: "Tu perfil no puede solicitar ajustes." });
+    }
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessLocation(apiProfile, body.locationId))) {
+        return json(res, 403, { error: "Sólo puedes ajustar una ubicación de tu centro." });
+      }
+      const adjustment = await createInventoryAdjustment(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      await syncInventoryAdjustmentTask(adjustment.id);
+      return json(res, 201, { adjustment });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo solicitar el ajuste." });
+    }
+  }
+
+  const adjustmentRoute = url.pathname.match(/^\/api\/v1\/inventory-adjustments\/([^/]+)$/);
+  if (adjustmentRoute && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = ["APPROVE", "REJECT", "POST"].includes(action) ? "approve" : "move";
+      if (!profileCan(apiProfile, permission)) {
+        return json(res, 403, { error: "Tu perfil no puede resolver este ajuste." });
+      }
+      const scope = await pool.query(`SELECT warehouse_id FROM logistics_inventory_adjustments
+        WHERE id=$1`, [adjustmentRoute[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Solicitud de ajuste inexistente." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "El ajuste pertenece a otro centro." });
+      }
+      const result = await updateInventoryAdjustment(pool, adjustmentRoute[1], action, body, apiProfile.id);
+      await syncInventoryAdjustmentTask(adjustmentRoute[1]);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el ajuste." });
     }
   }
 
@@ -1812,6 +1943,9 @@ const server = http.createServer(async (req, res) => {
     if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede mover inventario." });
     try {
       const body = await readJson(req);
+      if (String(body.movementType || "").toUpperCase() === "ADJUSTMENT") {
+        return json(res, 409, { error: "Los ajustes deben solicitarse y aprobarse antes de contabilizarse." });
+      }
       if (!apiProfile.admin && ["ADJUSTMENT", "REVERSAL", "OPENING"].includes(String(body.movementType || "").toUpperCase())) {
         return json(res, 403, { error: "Sólo el administrador puede ajustar, abrir o revertir stock." });
       }
