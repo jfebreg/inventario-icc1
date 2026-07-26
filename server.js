@@ -23,6 +23,7 @@ import {
   registerCanonicalItem,
   reconcileLegacyState,
   receiveTransfer,
+  registerItemFamily,
   registerWarehouse,
   returnCustodyAssignment,
   runLogisticsMigrations,
@@ -1146,6 +1147,23 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { items });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron consultar los artículos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/families" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede configurar familias." });
+    try {
+      const body = await readJson(req);
+      const result = await registerItemFamily(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, result.created ? 201 : 200, result);
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, {
+        error: conflict ? "La abreviatura ya está asignada a otra familia." : (error.message || "No se pudo guardar la familia.")
+      });
     }
   }
 

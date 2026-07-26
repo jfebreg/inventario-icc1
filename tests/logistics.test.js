@@ -129,3 +129,18 @@ test("las bodegas nuevas nacen con ubicaciones operativas en V2", async () => {
   assert.match(app, /await registerWarehouseV2\(center\)/);
   assert.match(app, /Creando bodega V2/);
 });
+
+test("las familias se configuran primero en el catálogo maestro V2", async () => {
+  const [app, server, logistics] = await Promise.all([
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../server.js", import.meta.url), "utf8"),
+    readFile(new URL("../lib/logistics.js", import.meta.url), "utf8")
+  ]);
+  assert.match(logistics, /export async function registerItemFamily/);
+  assert.match(logistics, /ITEM_FAMILY_UPDATED/);
+  assert.match(server, /url\.pathname === "\/api\/v1\/families" && req\.method === "POST"/);
+  assert.match(server, /La abreviatura ya está asignada/);
+  assert.match(app, /async function saveFamilyV2/);
+  assert.match(app, /await saveFamilyV2\(obj\)/);
+  assert.match(app, /Guardando familia V2/);
+});
