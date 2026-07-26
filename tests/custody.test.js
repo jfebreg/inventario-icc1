@@ -44,6 +44,13 @@ test("el menú QR consulta la custodia canónica y evita una segunda entrega", (
   assert.match(app, /Registrar devolución desde terreno/);
 });
 
+test("el QR recibe traslados canónicos aunque no estén en el respaldo antiguo", () => {
+  assert.match(app, /function canonicalPendingTransfers/);
+  assert.match(app, /function receiveCanonicalTransfer/);
+  assert.match(app, /data-receive\^="v2-receive:"/);
+  assert.match(app, /qr-receive:/);
+});
+
 test("el bloqueo de bodega no intenta bloquear el lado opcional del centro de costo", () => {
   assert.match(logistics, /FOR SHARE OF w/);
   assert.doesNotMatch(logistics, /w\.active=TRUE FOR SHARE`/);
