@@ -37,6 +37,13 @@ test("los reintentos no duplican entregas", () => {
   assert.match(logistics, /external_reference=\$2/);
 });
 
+test("el menú QR consulta la custodia canónica y evita una segunda entrega", () => {
+  assert.match(app, /function syncQuickLogisticsContext/);
+  assert.match(app, /canonicalCustodyId:canonical\.id/);
+  assert.match(app, /terrain=custody\?'':/);
+  assert.match(app, /Registrar devolución desde terreno/);
+});
+
 test("el bloqueo de bodega no intenta bloquear el lado opcional del centro de costo", () => {
   assert.match(logistics, /FOR SHARE OF w/);
   assert.doesNotMatch(logistics, /w\.active=TRUE FOR SHARE`/);
