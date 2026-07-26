@@ -54,7 +54,7 @@ let requestedQrCode=qrCodeFromUrl||sessionStorage.getItem('icc-pending-qr-code')
 if(qrCodeFromUrl)sessionStorage.setItem('icc-pending-qr-code',qrCodeFromUrl);
 window.scannedAssetCode=requestedQrCode;
 let activeUserId=''; let route='login'; let assetFilter=''; let familyFilter='all';
-let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],workers:[],reconciliation:null,error:''};
+let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],workers:[],reconciliation:null,error:''};
 let quickLogisticsLoading=false;
 let lastOperationalRefresh=0;
 let stateRevision=null;
@@ -116,7 +116,7 @@ async function refreshOperationalData(force=false){if(!activeUserId||!['quick','
 setInterval(()=>{if(document.visibilityState==='visible')refreshOperationalData()},30000);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refreshOperationalData()});
 window.addEventListener('focus',()=>refreshOperationalData());
-function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
+function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED','APPROVED','RECEIVED'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE','DRAFT','SUBMITTED','ORDERED','PARTIALLY_RECEIVED'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
 function normalizeCode(value){let text=String(value||'').toUpperCase().trim(),m=text.match(/^([A-Z]+)[\s-]*0*(\d+)(?:[\s-]+0*(\d+))?$/);if(m)return `${m[1]}-${Number(m[2])}${m[3]?`-${Number(m[3])}`:''}`;let raw=text.replace(/[^A-Z0-9]/g,''),plain=raw.match(/^([A-Z]+)0*([0-9]+)$/);return plain?`${plain[1]}-${Number(plain[2])}`:raw}
 function assetBaseCode(a){return a?.baseCode||String(a?.code||'').replace(/^([A-Z]+-\d{6})-\d+$/,'$1')}
 function codeMatches(a,b){return normalizeCode(a)===normalizeCode(b)}
@@ -250,7 +250,7 @@ function correctionModal(id){let i=state.inspections.find(x=>x.id===id),a=state.
 let securityUsers=[],enrolledWorkers=[],securityDataLoaded=false,securityDataLoading=false;
 async function loadSecurityData(force=false){if(!window.ICCAuth?.configured||!activeUserId||securityDataLoading||(!force&&securityDataLoaded))return;securityDataLoading=true;try{let calls=[fetch('/api/workers').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar trabajadores.')))];if(can('admin'))calls.push(fetch('/api/admin/users').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar usuarios.'))));let values=await Promise.all(calls);enrolledWorkers=values[0].workers||[];if(values[1])securityUsers=values[1].users||[];securityDataLoaded=true;if(route==='settings')render()}catch(err){toast(err.message)}finally{securityDataLoading=false}}
 async function logisticsFetch(url,options={}){let controller=new AbortController(),timer,timeout=new Promise((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(new Error(`La consulta ${url} tardó más de 20 segundos. Revisa el despliegue de Render y vuelve a intentar.`))},20000)});try{let request=fetch(url,{...options,signal:controller.signal}),res=await Promise.race([request,timeout]),payload=await res.json().catch(()=>({}));if(!res.ok)throw new Error(payload.error||`No se pudo consultar ${url} (HTTP ${res.status}).`);return payload}finally{clearTimeout(timer)}}
-async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],suppliers:bundle.suppliers||[],inboundReceipts:bundle.inboundReceipts||[],workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
+async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],suppliers:bundle.suppliers||[],inboundReceipts:bundle.inboundReceipts||[],replenishmentSuggestions:bundle.replenishmentSuggestions||[],purchaseRequisitions:bundle.purchaseRequisitions||[],workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
 function canonicalItemForAsset(a){let base=normalizeCode(assetBaseCode(a));return logisticsV2.items.find(item=>normalizeCode(item.sku)===base)||logisticsV2.items.find(item=>(item.units||[]).some(unit=>codeMatches(unit.unitCode,a.code)))}
 function canonicalUnitForAsset(item,a){return (item?.units||[]).find(unit=>codeMatches(unit.unitCode,a.code))||null}
 function canonicalWarehouse(name){let normalized=String(name||'').trim().toLowerCase();return logisticsV2.warehouses.find(w=>String(w.cost_center||w.name).trim().toLowerCase()===normalized)||null}
@@ -357,12 +357,14 @@ function supplierModal(){
 function inboundReceiptModal(){
   let suppliers=(logisticsV2.suppliers||[]).filter(x=>x.status==='ACTIVE'),
     items=(logisticsV2.items||[]).filter(x=>x.tracking_type!=='SERIAL'),
+    requisitions=(logisticsV2.purchaseRequisitions||[]).filter(x=>['APPROVED','ORDERED','PARTIALLY_RECEIVED'].includes(x.status)),
     supplierOptions=suppliers.map(x=>`<option value="${x.id}">${htmlSafe(x.name)}${x.tax_id?` · ${htmlSafe(x.tax_id)}`:''}</option>`).join(''),
     warehouseOptions=(logisticsV2.warehouses||[]).map(x=>`<option value="${x.id}">${htmlSafe(x.name)} · ${htmlSafe(x.cost_center||'')}</option>`).join(''),
     itemOptions=items.map(x=>`<option value="${x.id}" data-tracking="${x.tracking_type}">${htmlSafe(x.sku)} · ${htmlSafe(x.name)}${x.tracking_type==='LOT'?' · requiere lote':''}</option>`).join('');
   if(!suppliers.length)return toast('Primero registra un proveedor.');
   if(!items.length)return toast('No hay consumibles disponibles para recepción.');
   modal('Recibir compra en cuarentena',`<form id="inboundReceiptForm"><div class="form-grid">
+    <label class="full">Solicitud aprobada (opcional)<select name="requisitionId"><option value="">Sin solicitud asociada</option>${requisitions.map(x=>`<option value="${x.id}">${htmlSafe(x.requisition_number)} · ${htmlSafe(x.warehouse_name)} · ${htmlSafe(x.supplier_name||'Proveedor por definir')}</option>`).join('')}</select></label>
     <label>Proveedor<select name="supplierId" required>${supplierOptions}</select></label>
     <label>Bodega receptora<select name="warehouseId" required>${warehouseOptions}</select></label>
     <label>Tipo de documento<select name="documentType"><option value="DELIVERY_NOTE">Guía de despacho</option><option value="INVOICE">Factura</option><option value="PURCHASE_ORDER">Orden de compra</option><option value="OTHER">Otro</option></select></label>
@@ -376,9 +378,71 @@ function inboundReceiptModal(){
   </div><div class="access-box" style="margin-top:16px"><strong>Stock bloqueado:</strong> la cantidad quedará en Cuarentena y no podrá entregarse, trasladarse ni consumirse hasta su liberación.</div>
   <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Recibir en cuarentena</button></div></form>`);
 }
+function replenishmentV2Markup(){
+  if(!logisticsV2.loaded||logisticsV2.error)return'';
+  let suggestions=logisticsV2.replenishmentSuggestions||[],requests=logisticsV2.purchaseRequisitions||[],
+    open=requests.filter(x=>!['RECEIVED','CANCELLED'].includes(x.status));
+  return `<section class="card logistics-v2" style="margin-top:20px" data-replenishment>
+    <div class="heading-row"><div><p class="eyebrow">Planificación de abastecimiento</p><h2 class="section-title">Reposición y solicitudes de compra</h2>
+    <p class="page-subtitle">Sugerencias por stock disponible, mínimo/máximo, compras en curso y proveedor preferido.</p></div>${can('admin')?'<button class="button secondary" data-new-policy>＋ Configurar política</button>':''}</div>
+    <div class="grid metrics"><div class="card"><div class="metric-label">Reposiciones sugeridas</div><div class="metric-value">${suggestions.filter(x=>Number(x.suggested_quantity)>0).length}</div></div>
+    <div class="card"><div class="metric-label">Solicitudes abiertas</div><div class="metric-value">${open.length}</div></div></div>
+    <h3 class="section-title">Sugerencias automáticas</h3>
+    ${suggestions.length?`<div class="table-wrap"><table><thead><tr><th>Producto</th><th>Bodega</th><th>Disponible</th><th>Cuarentena</th><th>En proceso</th><th>Sugerido</th><th>Acciones</th></tr></thead><tbody>${suggestions.slice(0,50).map(x=>`<tr>
+      <td><strong>${htmlSafe(x.item_name)}</strong><br><span class="code">${htmlSafe(x.sku)}</span></td>
+      <td>${htmlSafe(x.warehouse_name)}</td><td>${x.available_quantity}</td><td>${x.quarantine_quantity}</td><td>${x.pending_quantity}</td>
+      <td><strong>${x.suggested_quantity}</strong><br><small>Máx. ${x.maximum_stock}</small></td>
+      <td><div class="actions">${can('move')&&Number(x.suggested_quantity)>0?`<button class="link-button" data-request-replenishment="${x.item_id}" data-warehouse="${x.warehouse_id}">Solicitar</button>`:''}${can('admin')?`<button class="link-button" data-policy-item="${x.item_id}" data-warehouse="${x.warehouse_id}">Configurar</button>`:''}</div></td>
+    </tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay productos bajo punto de reposición.</p>'}
+    <h3 class="section-title" style="margin-top:22px">Solicitudes de compra</h3>
+    ${requests.length?`<div class="table-wrap"><table><thead><tr><th>Solicitud</th><th>Bodega</th><th>Proveedor</th><th>Productos</th><th>Estado</th><th>Acciones</th></tr></thead><tbody>${requests.slice(0,50).map(x=>`<tr>
+      <td><strong>${htmlSafe(x.requisition_number)}</strong><br><small>${htmlSafe(String(x.created_at||'').slice(0,10))}</small></td>
+      <td>${htmlSafe(x.warehouse_name)}</td><td>${htmlSafe(x.supplier_name||'Por definir')}</td>
+      <td>${(x.lines||[]).map(line=>`${htmlSafe(line.sku)} · ${line.quantityRequested} ${htmlSafe(line.unit)}`).join('<br>')}</td>
+      <td>${tag(x.status)}</td><td><div class="actions">
+        ${x.status==='DRAFT'&&can('move')?`<button class="link-button" data-requisition-action="SUBMIT" data-requisition-id="${x.id}">Enviar</button>`:''}
+        ${x.status==='SUBMITTED'&&can('approve')?`<button class="link-button" data-requisition-action="APPROVE" data-requisition-id="${x.id}">Aprobar</button>`:''}
+        ${x.status==='APPROVED'&&can('approve')?`<button class="link-button" data-requisition-action="ORDER" data-requisition-id="${x.id}">Marcar ordenada</button>`:''}
+        ${['DRAFT','SUBMITTED','APPROVED'].includes(x.status)&&can('move')?`<button class="link-button" data-requisition-action="CANCEL" data-requisition-id="${x.id}">Cancelar</button>`:''}
+      </div></td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay solicitudes de compra.</p>'}
+  </section>`;
+}
+function replenishmentPolicyModal(itemId,warehouseId){
+  let suggestion=(logisticsV2.replenishmentSuggestions||[]).find(x=>x.item_id===itemId&&x.warehouse_id===warehouseId),
+    item=(logisticsV2.items||[]).find(x=>x.id===itemId),warehouse=(logisticsV2.warehouses||[]).find(x=>x.id===warehouseId),
+    suppliers=(logisticsV2.suppliers||[]).filter(x=>x.status==='ACTIVE'),
+    supplierOptions=`<option value="">Sin proveedor preferido</option>${suppliers.map(x=>`<option value="${x.id}" ${x.id===suggestion?.preferred_supplier_id?'selected':''}>${htmlSafe(x.name)}</option>`).join('')}`;
+  if(!item||!warehouse)return toast('No encontramos el producto o la bodega.');
+  modal('Política de reposición',`<form id="replenishmentPolicyForm"><input type="hidden" name="itemId" value="${itemId}"><input type="hidden" name="warehouseId" value="${warehouseId}">
+    <div class="access-box"><strong>${htmlSafe(item.sku)} · ${htmlSafe(item.name)}</strong><div>${htmlSafe(warehouse.name)}</div></div>
+    <div class="form-grid" style="margin-top:16px"><label>Stock mínimo<input name="minimumStock" type="number" min="0" step="0.0001" value="${suggestion?.minimum_stock||item.minimum_stock||0}"></label>
+    <label>Punto de reposición<input name="reorderPoint" type="number" min="0" step="0.0001" value="${suggestion?.reorder_point||item.minimum_stock||0}"></label>
+    <label>Stock máximo<input name="maximumStock" type="number" min="0" step="0.0001" value="${suggestion?.maximum_stock||Math.max(1,Number(item.minimum_stock||0)*2)}"></label>
+    <label>Stock de seguridad<input name="safetyStock" type="number" min="0" step="0.0001" value="${suggestion?.safety_stock||0}"></label>
+    <label>Plazo proveedor (días)<input name="leadTimeDays" type="number" min="0" value="${suggestion?.lead_time_days||0}"></label>
+    <label>Proveedor preferido<select name="preferredSupplierId">${supplierOptions}</select></label></div>
+    <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Guardar política</button></div></form>`);
+}
+function newReplenishmentPolicyModal(){
+  let itemOptions=(logisticsV2.items||[]).filter(x=>x.tracking_type!=='SERIAL').map(x=>`<option value="${x.id}">${htmlSafe(x.sku)} · ${htmlSafe(x.name)}</option>`).join(''),
+    warehouseOptions=(logisticsV2.warehouses||[]).map(x=>`<option value="${x.id}">${htmlSafe(x.name)} · ${htmlSafe(x.cost_center||'')}</option>`).join(''),
+    supplierOptions=`<option value="">Sin proveedor preferido</option>${(logisticsV2.suppliers||[]).filter(x=>x.status==='ACTIVE').map(x=>`<option value="${x.id}">${htmlSafe(x.name)}</option>`).join('')}`;
+  if(!itemOptions)return toast('No hay consumibles disponibles para configurar.');
+  if(!warehouseOptions)return toast('No hay bodegas disponibles para configurar.');
+  modal('Nueva política de reposición',`<form id="replenishmentPolicyForm"><div class="form-grid">
+    <label class="full">Producto<select name="itemId" required>${itemOptions}</select></label>
+    <label class="full">Bodega<select name="warehouseId" required>${warehouseOptions}</select></label>
+    <label>Stock mínimo<input name="minimumStock" type="number" min="0" step="0.0001" value="0"></label>
+    <label>Punto de reposición<input name="reorderPoint" type="number" min="0" step="0.0001" value="0"></label>
+    <label>Stock máximo<input name="maximumStock" type="number" min="0" step="0.0001" value="1"></label>
+    <label>Stock de seguridad<input name="safetyStock" type="number" min="0" step="0.0001" value="0"></label>
+    <label>Plazo proveedor (días)<input name="leadTimeDays" type="number" min="0" value="0"></label>
+    <label>Proveedor preferido<select name="preferredSupplierId">${supplierOptions}</select></label>
+  </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Guardar política</button></div></form>`);
+}
 function custodyV2Markup(){let rows=logisticsV2.custody||[];if(!logisticsV2.loaded||logisticsV2.error)return'';return `<section class="card logistics-v2" style="margin-top:20px"><div class="heading-row"><div><p class="eyebrow">Responsabilidad individual</p><h2 class="section-title">Entregas activas a terreno</h2><p class="page-subtitle">Activos bajo custodia y EPP pendiente o aceptado. Los consumibles quedan en el libro mayor como consumo.</p></div><span class="tag ${rows.length?'warning':'ok'}">${rows.length} activa(s)</span></div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Producto</th><th>Trabajador</th><th>Bodega</th><th>Tipo</th><th>Estado</th><th>Fecha</th></tr></thead><tbody>${rows.map(x=>`<tr><td><strong>${htmlSafe(x.item_name)}</strong><br><span class="code">${htmlSafe(x.unit_code||x.sku)}${x.lot_number?` · Lote ${htmlSafe(x.lot_number)}`:''}</span></td><td>${htmlSafe(x.worker_name||'Sin identificar')}<br><small>${htmlSafe(x.worker_rut||x.worker_email||'')}</small></td><td>${htmlSafe(x.warehouse_name||x.cost_center||'—')}</td><td>${htmlSafe(x.assignment_type)}</td><td>${tag(x.status)}</td><td>${htmlSafe(String(x.created_at||'').slice(0,10))}</td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay activos o EPP actualmente asignados a trabajadores.</p>'}</section>`}
 function cycleCountMarkup(){if(!logisticsV2.loaded||logisticsV2.error)return'';let rows=logisticsV2.cycleCounts||[],open=rows.filter(x=>!['POSTED','CANCELLED'].includes(x.status));return `<section class="card logistics-v2" style="margin-top:20px" data-cycle-counts><div class="heading-row"><div><p class="eyebrow">Control de existencias</p><h2 class="section-title">Conteos cíclicos</h2><p class="page-subtitle">Conteo ciego de consumibles, aprobación independiente y ajuste automático del libro mayor.</p></div>${can('move')?'<button class="button" data-new-cycle-count>＋ Iniciar conteo</button>':''}</div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Conteo</th><th>Bodega</th><th>Estado</th><th>Líneas</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>${rows.slice(0,30).map(x=>{let action=x.status==='SUBMITTED'&&can('approve')?`<button class="link-button" data-cycle-action="APPROVE" data-cycle-id="${x.id}">Aprobar</button>`:x.status==='APPROVED'&&can('approve')?`<button class="link-button" data-cycle-action="POST" data-cycle-id="${x.id}">Contabilizar</button>`:['DRAFT','IN_PROGRESS'].includes(x.status)&&can('move')?`<button class="link-button" data-cycle-open="${x.id}">Contar</button>${x.status==='IN_PROGRESS'?`<button class="link-button" data-cycle-action="SUBMIT" data-cycle-id="${x.id}">Enviar</button>`:''}<button class="link-button" data-cycle-action="CANCEL" data-cycle-id="${x.id}">Cancelar</button>`:`<button class="link-button" data-cycle-open="${x.id}">Ver</button>`;return `<tr><td><strong>${htmlSafe(x.count_number)}</strong><br><small>${x.blind_count?'Conteo ciego':'Conteo informado'}</small></td><td>${htmlSafe(x.warehouse_name||x.cost_center)}</td><td>${tag(x.status)}</td><td>${(x.lines||[]).length}</td><td>${String(x.created_at||'').slice(0,10)}</td><td><div class="actions">${action}</div></td></tr>`}).join('')}</tbody></table></div>`:'<p class="empty">No hay conteos registrados.</p>'}${open.length?`<div class="access-box" style="margin-top:14px">${open.length} conteo(s) pendiente(s) de cierre.</div>`:''}</section>`}
-function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+inboundV2Markup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
+function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+replenishmentV2Markup()+inboundV2Markup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
 function newCycleCountModal(){let options=(logisticsV2.warehouses||[]).map(w=>`<option value="${w.id}">${htmlSafe(w.name)} · ${htmlSafe(w.cost_center||'')}</option>`).join('');modal('Iniciar conteo cíclico',`<form id="newCycleCountForm"><div class="form-grid"><label class="full">Bodega<select name="warehouseId" required>${options}</select></label><label class="full">Observación<input name="notes" placeholder="Ej. conteo semanal, sector o responsable"></label></div><div class="access-box" style="margin-top:16px">El conteo será ciego: el usuario no verá las cantidades esperadas hasta enviarlo a aprobación. En esta etapa se incluyen consumibles; los activos serializados se controlan individualmente.</div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Crear conteo</button></div></form>`)}
 function cycleCountModal(id){let count=(logisticsV2.cycleCounts||[]).find(x=>x.id===id);if(!count)return toast('No encontramos el conteo.');let editable=['DRAFT','IN_PROGRESS'].includes(count.status)&&can('move'),showExpected=!['DRAFT','IN_PROGRESS'].includes(count.status);modal(`Conteo · ${count.count_number}`,`<div class="access-box"><strong>${htmlSafe(count.warehouse_name)}</strong><div>Estado: ${htmlSafe(count.status)} · ${count.blind_count?'Conteo ciego':'Conteo informado'}</div></div><form id="cycleCountForm" data-id="${count.id}"><div class="table-wrap" style="margin-top:16px"><table><thead><tr><th>Producto</th><th>Ubicación</th>${showExpected?'<th>Esperado</th>':''}<th>Contado</th>${showExpected?'<th>Diferencia</th>':''}<th>Observación</th></tr></thead><tbody>${(count.lines||[]).map(line=>`<tr><td><strong>${htmlSafe(line.item_name)}</strong><br><span class="code">${htmlSafe(line.sku)}</span></td><td>${htmlSafe(line.location_name)}</td>${showExpected?`<td>${line.expected_quantity}</td>`:''}<td><input name="qty-${line.id}" type="number" min="0" step="0.0001" required ${editable?'':'readonly'} value="${line.counted_quantity??''}" style="min-width:100px"></td>${showExpected?`<td><strong>${Number(line.variance||0)>0?'+':''}${line.variance??0}</strong></td>`:''}<td><input name="note-${line.id}" ${editable?'':'readonly'} value="${htmlSafe(line.notes||'')}" placeholder="Opcional"></td></tr>`).join('')}</tbody></table></div><div class="form-actions"><button type="button" class="outline" data-close>Cerrar</button>${editable?'<button class="button">Guardar cantidades</button>':''}</div></form>`)}
 async function cycleCountAction(id,action,extra={}){let payload=await logisticsFetch(`/api/v1/cycle-counts/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});await loadLogisticsV2(true);toast(action==='SUBMIT'?'Conteo enviado a aprobación.':action==='APPROVE'?'Conteo aprobado.':action==='POST'?`Conteo contabilizado: ${payload.adjustedLines||0} ajuste(s).`:'Conteo actualizado.');return payload}
@@ -744,7 +808,7 @@ document.addEventListener('submit',async e=>{
   let unlock=lockFormSubmission(e.target,'Recibiendo en cuarentena…');if(!unlock)return;
   try{
     let d=new FormData(e.target),result=await logisticsFetch('/api/v1/inbound-receipts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      organizationId:logisticsV2.status?.organizationId,supplierId:d.get('supplierId'),warehouseId:d.get('warehouseId'),
+      organizationId:logisticsV2.status?.organizationId,requisitionId:d.get('requisitionId'),supplierId:d.get('supplierId'),warehouseId:d.get('warehouseId'),
       documentType:d.get('documentType'),documentNumber:d.get('documentNumber'),source:'MANUAL',notes:d.get('notes'),
       lines:[{itemId:d.get('itemId'),quantity:Number(d.get('quantity')),lotNumber:d.get('lotNumber'),
         manufacturedAt:d.get('manufacturedAt'),expiresAt:d.get('expiresAt'),notes:d.get('notes')}]
@@ -773,9 +837,49 @@ document.addEventListener('click',async e=>{
     await loadLogisticsV2(true);toast(action==='RELEASE'?'Stock liberado y disponible.':'Recepción rechazada y retirada del stock.');render();
   }catch(err){toast(err.message||'No se pudo resolver la recepción.');t.disabled=false}
 },true);
+document.addEventListener('click',async e=>{
+  let t=e.target.closest?.('[data-new-policy],[data-policy-item],[data-request-replenishment],[data-requisition-action]');if(!t)return;e.preventDefault();
+  try{
+    if(t.dataset.newPolicy!==undefined){newReplenishmentPolicyModal();return}
+    if(t.dataset.policyItem){replenishmentPolicyModal(t.dataset.policyItem,t.dataset.warehouse);return}
+    if(t.dataset.requestReplenishment){
+      let suggestion=(logisticsV2.replenishmentSuggestions||[]).find(x=>x.item_id===t.dataset.requestReplenishment&&x.warehouse_id===t.dataset.warehouse);
+      if(!suggestion||!(Number(suggestion.suggested_quantity)>0))throw new Error('La sugerencia ya no requiere compra.');
+      if(!confirm(`¿Crear solicitud por ${suggestion.suggested_quantity} ${suggestion.unit_of_measure} de ${suggestion.item_name}?`))return;
+      let result=await logisticsFetch('/api/v1/purchase-requisitions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        organizationId:logisticsV2.status?.organizationId,warehouseId:suggestion.warehouse_id,
+        preferredSupplierId:suggestion.preferred_supplier_id,notes:'Generada desde sugerencia automática de reposición',
+        lines:[{itemId:suggestion.item_id,quantity:Number(suggestion.suggested_quantity),reason:`Disponible ${suggestion.available_quantity}; punto de reposición ${suggestion.reorder_point}; máximo ${suggestion.maximum_stock}`}]
+      })});
+      await loadLogisticsV2(true);toast(`Solicitud ${result.requisition?.requisition_number||''} creada como borrador.`);render();return
+    }
+    if(t.dataset.requisitionAction){
+      let request=(logisticsV2.purchaseRequisitions||[]).find(x=>x.id===t.dataset.requisitionId),action=t.dataset.requisitionAction,
+        label={SUBMIT:'enviar a aprobación',APPROVE:'aprobar',ORDER:'marcar como ordenada',CANCEL:'cancelar'}[action]||'actualizar';
+      if(!request||!confirm(`¿Deseas ${label} la solicitud ${request.requisition_number}?`))return;
+      await logisticsFetch(`/api/v1/purchase-requisitions/${encodeURIComponent(request.id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,notes:`${label} por ${activeUser().name}`})});
+      await loadLogisticsV2(true);toast(`Solicitud ${request.requisition_number} actualizada.`);render();
+    }
+  }catch(err){toast(err.message||'No se pudo completar la reposición.')}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='replenishmentPolicyForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Guardando política…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target);
+    await logisticsFetch('/api/v1/replenishment/policies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      organizationId:logisticsV2.status?.organizationId,itemId:d.get('itemId'),warehouseId:d.get('warehouseId'),
+      preferredSupplierId:d.get('preferredSupplierId'),minimumStock:Number(d.get('minimumStock')),
+      reorderPoint:Number(d.get('reorderPoint')),maximumStock:Number(d.get('maximumStock')),
+      safetyStock:Number(d.get('safetyStock')),leadTimeDays:Number(d.get('leadTimeDays'))
+    })});
+    await loadLogisticsV2(true);closeModal();toast('Política de reposición guardada.');render();
+  }catch(err){toast(err.message||'No se pudo guardar la política.')}finally{unlock()}
+},true);
 $('#userSwitcher').onclick=()=>{activeUserId?logout():(route='login',render())};$('#profileButton').onclick=()=>{activeUserId?(route='settings',render()):(route='login',render())};
 async function loadRemoteState(){let res=await fetch('/api/state');if(!res.ok)return false;let payload=await res.json();if(payload?.state){state=repairTextState(payload.state);stateRevision=Number(payload.revision||0);localStorage.setItem(`${storageKey}-revision`,String(stateRevision));ensureInventoryModel();reconcileLegacyInspectionWorkflow();let authUser=window.ICCAuth?.appUser?.();if(authUser&&!state.users.some(u=>u.id===authUser.id))state.users.unshift(authUser);localStorage.setItem(storageKey,JSON.stringify(state));openAssetFromUrl();return true}return false}
-function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
+function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],replenishmentSuggestions:[],purchaseRequisitions:[],workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
 window.addEventListener('icc-auth-error',e=>toast(e.detail));
 window.addEventListener('icc-state-conflict',e=>toast(e.detail||'Los datos cambiaron en otra sesión. Actualiza la pantalla.'));
 window.addEventListener('icc-realtime',()=>{renderRealtimeCounter();if(route==='tasks')render()});

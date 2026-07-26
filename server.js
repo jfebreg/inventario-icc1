@@ -13,6 +13,7 @@ import {
   createInspectionRun,
   createCustodyAssignment,
   createInboundReceipt,
+  createPurchaseRequisition,
   createTransfer,
   dispatchTransfer,
   ensureDefaultOrganization,
@@ -20,6 +21,8 @@ import {
   listCycleCounts,
   listCustodyAssignments,
   listInboundReceipts,
+  listPurchaseRequisitions,
+  listReplenishmentSuggestions,
   listSuppliers,
   listTransfers,
   listWarehouses,
@@ -38,7 +41,9 @@ import {
   stockSnapshot,
   updateCycleCount,
   updateInboundReceipt,
-  updateInspectionRun
+  updatePurchaseRequisition,
+  updateInspectionRun,
+  upsertReplenishmentPolicy
 } from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -1163,7 +1168,8 @@ const server = http.createServer(async (req, res) => {
     if (!profileCan(dashboardProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
-      const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts, workers, reconciliation] = await Promise.all([
+      const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
+        replenishmentSuggestions, purchaseRequisitions, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
@@ -1173,6 +1179,8 @@ const server = http.createServer(async (req, res) => {
         listCycleCounts(pool, dashboardProfile),
         listSuppliers(pool, logisticsOrganizationId),
         listInboundReceipts(pool, dashboardProfile),
+        listReplenishmentSuggestions(pool, dashboardProfile),
+        listPurchaseRequisitions(pool, dashboardProfile),
         pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
           ${dashboardProfile.admin ? "" : "WHERE cost_center=$1"}
           ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows),
@@ -1194,6 +1202,8 @@ const server = http.createServer(async (req, res) => {
         cycleCounts,
         suppliers,
         inboundReceipts,
+        replenishmentSuggestions,
+        purchaseRequisitions,
         workers,
         reconciliation
       });
@@ -1360,6 +1370,78 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la recepción." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/replenishment" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar reposición." });
+    try {
+      return json(res, 200, { suggestions: await listReplenishmentSuggestions(pool, apiProfile) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo calcular la reposición." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/replenishment/policies" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede configurar reposición." });
+    try {
+      const body = await readJson(req);
+      const policy = await upsertReplenishmentPolicy(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 200, { policy });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar la política." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/purchase-requisitions" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar solicitudes." });
+    try {
+      return json(res, 200, { purchaseRequisitions: await listPurchaseRequisitions(pool, apiProfile) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las solicitudes." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/purchase-requisitions" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede solicitar compras." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
+        return json(res, 403, { error: "Sólo puedes solicitar para una bodega de tu centro." });
+      }
+      const result = await createPurchaseRequisition(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear la solicitud." });
+    }
+  }
+
+  const requisitionAction = url.pathname.match(/^\/api\/v1\/purchase-requisitions\/([^/]+)$/);
+  if (requisitionAction && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = ["APPROVE", "ORDER"].includes(action) ? "approve" : "move";
+      if (!profileCan(apiProfile, permission)) {
+        return json(res, 403, { error: "Tu perfil no puede completar esta etapa de compra." });
+      }
+      const scope = await pool.query("SELECT warehouse_id FROM logistics_purchase_requisitions WHERE id=$1", [requisitionAction[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Solicitud no encontrada." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La solicitud pertenece a otro centro de costo." });
+      }
+      const result = await updatePurchaseRequisition(pool, requisitionAction[1], action, {
+        ...body, allowSelfApproval: Boolean(apiProfile.admin)
+      }, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud." });
     }
   }
 
