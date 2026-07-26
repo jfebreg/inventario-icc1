@@ -15,6 +15,8 @@ import {
   createInboundReceipt,
   createInventoryAdjustment,
   createInventoryPeriod,
+  createPurchaseOrder,
+  createSupplierInvoice,
   createMaterialRequest,
   createMaintenancePlan,
   createPurchaseRequisition,
@@ -31,6 +33,7 @@ import {
   listMaterialRequests,
   listMaintenance,
   listPurchaseRequisitions,
+  listProcurement,
   listReplenishmentSuggestions,
   listSuppliers,
   listTransfers,
@@ -56,7 +59,10 @@ import {
   updateInventoryAdjustment,
   updateMaterialRequest,
   updateWorkOrder,
+  updatePurchaseOrder,
   updatePurchaseRequisition,
+  updateProcurementSettings,
+  updateSupplierInvoice,
   updateStorageLocation,
   updateInspectionRun,
   closeInventoryPeriod,
@@ -615,6 +621,50 @@ async function syncInventoryAdjustmentTask(adjustmentId) {
     ON CONFLICT (id) DO NOTHING`,
   [`notification-${taskId}-${adjustment.status}`, assignee, adjustment.cost_center || "Bodega Central",
     title, detail, adjustment.id, JSON.stringify(adjustment)]);
+}
+
+async function syncSupplierInvoiceTask(invoiceId) {
+  const result = await pool.query(`SELECT invoice.*,purchase_order.purchase_order_number,
+      warehouse.name AS warehouse_name,center.name AS cost_center,supplier.name AS supplier_name
+    FROM logistics_supplier_invoices invoice
+    JOIN logistics_purchase_orders purchase_order ON purchase_order.id=invoice.purchase_order_id
+    JOIN logistics_warehouses warehouse ON warehouse.id=purchase_order.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    JOIN logistics_suppliers supplier ON supplier.id=invoice.supplier_id
+    WHERE invoice.id=$1`, [invoiceId]);
+  const invoice = result.rows[0];
+  if (!invoice) return;
+  const taskId = `supplier-invoice-${invoice.id}`;
+  if (!["MATCHED", "EXCEPTION"].includes(invoice.status)) {
+    await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
+      updated_at=NOW() WHERE id=$1`, [taskId]);
+    return;
+  }
+  const responsible = await pool.query(`SELECT auth_user_id FROM inventory_user_profiles
+    WHERE active=TRUE AND auth_user_id IS NOT NULL AND id<>$1
+      AND (admin=TRUE OR permissions ? 'approve') AND (admin=TRUE OR cost_center=$2)
+    ORDER BY admin DESC,updated_at DESC LIMIT 1`,
+  [invoice.registered_by, invoice.cost_center || "Bodega Central"]);
+  const assignee = responsible.rows[0]?.auth_user_id || null;
+  const exception = invoice.status === "EXCEPTION";
+  const title = exception
+    ? `Factura bloqueada por diferencias: ${invoice.invoice_number}`
+    : `Factura conciliada pendiente de aprobación: ${invoice.invoice_number}`;
+  const detail = `${invoice.supplier_name} · ${invoice.purchase_order_number} · ${invoice.currency} ${invoice.total_amount}`;
+  await pool.query(`INSERT INTO inventory_tasks
+    (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,entity_type,entity_id,payload,updated_at)
+    VALUES ($1,'Conciliación de factura',$2,$3,$4,'Pendiente',$5,$6,'supplier_invoice',$7,$8::jsonb,NOW())
+    ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,priority=EXCLUDED.priority,
+      status='Pendiente',center_name=EXCLUDED.center_name,assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,
+      resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
+  [taskId, title, detail, exception ? "Crítica" : "Alta", invoice.cost_center || "Bodega Central",
+    assignee, invoice.id, JSON.stringify(invoice)]);
+  await pool.query(`INSERT INTO inventory_notifications
+    (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+    VALUES ($1,$2,$3,'Conciliación de factura',$4,$5,$6,'supplier_invoice',$7,$8::jsonb)
+    ON CONFLICT (id) DO NOTHING`,
+  [`notification-${taskId}-${invoice.status}`, assignee, invoice.cost_center || "Bodega Central",
+    title, detail, exception ? "critical" : "warning", invoice.id, JSON.stringify(invoice)]);
 }
 
 function sameCenter(left, right) {
@@ -1229,7 +1279,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1246,6 +1296,7 @@ const server = http.createServer(async (req, res) => {
         listMaintenance(pool, dashboardProfile),
         listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
         listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
+        listProcurement(pool, dashboardProfile, logisticsOrganizationId),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1278,6 +1329,7 @@ const server = http.createServer(async (req, res) => {
         maintenance,
         inventoryAnalytics,
         inventoryControl,
+        procurement,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1528,6 +1580,7 @@ const server = http.createServer(async (req, res) => {
       }
       const result = await createInboundReceipt(pool, {
         ...body,
+        allowNoPurchaseOrder: Boolean(apiProfile.admin && body.exceptionalWithoutPurchaseOrder),
         organizationId: body.organizationId || logisticsOrganizationId
       }, apiProfile.id);
       return json(res, result.replayed ? 200 : 201, result);
@@ -1626,6 +1679,104 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/procurement" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar compras." });
+    try {
+      return json(res, 200, await listProcurement(pool, apiProfile, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar compras." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/procurement/settings" && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede configurar tolerancias." });
+    try {
+      const body = await readJson(req);
+      const settings = await updateProcurementSettings(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 200, { settings });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron guardar las tolerancias." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/purchase-orders" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede crear órdenes." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
+        return json(res, 403, { error: "Sólo puedes crear órdenes para tu centro." });
+      }
+      const result = await createPurchaseOrder(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear la orden." });
+    }
+  }
+
+  const purchaseOrderRoute = url.pathname.match(/^\/api\/v1\/purchase-orders\/([^/]+)$/);
+  if (purchaseOrderRoute && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = ["APPROVE", "CLOSE"].includes(action) ? "approve" : "move";
+      if (!profileCan(apiProfile, permission)) return json(res, 403, { error: "Tu perfil no puede actualizar la orden." });
+      const scope = await pool.query(`SELECT warehouse_id FROM logistics_purchase_orders WHERE id=$1`, [purchaseOrderRoute[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Orden inexistente." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La orden pertenece a otro centro." });
+      }
+      return json(res, 200, await updatePurchaseOrder(pool, purchaseOrderRoute[1], action, body, apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la orden." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/supplier-invoices" && req.method === "POST") {
+    if (!profileCan(apiProfile, "receive")) return json(res, 403, { error: "Tu perfil no puede registrar facturas." });
+    try {
+      const body = await readJson(req);
+      const scope = await pool.query(`SELECT warehouse_id FROM logistics_purchase_orders WHERE id=$1`, [body.purchaseOrderId]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Orden inexistente." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La orden pertenece a otro centro." });
+      }
+      const result = await createSupplierInvoice(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      await syncSupplierInvoiceTask(result.invoice.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar o conciliar la factura." });
+    }
+  }
+
+  const supplierInvoiceRoute = url.pathname.match(/^\/api\/v1\/supplier-invoices\/([^/]+)$/);
+  if (supplierInvoiceRoute && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "approve")) return json(res, 403, { error: "Tu perfil no puede aprobar facturas." });
+    try {
+      const body = await readJson(req);
+      const scope = await pool.query(`SELECT purchase_order.warehouse_id
+        FROM logistics_supplier_invoices invoice
+        JOIN logistics_purchase_orders purchase_order ON purchase_order.id=invoice.purchase_order_id
+        WHERE invoice.id=$1`, [supplierInvoiceRoute[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Factura inexistente." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La factura pertenece a otro centro." });
+      }
+      const result = await updateSupplierInvoice(pool, supplierInvoiceRoute[1], body.action, {
+        ...body, allowException: Boolean(apiProfile.admin)
+      }, apiProfile.id);
+      await syncSupplierInvoiceTask(supplierInvoiceRoute[1]);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo resolver la factura." });
     }
   }
 
