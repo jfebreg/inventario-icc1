@@ -54,7 +54,7 @@ let requestedQrCode=qrCodeFromUrl||sessionStorage.getItem('icc-pending-qr-code')
 if(qrCodeFromUrl)sessionStorage.setItem('icc-pending-qr-code',qrCodeFromUrl);
 window.scannedAssetCode=requestedQrCode;
 let activeUserId=''; let route='login'; let assetFilter=''; let familyFilter='all';
-let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],workers:[],reconciliation:null,error:''};
+let logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],workers:[],reconciliation:null,error:''};
 let quickLogisticsLoading=false;
 let lastOperationalRefresh=0;
 let stateRevision=null;
@@ -106,8 +106,8 @@ new MutationObserver(()=>queueMicrotask(syncInventoryLogisticsContext)).observe(
 new MutationObserver(()=>queueMicrotask(renderInventorySourceNotice)).observe(document.getElementById('view'),{childList:true,subtree:true});
 function renderMobileTerrainShortcut(){if(!window.matchMedia?.('(max-width: 900px)').matches)return;let a=scannedAsset();if(route==='dashboard'){let grid=$('.mobile-dashboard-actions .grid');if(grid&&!grid.querySelector('[data-mobile-terrain]'))grid.insertAdjacentHTML('afterbegin',`<button class="button quick-action primary" data-mobile-terrain>${a?`Entrega a terreno · ${htmlSafe(a.name)}`:'Entrega a terreno'}</button>`)}if(route==='scan'&&a){let summary=$('.scan-product-summary');if(summary&&!summary.querySelector('[data-mobile-terrain]'))summary.insertAdjacentHTML('beforeend',`<button type="button" class="button" data-mobile-terrain>Entrega a terreno</button>`)}}
 async function syncQuickLogisticsContext(){if(route!=='quick'||!activeUserId||logisticsV2.loaded||logisticsV2.loading||logisticsV2.error||quickLogisticsLoading)return;quickLogisticsLoading=true;try{await loadLogisticsV2(true);if(route==='quick')render()}finally{quickLogisticsLoading=false}}
-function canonicalStockContext(a){if(!a||!logisticsV2.loaded)return null;let item=canonicalItemForAsset(a),unit=canonicalUnitForAsset(item,a),balances=(logisticsV2.stock||[]).filter(x=>unit?String(x.asset_unit_id||'')===String(unit.id):item&&String(x.item_id||'')===String(item.id)),total=balances.reduce((sum,x)=>sum+Number(x.quantity||0),0),transit=balances.filter(x=>x.location_type==='TRANSIT').reduce((sum,x)=>sum+Number(x.quantity||0),0),locations=balances.filter(x=>x.location_type!=='TRANSIT').map(x=>({name:x.cost_center||x.warehouse_name||x.location_name,quantity:Number(x.quantity||0)})),updated=balances.map(x=>x.updated_at).filter(Boolean).sort().at(-1)||'';return{item,unit,balances,total,transit,locations,updated}}
-function canonicalStockAt(a,center){let ctx=canonicalStockContext(a);if(!ctx)return null;let wanted=String(center||'').trim().toLowerCase();return ctx.balances.filter(x=>wanted==='en tránsito'?x.location_type==='TRANSIT':[x.cost_center,x.warehouse_name,x.location_name].some(name=>String(name||'').trim().toLowerCase()===wanted)).reduce((sum,x)=>sum+Number(x.quantity||0),0)}
+function canonicalStockContext(a){if(!a||!logisticsV2.loaded)return null;let item=canonicalItemForAsset(a),unit=canonicalUnitForAsset(item,a),balances=(logisticsV2.stock||[]).filter(x=>unit?String(x.asset_unit_id||'')===String(unit.id):item&&String(x.item_id||'')===String(item.id)),total=balances.reduce((sum,x)=>sum+Number(x.quantity||0),0),transit=balances.filter(x=>x.location_type==='TRANSIT').reduce((sum,x)=>sum+Number(x.quantity||0),0),quarantine=balances.filter(x=>x.location_type==='QUARANTINE').reduce((sum,x)=>sum+Number(x.quantity||0),0),locations=balances.filter(x=>x.location_type==='STORAGE').map(x=>({name:x.cost_center||x.warehouse_name||x.location_name,quantity:Number(x.quantity||0)})),updated=balances.map(x=>x.updated_at).filter(Boolean).sort().at(-1)||'';return{item,unit,balances,total,transit,quarantine,locations,updated}}
+function canonicalStockAt(a,center){let ctx=canonicalStockContext(a);if(!ctx)return null;let wanted=String(center||'').trim().toLowerCase();return ctx.balances.filter(x=>wanted==='en tránsito'?x.location_type==='TRANSIT':x.location_type==='STORAGE'&&[x.cost_center,x.warehouse_name,x.location_name].some(name=>String(name||'').trim().toLowerCase()===wanted)).reduce((sum,x)=>sum+Number(x.quantity||0),0)}
 function availableStockForMovement(a,center){let canonical=canonicalStockAt(a,center);return canonical===null?stockAt(a,center):canonical}
 function renderCanonicalQrStatus(){if(route!=='quick'||!logisticsV2.loaded||document.querySelector('[data-canonical-qr-status]'))return;let a=state.assets.find(x=>x.id===(window.quickAssetId||window.lifeId)),ctx=canonicalStockContext(a),custody=activeCustody(a);if(!a||!ctx)return;let locations=ctx.locations.length?ctx.locations.map(x=>`${htmlSafe(x.name)}: <strong>${x.quantity}</strong>`).join(' · '):'Sin saldo en bodega',markup=`<div class="canonical-qr-status ${ctx.balances.length?'':'warning'}" data-canonical-qr-status><div class="canonical-status-head"><div><span>Libro mayor V2</span><strong>${ctx.balances.length?'Información oficial conciliada':'Sin saldo canónico visible'}</strong></div><button class="link-button" data-refresh-v2>Actualizar ahora</button></div><div class="canonical-qr-metrics"><small>Total empresa <b>${ctx.total}</b></small><small>En tránsito <b>${ctx.transit}</b></small><small>A cargo de <b>${htmlSafe(custody?.worker||'—')}</b></small></div><p>${locations}</p><small>${ctx.updated?`Saldo actualizado: ${new Date(ctx.updated).toLocaleString('es-CL')} · `:''}Sincronización automática cada 30 segundos.</small></div>`;let mobile=$('.quick-mobile-head'),desktop=$('.quick-desktop-only .heading-row');mobile?.insertAdjacentHTML('afterend',markup);desktop?.insertAdjacentHTML('afterend',markup)}
 async function syncInventoryLogisticsContext(){if(route!=='inventory'||!activeUserId||logisticsV2.loaded||logisticsV2.loading||logisticsV2.error)return;try{await loadLogisticsV2(true);if(route==='inventory')render()}catch{}}
@@ -116,7 +116,7 @@ async function refreshOperationalData(force=false){if(!activeUserId||!['quick','
 setInterval(()=>{if(document.visibilityState==='visible')refreshOperationalData()},30000);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refreshOperationalData()});
 window.addEventListener('focus',()=>refreshOperationalData());
-function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
+function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
 function normalizeCode(value){let text=String(value||'').toUpperCase().trim(),m=text.match(/^([A-Z]+)[\s-]*0*(\d+)(?:[\s-]+0*(\d+))?$/);if(m)return `${m[1]}-${Number(m[2])}${m[3]?`-${Number(m[3])}`:''}`;let raw=text.replace(/[^A-Z0-9]/g,''),plain=raw.match(/^([A-Z]+)0*([0-9]+)$/);return plain?`${plain[1]}-${Number(plain[2])}`:raw}
 function assetBaseCode(a){return a?.baseCode||String(a?.code||'').replace(/^([A-Z]+-\d{6})-\d+$/,'$1')}
 function codeMatches(a,b){return normalizeCode(a)===normalizeCode(b)}
@@ -250,7 +250,7 @@ function correctionModal(id){let i=state.inspections.find(x=>x.id===id),a=state.
 let securityUsers=[],enrolledWorkers=[],securityDataLoaded=false,securityDataLoading=false;
 async function loadSecurityData(force=false){if(!window.ICCAuth?.configured||!activeUserId||securityDataLoading||(!force&&securityDataLoaded))return;securityDataLoading=true;try{let calls=[fetch('/api/workers').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar trabajadores.')))];if(can('admin'))calls.push(fetch('/api/admin/users').then(r=>r.ok?r.json():Promise.reject(new Error('No se pudieron cargar usuarios.'))));let values=await Promise.all(calls);enrolledWorkers=values[0].workers||[];if(values[1])securityUsers=values[1].users||[];securityDataLoaded=true;if(route==='settings')render()}catch(err){toast(err.message)}finally{securityDataLoading=false}}
 async function logisticsFetch(url,options={}){let controller=new AbortController(),timer,timeout=new Promise((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(new Error(`La consulta ${url} tardó más de 20 segundos. Revisa el despliegue de Render y vuelve a intentar.`))},20000)});try{let request=fetch(url,{...options,signal:controller.signal}),res=await Promise.race([request,timeout]),payload=await res.json().catch(()=>({}));if(!res.ok)throw new Error(payload.error||`No se pudo consultar ${url} (HTTP ${res.status}).`);return payload}finally{clearTimeout(timer)}}
-async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
+async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loading||(!force&&logisticsV2.loaded))return;logisticsV2.loading=true;logisticsV2.error='';if(['reports','settings'].includes(route))render();try{let bundle=await logisticsFetch('/api/v1/logistics/dashboard',{headers:{'X-Legacy-User-Id':activeUserId}});logisticsV2={...logisticsV2,loaded:true,loading:false,status:bundle.status||null,items:bundle.items||[],warehouses:bundle.warehouses||[],stock:bundle.stock||[],transfers:bundle.transfers||[],custody:bundle.custody||[],cycleCounts:bundle.cycleCounts||[],suppliers:bundle.suppliers||[],inboundReceipts:bundle.inboundReceipts||[],workers:bundle.workers||[],reconciliation:bundle.reconciliation||null,error:''};if(['reports','settings'].includes(route))render()}catch(err){logisticsV2.loading=false;logisticsV2.error=err.message||'No fue posible cargar el modelo logístico.';if(['reports','settings'].includes(route))render()}}
 function canonicalItemForAsset(a){let base=normalizeCode(assetBaseCode(a));return logisticsV2.items.find(item=>normalizeCode(item.sku)===base)||logisticsV2.items.find(item=>(item.units||[]).some(unit=>codeMatches(unit.unitCode,a.code)))}
 function canonicalUnitForAsset(item,a){return (item?.units||[]).find(unit=>codeMatches(unit.unitCode,a.code))||null}
 function canonicalWarehouse(name){let normalized=String(name||'').trim().toLowerCase();return logisticsV2.warehouses.find(w=>String(w.cost_center||w.name).trim().toLowerCase()===normalized)||null}
@@ -327,9 +327,58 @@ function newLotModal(){
   </div><div class="access-box" style="margin-top:16px">Cada ingreso queda en el libro mayor con su lote. Las salidas y traslados posteriores aplican FEFO automáticamente.</div>
   <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Registrar lote</button></div></form>`);
 }
+function inboundV2Markup(){
+  if(!logisticsV2.loaded||logisticsV2.error)return'';
+  let rows=logisticsV2.inboundReceipts||[],pending=rows.filter(x=>x.status==='QUARANTINE');
+  return `<section class="card logistics-v2" style="margin-top:20px" data-inbound-control>
+    <div class="heading-row"><div><p class="eyebrow">Compras y abastecimiento</p><h2 class="section-title">Recepciones controladas</h2>
+    <p class="page-subtitle">Todo ingreso queda inmovilizado en cuarentena hasta revisar documento, cantidad y condición.</p></div>
+    <div class="actions">${can('admin')?'<button class="button secondary" data-new-supplier>＋ Proveedor</button>':''}${can('move')?'<button class="button" data-new-inbound>＋ Recibir compra</button>':''}</div></div>
+    <div class="grid metrics"><div class="card"><div class="metric-label">Proveedores activos</div><div class="metric-value">${(logisticsV2.suppliers||[]).filter(x=>x.status==='ACTIVE').length}</div></div>
+    <div class="card"><div class="metric-label">En cuarentena</div><div class="metric-value">${pending.length}</div><div class="metric-foot ${pending.length?'alert':''}">${pending.length?'Stock no utilizable':'Sin recepciones pendientes'}</div></div></div>
+    ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Recepción</th><th>Proveedor / documento</th><th>Bodega</th><th>Productos</th><th>Estado</th><th>Acciones</th></tr></thead><tbody>${rows.slice(0,40).map(x=>`<tr>
+      <td><strong>${htmlSafe(x.receipt_number)}</strong><br><small>${htmlSafe(String(x.received_at||'').slice(0,10))}</small></td>
+      <td>${htmlSafe(x.supplier_name)}<br><small>${htmlSafe(x.document_type)} · ${htmlSafe(x.document_number)}</small></td>
+      <td>${htmlSafe(x.warehouse_name||x.cost_center||'—')}</td>
+      <td>${(x.lines||[]).map(line=>`${htmlSafe(line.sku)} · ${line.quantity}${line.lotNumber?` · Lote ${htmlSafe(line.lotNumber)}`:''}`).join('<br>')}</td>
+      <td>${tag(x.status)}</td><td>${x.status==='QUARANTINE'&&(can('receive')||can('approve'))?`<div class="actions">${can('receive')?`<button class="link-button" data-inbound-action="RELEASE" data-inbound-id="${x.id}">Liberar</button>`:''}${can('approve')?`<button class="link-button" data-inbound-action="REJECT" data-inbound-id="${x.id}">Rechazar</button>`:''}</div>`:'—'}</td>
+    </tr>`).join('')}</tbody></table></div>`:'<p class="empty">Aún no hay recepciones controladas.</p>'}
+  </section>`;
+}
+function supplierModal(){
+  modal('Registrar proveedor',`<form id="supplierForm"><div class="form-grid">
+    <label>Código interno<input name="code" required placeholder="Ej. DISTINTEC"></label>
+    <label>RUT / identificación tributaria<input name="taxId" placeholder="Ej. 76.123.456-7"></label>
+    <label class="full">Razón social<input name="name" required></label>
+    <label>Correo<input name="email" type="email"></label><label>Teléfono<input name="phone"></label>
+    <label class="full">Dirección<input name="address"></label>
+  </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Guardar proveedor</button></div></form>`);
+}
+function inboundReceiptModal(){
+  let suppliers=(logisticsV2.suppliers||[]).filter(x=>x.status==='ACTIVE'),
+    items=(logisticsV2.items||[]).filter(x=>x.tracking_type!=='SERIAL'),
+    supplierOptions=suppliers.map(x=>`<option value="${x.id}">${htmlSafe(x.name)}${x.tax_id?` · ${htmlSafe(x.tax_id)}`:''}</option>`).join(''),
+    warehouseOptions=(logisticsV2.warehouses||[]).map(x=>`<option value="${x.id}">${htmlSafe(x.name)} · ${htmlSafe(x.cost_center||'')}</option>`).join(''),
+    itemOptions=items.map(x=>`<option value="${x.id}" data-tracking="${x.tracking_type}">${htmlSafe(x.sku)} · ${htmlSafe(x.name)}${x.tracking_type==='LOT'?' · requiere lote':''}</option>`).join('');
+  if(!suppliers.length)return toast('Primero registra un proveedor.');
+  if(!items.length)return toast('No hay consumibles disponibles para recepción.');
+  modal('Recibir compra en cuarentena',`<form id="inboundReceiptForm"><div class="form-grid">
+    <label>Proveedor<select name="supplierId" required>${supplierOptions}</select></label>
+    <label>Bodega receptora<select name="warehouseId" required>${warehouseOptions}</select></label>
+    <label>Tipo de documento<select name="documentType"><option value="DELIVERY_NOTE">Guía de despacho</option><option value="INVOICE">Factura</option><option value="PURCHASE_ORDER">Orden de compra</option><option value="OTHER">Otro</option></select></label>
+    <label>Número de documento<input name="documentNumber" required></label>
+    <label class="full">Producto<select name="itemId" required>${itemOptions}</select></label>
+    <label>Cantidad recibida<input name="quantity" type="number" min="0.0001" step="0.0001" required value="1"></label>
+    <label>Número de lote<input name="lotNumber" placeholder="Obligatorio si el producto controla lote"></label>
+    <label>Fabricación<input name="manufacturedAt" type="date"></label>
+    <label>Vencimiento<input name="expiresAt" type="date"></label>
+    <label class="full">Observaciones de recepción<input name="notes" placeholder="Embalaje, diferencia, condición visible o responsable"></label>
+  </div><div class="access-box" style="margin-top:16px"><strong>Stock bloqueado:</strong> la cantidad quedará en Cuarentena y no podrá entregarse, trasladarse ni consumirse hasta su liberación.</div>
+  <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Recibir en cuarentena</button></div></form>`);
+}
 function custodyV2Markup(){let rows=logisticsV2.custody||[];if(!logisticsV2.loaded||logisticsV2.error)return'';return `<section class="card logistics-v2" style="margin-top:20px"><div class="heading-row"><div><p class="eyebrow">Responsabilidad individual</p><h2 class="section-title">Entregas activas a terreno</h2><p class="page-subtitle">Activos bajo custodia y EPP pendiente o aceptado. Los consumibles quedan en el libro mayor como consumo.</p></div><span class="tag ${rows.length?'warning':'ok'}">${rows.length} activa(s)</span></div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Producto</th><th>Trabajador</th><th>Bodega</th><th>Tipo</th><th>Estado</th><th>Fecha</th></tr></thead><tbody>${rows.map(x=>`<tr><td><strong>${htmlSafe(x.item_name)}</strong><br><span class="code">${htmlSafe(x.unit_code||x.sku)}${x.lot_number?` · Lote ${htmlSafe(x.lot_number)}`:''}</span></td><td>${htmlSafe(x.worker_name||'Sin identificar')}<br><small>${htmlSafe(x.worker_rut||x.worker_email||'')}</small></td><td>${htmlSafe(x.warehouse_name||x.cost_center||'—')}</td><td>${htmlSafe(x.assignment_type)}</td><td>${tag(x.status)}</td><td>${htmlSafe(String(x.created_at||'').slice(0,10))}</td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay activos o EPP actualmente asignados a trabajadores.</p>'}</section>`}
 function cycleCountMarkup(){if(!logisticsV2.loaded||logisticsV2.error)return'';let rows=logisticsV2.cycleCounts||[],open=rows.filter(x=>!['POSTED','CANCELLED'].includes(x.status));return `<section class="card logistics-v2" style="margin-top:20px" data-cycle-counts><div class="heading-row"><div><p class="eyebrow">Control de existencias</p><h2 class="section-title">Conteos cíclicos</h2><p class="page-subtitle">Conteo ciego de consumibles, aprobación independiente y ajuste automático del libro mayor.</p></div>${can('move')?'<button class="button" data-new-cycle-count>＋ Iniciar conteo</button>':''}</div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Conteo</th><th>Bodega</th><th>Estado</th><th>Líneas</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>${rows.slice(0,30).map(x=>{let action=x.status==='SUBMITTED'&&can('approve')?`<button class="link-button" data-cycle-action="APPROVE" data-cycle-id="${x.id}">Aprobar</button>`:x.status==='APPROVED'&&can('approve')?`<button class="link-button" data-cycle-action="POST" data-cycle-id="${x.id}">Contabilizar</button>`:['DRAFT','IN_PROGRESS'].includes(x.status)&&can('move')?`<button class="link-button" data-cycle-open="${x.id}">Contar</button>${x.status==='IN_PROGRESS'?`<button class="link-button" data-cycle-action="SUBMIT" data-cycle-id="${x.id}">Enviar</button>`:''}<button class="link-button" data-cycle-action="CANCEL" data-cycle-id="${x.id}">Cancelar</button>`:`<button class="link-button" data-cycle-open="${x.id}">Ver</button>`;return `<tr><td><strong>${htmlSafe(x.count_number)}</strong><br><small>${x.blind_count?'Conteo ciego':'Conteo informado'}</small></td><td>${htmlSafe(x.warehouse_name||x.cost_center)}</td><td>${tag(x.status)}</td><td>${(x.lines||[]).length}</td><td>${String(x.created_at||'').slice(0,10)}</td><td><div class="actions">${action}</div></td></tr>`}).join('')}</tbody></table></div>`:'<p class="empty">No hay conteos registrados.</p>'}${open.length?`<div class="access-box" style="margin-top:14px">${open.length} conteo(s) pendiente(s) de cierre.</div>`:''}</section>`}
-function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
+function renderLogisticsPanel(){if(!['reports','settings'].includes(route)||!activeUserId||$('#logisticsV2Panel'))return;$('#view')?.insertAdjacentHTML('beforeend',logisticsPanelMarkup()+inboundV2Markup()+lotV2Markup()+custodyV2Markup()+cycleCountMarkup());if(!logisticsV2.loaded&&!logisticsV2.loading&&!logisticsV2.error)loadLogisticsV2()}
 function newCycleCountModal(){let options=(logisticsV2.warehouses||[]).map(w=>`<option value="${w.id}">${htmlSafe(w.name)} · ${htmlSafe(w.cost_center||'')}</option>`).join('');modal('Iniciar conteo cíclico',`<form id="newCycleCountForm"><div class="form-grid"><label class="full">Bodega<select name="warehouseId" required>${options}</select></label><label class="full">Observación<input name="notes" placeholder="Ej. conteo semanal, sector o responsable"></label></div><div class="access-box" style="margin-top:16px">El conteo será ciego: el usuario no verá las cantidades esperadas hasta enviarlo a aprobación. En esta etapa se incluyen consumibles; los activos serializados se controlan individualmente.</div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Crear conteo</button></div></form>`)}
 function cycleCountModal(id){let count=(logisticsV2.cycleCounts||[]).find(x=>x.id===id);if(!count)return toast('No encontramos el conteo.');let editable=['DRAFT','IN_PROGRESS'].includes(count.status)&&can('move'),showExpected=!['DRAFT','IN_PROGRESS'].includes(count.status);modal(`Conteo · ${count.count_number}`,`<div class="access-box"><strong>${htmlSafe(count.warehouse_name)}</strong><div>Estado: ${htmlSafe(count.status)} · ${count.blind_count?'Conteo ciego':'Conteo informado'}</div></div><form id="cycleCountForm" data-id="${count.id}"><div class="table-wrap" style="margin-top:16px"><table><thead><tr><th>Producto</th><th>Ubicación</th>${showExpected?'<th>Esperado</th>':''}<th>Contado</th>${showExpected?'<th>Diferencia</th>':''}<th>Observación</th></tr></thead><tbody>${(count.lines||[]).map(line=>`<tr><td><strong>${htmlSafe(line.item_name)}</strong><br><span class="code">${htmlSafe(line.sku)}</span></td><td>${htmlSafe(line.location_name)}</td>${showExpected?`<td>${line.expected_quantity}</td>`:''}<td><input name="qty-${line.id}" type="number" min="0" step="0.0001" required ${editable?'':'readonly'} value="${line.counted_quantity??''}" style="min-width:100px"></td>${showExpected?`<td><strong>${Number(line.variance||0)>0?'+':''}${line.variance??0}</strong></td>`:''}<td><input name="note-${line.id}" ${editable?'':'readonly'} value="${htmlSafe(line.notes||'')}" placeholder="Opcional"></td></tr>`).join('')}</tbody></table></div><div class="form-actions"><button type="button" class="outline" data-close>Cerrar</button>${editable?'<button class="button">Guardar cantidades</button>':''}</div></form>`)}
 async function cycleCountAction(id,action,extra={}){let payload=await logisticsFetch(`/api/v1/cycle-counts/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});await loadLogisticsV2(true);toast(action==='SUBMIT'?'Conteo enviado a aprobación.':action==='APPROVE'?'Conteo aprobado.':action==='POST'?`Conteo contabilizado: ${payload.adjustedLines||0} ajuste(s).`:'Conteo actualizado.');return payload}
@@ -671,9 +720,62 @@ document.addEventListener('submit',async e=>{
     await loadLogisticsV2(true);closeModal();toast(`Lote ${result.lot?.lot_number||''} ingresado y contabilizado con trazabilidad FEFO.`);render();
   }catch(err){toast(err.message||'No se pudo registrar el lote.')}finally{unlock()}
 },true);
+document.addEventListener('click',e=>{
+  let t=e.target.closest?.('[data-new-supplier],[data-new-inbound]');
+  if(!t)return;e.preventDefault();
+  if(t.dataset.newSupplier!==undefined&&requirePerm('admin'))supplierModal();
+  if(t.dataset.newInbound!==undefined&&requirePerm('move'))inboundReceiptModal();
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='supplierForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Guardando proveedor…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target),result=await logisticsFetch('/api/v1/suppliers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      organizationId:logisticsV2.status?.organizationId,code:d.get('code'),taxId:d.get('taxId'),
+      name:d.get('name'),email:d.get('email'),phone:d.get('phone'),address:d.get('address')
+    })});
+    await loadLogisticsV2(true);closeModal();toast(`Proveedor ${result.supplier?.name||''} registrado.`);
+  }catch(err){toast(err.message||'No se pudo registrar el proveedor.')}finally{unlock()}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='inboundReceiptForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Recibiendo en cuarentena…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target),result=await logisticsFetch('/api/v1/inbound-receipts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      organizationId:logisticsV2.status?.organizationId,supplierId:d.get('supplierId'),warehouseId:d.get('warehouseId'),
+      documentType:d.get('documentType'),documentNumber:d.get('documentNumber'),source:'MANUAL',notes:d.get('notes'),
+      lines:[{itemId:d.get('itemId'),quantity:Number(d.get('quantity')),lotNumber:d.get('lotNumber'),
+        manufacturedAt:d.get('manufacturedAt'),expiresAt:d.get('expiresAt'),notes:d.get('notes')}]
+    })});
+    await loadLogisticsV2(true);closeModal();toast(`Recepción ${result.receipt?.receipt_number||''} creada. El stock permanece bloqueado en cuarentena.`);render();
+  }catch(err){toast(err.message||'No se pudo registrar la recepción.')}finally{unlock()}
+},true);
+document.addEventListener('click',async e=>{
+  let t=e.target.closest?.('[data-inbound-action]');if(!t)return;e.preventDefault();
+  let action=t.dataset.inboundAction,id=t.dataset.inboundId,receipt=(logisticsV2.inboundReceipts||[]).find(x=>x.id===id),
+    label=action==='RELEASE'?'liberar y dejar disponible':'rechazar y retirar del stock';
+  if(!receipt||!confirm(`¿Deseas ${label} la recepción ${receipt.receipt_number}?`))return;
+  t.disabled=true;
+  try{
+    let result=await logisticsFetch(`/api/v1/inbound-receipts/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,source:'MANUAL',notes:`${label} por ${activeUser().name}`})});
+    if(action==='RELEASE'){
+      let center=receipt.cost_center||receipt.warehouse_name,today=new Date().toISOString().slice(0,10);
+      for(let line of receipt.lines||[]){
+        let a=findAssetByCode(line.sku);if(!a)continue;
+        let qty=Number(line.quantity||0);setStockAt(a,center,stockAt(a,center)+qty);a.location=center;
+        state.movements.unshift({id:`m${Date.now()}-${line.id}`,date:today,code:a.code,action:'Liberación de recepción',user:activeUser().name,from:'Cuarentena',to:center,qty,status:'Recibido',detail:`${receipt.receipt_number} · ${receipt.supplier_name} · ${receipt.document_type} ${receipt.document_number}`,canonicalReceiptId:id});
+      }
+      audit('Recepción liberada',`${receipt.receipt_number} · ${receipt.supplier_name}`);
+      await persistState();
+    }
+    await loadLogisticsV2(true);toast(action==='RELEASE'?'Stock liberado y disponible.':'Recepción rechazada y retirada del stock.');render();
+  }catch(err){toast(err.message||'No se pudo resolver la recepción.');t.disabled=false}
+},true);
 $('#userSwitcher').onclick=()=>{activeUserId?logout():(route='login',render())};$('#profileButton').onclick=()=>{activeUserId?(route='settings',render()):(route='login',render())};
 async function loadRemoteState(){let res=await fetch('/api/state');if(!res.ok)return false;let payload=await res.json();if(payload?.state){state=repairTextState(payload.state);stateRevision=Number(payload.revision||0);localStorage.setItem(`${storageKey}-revision`,String(stateRevision));ensureInventoryModel();reconcileLegacyInspectionWorkflow();let authUser=window.ICCAuth?.appUser?.();if(authUser&&!state.users.some(u=>u.id===authUser.id))state.users.unshift(authUser);localStorage.setItem(storageKey,JSON.stringify(state));openAssetFromUrl();return true}return false}
-function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
+function applyAuthenticatedUser(user){logisticsV2={loaded:false,loading:false,status:null,items:[],warehouses:[],stock:[],transfers:[],custody:[],cycleCounts:[],suppliers:[],inboundReceipts:[],workers:[],reconciliation:null,error:''};if(user){let existing=state.users.find(u=>u.id===user.id);if(existing)Object.assign(existing,user);else state.users.unshift(user);activeUserId=user.id;localStorage.setItem('control-activos-session',activeUserId);if(!openAssetFromUrl())route='dashboard';securityDataLoaded=false;loadRemoteState().finally(()=>{if(!openAssetFromUrl()&&requestedQrCode)route='scan';render()})}else if(window.ICCAuth?.configured&&window.ICCAuth.migrationComplete){activeUserId='';localStorage.removeItem('control-activos-session');route='login';render()}else render()}
 window.addEventListener('icc-auth-error',e=>toast(e.detail));
 window.addEventListener('icc-state-conflict',e=>toast(e.detail||'Los datos cambiaron en otra sesión. Actualiza la pantalla.'));
 window.addEventListener('icc-realtime',()=>{renderRealtimeCounter();if(route==='tasks')render()});

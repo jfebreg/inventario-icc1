@@ -12,12 +12,15 @@ import {
   createCycleCount,
   createInspectionRun,
   createCustodyAssignment,
+  createInboundReceipt,
   createTransfer,
   dispatchTransfer,
   ensureDefaultOrganization,
   listCanonicalItems,
   listCycleCounts,
   listCustodyAssignments,
+  listInboundReceipts,
+  listSuppliers,
   listTransfers,
   listWarehouses,
   logisticsHealth,
@@ -27,12 +30,14 @@ import {
   reconcileLegacyState,
   receiveTransfer,
   receiveLot,
+  registerSupplier,
   registerItemFamily,
   registerWarehouse,
   returnCustodyAssignment,
   runLogisticsMigrations,
   stockSnapshot,
   updateCycleCount,
+  updateInboundReceipt,
   updateInspectionRun
 } from "./lib/logistics.js";
 
@@ -1158,7 +1163,7 @@ const server = http.createServer(async (req, res) => {
     if (!profileCan(dashboardProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
-      const [schema, items, warehouses, stock, transfers, custody, cycleCounts, workers, reconciliation] = await Promise.all([
+      const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
@@ -1166,6 +1171,8 @@ const server = http.createServer(async (req, res) => {
         listTransfers(pool, dashboardProfile),
         listCustodyAssignments(pool, dashboardProfile, { status: "active" }),
         listCycleCounts(pool, dashboardProfile),
+        listSuppliers(pool, logisticsOrganizationId),
+        listInboundReceipts(pool, dashboardProfile),
         pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
           ${dashboardProfile.admin ? "" : "WHERE cost_center=$1"}
           ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows),
@@ -1185,6 +1192,8 @@ const server = http.createServer(async (req, res) => {
         transfers,
         custody,
         cycleCounts,
+        suppliers,
+        inboundReceipts,
         workers,
         reconciliation
       });
@@ -1278,6 +1287,79 @@ const server = http.createServer(async (req, res) => {
       return json(res, result.replayed ? 200 : 201, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo registrar el lote." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/suppliers" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar proveedores." });
+    try {
+      return json(res, 200, { suppliers: await listSuppliers(pool, logisticsOrganizationId) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar los proveedores." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/suppliers" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede crear proveedores." });
+    try {
+      const body = await readJson(req);
+      const supplier = await registerSupplier(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, { supplier });
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, {
+        error: conflict ? "El código o RUT del proveedor ya está registrado." : (error.message || "No se pudo registrar el proveedor.")
+      });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inbound-receipts" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar recepciones." });
+    try {
+      return json(res, 200, { inboundReceipts: await listInboundReceipts(pool, apiProfile) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las recepciones." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inbound-receipts" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede recibir compras." });
+    try {
+      const body = await readJson(req);
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
+        return json(res, 403, { error: "Sólo puedes recibir compras en una bodega de tu centro." });
+      }
+      const result = await createInboundReceipt(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, result.replayed ? 200 : 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar la recepción." });
+    }
+  }
+
+  const inboundAction = url.pathname.match(/^\/api\/v1\/inbound-receipts\/([^/]+)$/);
+  if (inboundAction && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = action === "REJECT" ? "approve" : "receive";
+      if (!profileCan(apiProfile, permission)) {
+        return json(res, 403, { error: "Tu perfil no puede resolver esta recepción." });
+      }
+      const scope = await pool.query("SELECT warehouse_id FROM logistics_inbound_receipts WHERE id=$1", [inboundAction[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Recepción no encontrada." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La recepción pertenece a otro centro de costo." });
+      }
+      const result = await updateInboundReceipt(pool, inboundAction[1], action, body, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la recepción." });
     }
   }
 
