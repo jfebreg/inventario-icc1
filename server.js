@@ -679,7 +679,7 @@ function mergeStateForProfile(current, incoming, profile) {
   return merged;
 }
 
-async function syncNormalizedTables(client, state, savedBy = "Sistema") {
+async function syncNormalizedTables(client, state, savedBy = "Sistema", stateRevision = null) {
   for (const f of state.families || []) {
     await client.query(`INSERT INTO inventory_families (id, name, prefix, serial, inspection, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,NOW())
       ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, prefix=EXCLUDED.prefix, serial=EXCLUDED.serial, inspection=EXCLUDED.inspection, payload=EXCLUDED.payload, updated_at=NOW()`, [f.id, f.name, f.prefix, Boolean(f.serial), f.inspection || "", asJson(f)]);
@@ -732,7 +732,17 @@ async function syncNormalizedTables(client, state, savedBy = "Sistema") {
   for (const a of state.auditLog || []) {
     await client.query(`INSERT INTO inventory_audit_log (id, event_date, user_name, action, detail, payload) VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`, [a.id, a.date || new Date().toISOString(), a.user || "", a.action || "", a.detail || "", asJson(a)]);
   }
-  await client.query(`INSERT INTO inventory_state_versions (saved_by, asset_count, movement_count, document_count, payload) VALUES ($1,$2,$3,$4,$5::jsonb)`, [savedBy || "Sistema", (state.assets || []).length, (state.movements || []).length, (state.documents || []).length, asJson({ savedAt: new Date().toISOString(), savedBy: savedBy || "Sistema", assetCount: (state.assets || []).length, movementCount: (state.movements || []).length })]);
+  const snapshot = asJson(state);
+  await client.query(`INSERT INTO inventory_state_versions
+    (saved_by, asset_count, movement_count, document_count, payload, state_revision, checksum)
+    VALUES ($1,$2,$3,$4,$5::jsonb,$6,encode(digest(($5::jsonb)::text,'sha256'),'hex'))`,
+    [savedBy || "Sistema", (state.assets || []).length, (state.movements || []).length,
+      (state.documents || []).length, snapshot, stateRevision]);
+  await client.query(`DELETE FROM inventory_state_versions WHERE id IN (
+    SELECT id FROM inventory_state_versions
+    WHERE state_revision IS NOT NULL
+    ORDER BY saved_at DESC, id DESC OFFSET 30
+  )`);
 }
 
 async function syncOperationalTasks(client, state) {
@@ -934,7 +944,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readJson(req);
       await client.query("BEGIN");
-      const result = await client.query("SELECT payload FROM inventory_app_state WHERE id=1 FOR UPDATE");
+      const result = await client.query("SELECT payload,revision FROM inventory_app_state WHERE id=1 FOR UPDATE");
       const current = result.rows[0]?.payload || {};
       const assignment = (current.assignments || []).find(item => item.token === body.token);
       const asset = (current.assets || []).find(item => item.id === assignment?.assetId || item.code === assignment?.code);
@@ -949,8 +959,10 @@ const server = http.createServer(async (req, res) => {
       asset.responsible = assignment.worker;
       current.movements = current.movements || [];
       current.movements.unshift({ id: `m${Date.now()}`, date: today, code: asset.code, action: "Aceptación de cargo EPP", user: assignment.acceptedBy, from: assignment.from, to: assignment.worker, qty: assignment.qty, status: "Aceptado", detail: `Trabajador acepta cargo digitalmente. Producto: ${asset.name}.` });
-      await client.query("UPDATE inventory_app_state SET payload=$1::jsonb, updated_at=NOW() WHERE id=1", [asJson(current)]);
-      await syncNormalizedTables(client, current, assignment.acceptedBy);
+      const updatedState = await client.query(`UPDATE inventory_app_state
+        SET payload=$1::jsonb,revision=revision+1,updated_at=NOW()
+        WHERE id=1 RETURNING revision`, [asJson(current)]);
+      await syncNormalizedTables(client, current, assignment.acceptedBy, updatedState.rows[0]?.revision);
       await syncOperationalTasks(client, current);
       await client.query("COMMIT");
       return json(res, 200, { ok: true, message: "Cargo aceptado correctamente." });
@@ -1495,12 +1507,64 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (url.pathname === "/api/admin/state-versions" && req.method === "GET") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede consultar respaldos." });
+    const versions = await pool.query(`SELECT id,saved_at,saved_by,asset_count,movement_count,
+      document_count,state_revision,checksum,
+      checksum=encode(digest(payload::text,'sha256'),'hex') AS checksum_valid
+      FROM inventory_state_versions
+      WHERE state_revision IS NOT NULL
+      ORDER BY saved_at DESC,id DESC LIMIT 30`);
+    return json(res, 200, { versions: versions.rows });
+  }
+
+  if (url.pathname.startsWith("/api/admin/state-versions/") && url.pathname.endsWith("/restore") && req.method === "POST") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede restaurar respaldos." });
+    if (!logisticsReady) return json(res, 503, { error: "El modelo logístico todavía no está disponible." });
+    const versionId = url.pathname.split("/")[4];
+    if (!/^\d+$/.test(versionId || "")) return json(res, 400, { error: "Respaldo inválido." });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT id FROM inventory_app_state WHERE id=1 FOR UPDATE");
+      const version = await client.query(`SELECT *,
+        checksum=encode(digest(payload::text,'sha256'),'hex') AS checksum_valid
+        FROM inventory_state_versions WHERE id=$1`, [versionId]);
+      const snapshot = version.rows[0];
+      if (!snapshot) throw new Error("Respaldo no encontrado.");
+      if (!snapshot.checksum_valid) throw new Error("El respaldo no supera la verificación de integridad.");
+      const written = await client.query(`UPDATE inventory_app_state
+        SET payload=$1::jsonb,revision=revision+1,updated_at=NOW()
+        WHERE id=1 RETURNING revision,updated_at`, [asJson(snapshot.payload)]);
+      const revision = Number(written.rows[0]?.revision || 0);
+      await syncNormalizedTables(client, snapshot.payload, `${apiProfile.name} · restauración`, revision);
+      await syncOperationalTasks(client, snapshot.payload);
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data,metadata)
+        VALUES ($1,'STATE_SNAPSHOT_RESTORED','state_snapshot',$2,$3,$4,'SYSTEM',$5::jsonb,$6::jsonb)`,
+        [logisticsOrganizationId, String(versionId), apiProfile.id, `state-restore:${versionId}:${revision}`,
+          asJson({ revision, restoredAt: written.rows[0]?.updated_at }),
+          asJson({ snapshotRevision: snapshot.state_revision, checksum: snapshot.checksum })]);
+      await client.query("COMMIT");
+      return json(res, 200, { ok: true, revision, updatedAt: written.rows[0]?.updated_at });
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch {}
+      return json(res, 400, { error: error.message || "No se pudo restaurar el respaldo." });
+    } finally {
+      client.release();
+    }
+  }
+
   if (url.pathname === "/api/state" && req.method === "GET") {
     if (!pool) return json(res, 503, { error: "DATABASE_URL no configurada" });
     try {
-      const result = await pool.query("SELECT payload FROM inventory_app_state WHERE id = 1");
+      const result = await pool.query("SELECT payload,revision,updated_at FROM inventory_app_state WHERE id = 1");
       const current = result.rows[0]?.payload || null;
-      return json(res, 200, { state: current ? stateForProfile(current, apiProfile) : null });
+      return json(res, 200, {
+        state: current ? stateForProfile(current, apiProfile) : null,
+        revision: Number(result.rows[0]?.revision || 0),
+        updatedAt: result.rows[0]?.updated_at || null
+      });
     } catch (error) {
       return json(res, 503, { error: "Base de datos no disponible", detail: error.message });
     }
@@ -1513,14 +1577,28 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!body.state || typeof body.state !== "object") return json(res, 400, { error: "Estado de inventario inválido" });
       await client.query("BEGIN");
-      const currentResult = await client.query("SELECT payload FROM inventory_app_state WHERE id=1 FOR UPDATE");
+      const currentResult = await client.query("SELECT payload,revision FROM inventory_app_state WHERE id=1 FOR UPDATE");
+      const currentRevision = Number(currentResult.rows[0]?.revision || 0);
+      const hasBaseRevision = body.baseRevision !== undefined && body.baseRevision !== null;
+      if (hasBaseRevision && Number(body.baseRevision) !== currentRevision) {
+        await client.query("ROLLBACK");
+        return json(res, 409, {
+          error: "El respaldo cambió en otra sesión. Actualiza la pantalla antes de volver a guardar.",
+          code: "STATE_REVISION_CONFLICT",
+          currentRevision
+        });
+      }
       const nextState = mergeStateForProfile(currentResult.rows[0]?.payload || {}, body.state, apiProfile);
-      await client.query(`INSERT INTO inventory_app_state (id, payload, updated_at) VALUES (1, $1::jsonb, NOW())
-        ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, [JSON.stringify(nextState)]);
-      await syncNormalizedTables(client, nextState, apiProfile?.name || body.savedBy || "Sistema");
+      const written = await client.query(`INSERT INTO inventory_app_state (id,payload,revision,updated_at)
+        VALUES (1,$1::jsonb,1,NOW())
+        ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload,
+          revision=inventory_app_state.revision+1,updated_at=NOW()
+        RETURNING revision,updated_at`, [JSON.stringify(nextState)]);
+      const revision = Number(written.rows[0]?.revision || currentRevision + 1);
+      await syncNormalizedTables(client, nextState, apiProfile?.name || body.savedBy || "Sistema", revision);
       await syncOperationalTasks(client, nextState);
       await client.query("COMMIT");
-      return json(res, 200, { ok: true, normalized: true });
+      return json(res, 200, { ok: true, normalized: true, revision, updatedAt: written.rows[0]?.updated_at });
     } catch (error) {
       try { await client.query("ROLLBACK"); } catch {}
       return json(res, 400, { error: error.message || "No se pudo guardar" });
@@ -1539,9 +1617,12 @@ const server = http.createServer(async (req, res) => {
       if (!body.state || typeof body.state !== "object") return json(res, 400, { error: "Estado de inventario inválido" });
       const currentResult = await pool.query("SELECT payload FROM inventory_app_state WHERE id=1");
       const nextState = mergeStateForProfile(currentResult.rows[0]?.payload || {}, body.state, apiProfile);
-      await pool.query(`INSERT INTO inventory_app_state (id, payload, updated_at) VALUES (1, $1::jsonb, NOW())
-        ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, [JSON.stringify(nextState)]);
-      return json(res, 200, { ok: true });
+      const written = await pool.query(`INSERT INTO inventory_app_state (id,payload,revision,updated_at)
+        VALUES (1,$1::jsonb,1,NOW())
+        ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload,
+          revision=inventory_app_state.revision+1,updated_at=NOW()
+        RETURNING revision,updated_at`, [JSON.stringify(nextState)]);
+      return json(res, 200, { ok: true, revision: Number(written.rows[0]?.revision || 0), updatedAt: written.rows[0]?.updated_at });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo guardar" });
     }
