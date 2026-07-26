@@ -19,6 +19,7 @@ import {
   listWarehouses,
   logisticsHealth,
   postStockMovement,
+  registerCanonicalItem,
   reconcileLegacyState,
   receiveTransfer,
   returnCustodyAssignment,
@@ -1142,6 +1143,25 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { items });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron consultar los artículos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/items" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede registrar artículos." });
+    try {
+      const body = await readJson(req);
+      if (!body.initialLocationId) return json(res, 400, { error: "Selecciona la ubicación inicial." });
+      if (!apiProfile.admin && !(await profileMayAccessLocation(apiProfile, body.initialLocationId))) {
+        return json(res, 403, { error: "Sólo puedes registrar artículos en una bodega de tu centro." });
+      }
+      const result = await registerCanonicalItem(pool, {
+        ...body,
+        organizationId: body.organizationId || logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, { error: conflict ? "El código o número de serie ya existe." : (error.message || "No se pudo registrar el artículo.") });
     }
   }
 

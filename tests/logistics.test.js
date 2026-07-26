@@ -53,3 +53,16 @@ test("el puente legado conserva una relación única con cada operación canóni
   assert.match(migration, /logistics_transfer_lines_identity_idx/);
   assert.match(migration, /ENABLE ROW LEVEL SECURITY/);
 });
+
+test("los artículos nuevos se registran primero en el catálogo maestro V2", async () => {
+  const [app, server, logistics] = await Promise.all([
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../server.js", import.meta.url), "utf8"),
+    readFile(new URL("../lib/logistics.js", import.meta.url), "utf8")
+  ]);
+  assert.match(logistics, /export async function registerCanonicalItem/);
+  assert.match(server, /url\.pathname === "\/api\/v1\/items" && req\.method === "POST"/);
+  assert.match(app, /async function registerAssetV2/);
+  assert.match(app, /await registerAssetV2/);
+  assert.match(logistics, /item-opening:/);
+});
