@@ -543,6 +543,63 @@ async function profileMayAccessLocation(profile, locationId) {
   return Boolean(result.rowCount);
 }
 
+function sameCenter(left, right) {
+  return Boolean(String(left || "").trim())
+    && String(left || "").trim().toLocaleLowerCase("es")
+      === String(right || "").trim().toLocaleLowerCase("es");
+}
+
+function filePayload(row) {
+  if (row?.payload && typeof row.payload === "object") return row.payload;
+  try {
+    return JSON.parse(row?.payload || "{}");
+  } catch {
+    return {};
+  }
+}
+
+async function profileMayAccessDocumentEntity(profile, entityType, entityId, declaredCenter = "") {
+  if (!profile || !entityId) return false;
+  if (profile.admin) return true;
+  if (declaredCenter && !sameCenter(declaredCenter, profile.cost_center)) return false;
+  const type = String(entityType || "").trim().toLowerCase();
+  if (type === "inspection_run") {
+    const result = await pool.query(`SELECT 1 FROM logistics_inspection_runs inspection
+      JOIN logistics_warehouses warehouse ON warehouse.id=inspection.warehouse_id
+      JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+      WHERE inspection.id=$1 AND center.name=$2`, [entityId, profile.cost_center]);
+    return Boolean(result.rowCount);
+  }
+  if (type === "custody_assignment") {
+    const result = await pool.query(`SELECT 1 FROM logistics_custody_assignments custody
+      JOIN logistics_warehouses warehouse ON warehouse.id=custody.warehouse_id
+      JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+      WHERE custody.id=$1 AND center.name=$2`, [entityId, profile.cost_center]);
+    return Boolean(result.rowCount);
+  }
+  if (type === "worker") {
+    const result = await pool.query(`SELECT 1 FROM inventory_worker_enrollments
+      WHERE (id=$1 OR LOWER(name)=LOWER($1)) AND cost_center=$2`, [entityId, profile.cost_center]);
+    return Boolean(result.rowCount) || sameCenter(declaredCenter, profile.cost_center);
+  }
+  return sameCenter(declaredCenter, profile.cost_center);
+}
+
+async function profileMayAccessFile(profile, row) {
+  if (!profile || !row) return false;
+  if (profile.admin) return true;
+  const payload = filePayload(row);
+  if (payload.center) return sameCenter(payload.center, profile.cost_center);
+  const links = await pool.query(`SELECT link.entity_type,link.entity_id
+    FROM logistics_documents document
+    JOIN logistics_document_links link ON link.document_id=document.id
+    WHERE document.file_object_id=$1`, [row.id]);
+  for (const link of links.rows) {
+    if (await profileMayAccessDocumentEntity(profile, link.entity_type, link.entity_id)) return true;
+  }
+  return !links.rowCount && sameCenter(payload.uploadedBy, profile.name);
+}
+
 function assetBelongsToCenter(asset, center) {
   if (!asset || !center) return false;
   return asset.location === center || Number(asset.stocks?.[center] || 0) > 0;
@@ -1410,6 +1467,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/storage/status") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede consultar el diagnóstico de archivos." });
     if (!pool) return json(res, 503, { ok: false, database: false, error: "DATABASE_URL no configurada" });
     const status = {
       ok: false,
@@ -1502,6 +1560,14 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readJson(req);
       if (!body.filename || !body.dataUrl) return json(res, 400, { error: "Falta archivo" });
+      if (!apiProfile.admin) {
+        if (!body.center || !sameCenter(body.center, apiProfile.cost_center)) {
+          return json(res, 403, { error: "Sólo puedes archivar documentos de tu centro de costo." });
+        }
+        if (!(await profileMayAccessDocumentEntity(apiProfile, body.entityType, body.entityId || body.ref, body.center))) {
+          return json(res, 403, { error: "El registro asociado no pertenece a tu centro de costo." });
+        }
+      }
       const result = await uploadFileObject(body);
       let canonical = null;
       if (logisticsReady) {
@@ -1526,8 +1592,15 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/inspection/pdf" && req.method === "POST") {
+    if (!profileCan(apiProfile, "inspect") && !profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede descargar inspecciones." });
+    }
     try {
       const body = await readJson(req);
+      const inspectionCenter = body?.asset?.location || body?.inspection?.project || "";
+      if (!apiProfile.admin && !sameCenter(inspectionCenter, apiProfile.cost_center)) {
+        return json(res, 403, { error: "La inspección pertenece a otro centro de costo." });
+      }
       const pdf = await createInspectionPdf(body);
       const code = safeName(body?.asset?.code || "inspeccion");
       const date = safeName(body?.inspection?.date || new Date().toISOString().slice(0, 10));
@@ -1544,12 +1617,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname.startsWith("/api/files/") && req.method === "GET") {
+    if (!apiProfile) return json(res, 401, { error: "Debes iniciar sesión para descargar archivos." });
     if (!pool) return json(res, 503, { error: "DATABASE_URL no configurada" });
     try {
       const id = decodeURIComponent(url.pathname.replace("/api/files/", ""));
       const result = await pool.query("SELECT * FROM inventory_file_objects WHERE id = $1", [id]);
       const row = result.rows[0];
       if (!row) return json(res, 404, { error: "Archivo no encontrado" });
+      if (!(await profileMayAccessFile(apiProfile, row))) {
+        return json(res, 403, { error: "El archivo pertenece a otro centro de costo." });
+      }
       if (row.provider === "supabase" && row.storage_path && storageConfigured()) {
         const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${String(row.storage_path).split("/").map(encodeURIComponent).join("/")}`;
         const response = await fetch(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } });
