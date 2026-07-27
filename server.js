@@ -10,6 +10,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
   createCycleCount,
+  createAssetCompliance,
   createAssetDisposal,
   createInspectionRun,
   createCustodyAssignment,
@@ -26,6 +27,7 @@ import {
   dispatchTransfer,
   ensureDefaultOrganization,
   listCanonicalItems,
+  listAssetCompliance,
   listAssetDisposals,
   listAssetFinancials,
   listCycleCounts,
@@ -57,6 +59,7 @@ import {
   stockSnapshot,
   suggestPutawayLocations,
   updateCycleCount,
+  updateAssetCompliance,
   updateAssetDisposal,
   upsertAssetFinancial,
   updateItemCost,
@@ -761,6 +764,67 @@ async function syncAssetDisposalTask(disposalId) {
     title, detail, disposal.id, JSON.stringify(disposal)]);
 }
 
+async function syncAssetComplianceTask(complianceId) {
+  const result = await pool.query(`SELECT compliance.*,unit.unit_code,item.name AS item_name,
+      center.name AS cost_center,
+      CASE WHEN compliance.expires_at<CURRENT_DATE THEN 'EXPIRED'
+        WHEN compliance.expires_at<=CURRENT_DATE+compliance.reminder_days THEN 'EXPIRING'
+        ELSE compliance.status END AS effective_status
+    FROM logistics_asset_compliance_records compliance
+    JOIN logistics_asset_units unit ON unit.id=compliance.asset_unit_id
+    JOIN logistics_items item ON item.id=unit.item_id
+    LEFT JOIN LATERAL (
+      SELECT balance.location_id FROM logistics_stock_balances balance
+      WHERE balance.asset_unit_id=unit.id AND balance.quantity>0
+      ORDER BY balance.updated_at DESC LIMIT 1
+    ) stock ON TRUE
+    LEFT JOIN logistics_locations location ON location.id=stock.location_id
+    LEFT JOIN logistics_warehouses warehouse ON warehouse.id=location.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    WHERE compliance.id=$1`, [complianceId]);
+  const record = result.rows[0];
+  if (!record) return;
+  const taskId = `asset-compliance-${record.id}`;
+  if (record.status !== "ACTIVE" || !record.expires_at) {
+    await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
+      resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW() WHERE id=$1`, [taskId]);
+    return;
+  }
+  const responsible = await pool.query(`SELECT auth_user_id FROM inventory_user_profiles
+    WHERE active=TRUE AND auth_user_id IS NOT NULL
+      AND (admin=TRUE OR permissions ? 'inspect' OR permissions ? 'approve')
+      AND (admin=TRUE OR cost_center=$1)
+    ORDER BY admin DESC,updated_at DESC LIMIT 1`, [record.cost_center || "Bodega Central"]);
+  const assignee = responsible.rows[0]?.auth_user_id || null;
+  const expired = record.effective_status === "EXPIRED";
+  const title = expired
+    ? `Documento vencido: ${record.unit_code}`
+    : `Próximo vencimiento: ${record.unit_code}`;
+  const detail = `${record.item_name} · ${record.requirement_name} · vence ${record.expires_at}`;
+  await pool.query(`INSERT INTO inventory_tasks
+    (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,
+     entity_type,entity_id,due_at,payload,updated_at)
+    VALUES ($1,'Cumplimiento de activo',$2,$3,$4,'Pendiente',$5,$6,
+      'asset_compliance',$7,$8,$9::jsonb,NOW())
+    ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,
+      priority=EXCLUDED.priority,status='Pendiente',center_name=EXCLUDED.center_name,
+      assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,due_at=EXCLUDED.due_at,
+      resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
+  [taskId, title, detail, expired && record.critical ? "Crítica" : "Alta",
+    record.cost_center || "Bodega Central", assignee, record.id, record.expires_at,
+    JSON.stringify(record)]);
+  if (["EXPIRED", "EXPIRING"].includes(record.effective_status)) {
+    await pool.query(`INSERT INTO inventory_notifications
+      (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,
+       entity_type,entity_id,payload)
+      VALUES ($1,$2,$3,'Cumplimiento de activo',$4,$5,$6,'asset_compliance',$7,$8::jsonb)
+      ON CONFLICT (id) DO NOTHING`,
+    [`notification-${taskId}-${record.effective_status}`, assignee,
+      record.cost_center || "Bodega Central", title, detail,
+      expired && record.critical ? "critical" : "warning", record.id, JSON.stringify(record)]);
+  }
+}
+
 function sameCenter(left, right) {
   return Boolean(String(left || "").trim())
     && String(left || "").trim().toLocaleLowerCase("es")
@@ -793,6 +857,17 @@ async function profileMayAccessDocumentEntity(profile, entityType, entityId, dec
       JOIN logistics_warehouses warehouse ON warehouse.id=custody.warehouse_id
       JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
       WHERE custody.id=$1 AND center.name=$2`, [entityId, profile.cost_center]);
+    return Boolean(result.rowCount);
+  }
+  if (type === "asset_compliance") {
+    const result = await pool.query(`SELECT 1
+      FROM logistics_asset_compliance_records compliance
+      JOIN logistics_asset_units unit ON unit.id=compliance.asset_unit_id
+      JOIN logistics_stock_balances balance ON balance.asset_unit_id=unit.id AND balance.quantity>0
+      JOIN logistics_locations location ON location.id=balance.location_id
+      JOIN logistics_warehouses warehouse ON warehouse.id=location.warehouse_id
+      JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+      WHERE compliance.id=$1 AND center.name=$2 LIMIT 1`, [entityId, profile.cost_center]);
     return Boolean(result.rowCount);
   }
   if (type === "worker") {
@@ -1373,7 +1448,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement, assetDisposals, assetFinancials,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1393,6 +1468,7 @@ const server = http.createServer(async (req, res) => {
         listProcurement(pool, dashboardProfile, logisticsOrganizationId),
         listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId),
         listAssetFinancials(pool, dashboardProfile, logisticsOrganizationId),
+        listAssetCompliance(pool, dashboardProfile, logisticsOrganizationId),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1428,6 +1504,7 @@ const server = http.createServer(async (req, res) => {
         procurement,
         assetDisposals,
         assetFinancials,
+        assetCompliance,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1475,6 +1552,69 @@ const server = http.createServer(async (req, res) => {
         url.searchParams.get("asOfDate")));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo calcular el registro financiero." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-compliance" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar cumplimiento técnico." });
+    }
+    try {
+      return json(res, 200, await listAssetCompliance(pool, apiProfile, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar el cumplimiento técnico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-compliance" && req.method === "POST") {
+    if (!profileCan(apiProfile, "inspect") && !profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Tu perfil no puede registrar antecedentes técnicos." });
+    }
+    try {
+      const body = await readJson(req);
+      const scope = await pool.query(`SELECT location.warehouse_id
+        FROM logistics_stock_balances balance
+        JOIN logistics_locations location ON location.id=balance.location_id
+        WHERE balance.asset_unit_id=$1 AND balance.quantity>0 LIMIT 1`, [body.assetUnitId]);
+      if (!scope.rows[0]) return json(res, 404, { error: "El activo no tiene ubicación disponible." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "El activo pertenece a otro centro de costo." });
+      }
+      const result = await createAssetCompliance(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      await syncAssetComplianceTask(result.compliance.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar el antecedente técnico." });
+    }
+  }
+
+  const assetComplianceAction = url.pathname.match(/^\/api\/v1\/asset-compliance\/([^/]+)$/);
+  if (assetComplianceAction && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "approve") && !profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Tu perfil no puede revocar antecedentes técnicos." });
+    }
+    try {
+      const body = await readJson(req);
+      const scope = await pool.query(`SELECT warehouse.id AS warehouse_id
+        FROM logistics_asset_compliance_records compliance
+        JOIN logistics_asset_units unit ON unit.id=compliance.asset_unit_id
+        LEFT JOIN logistics_stock_balances balance
+          ON balance.asset_unit_id=unit.id AND balance.quantity>0
+        LEFT JOIN logistics_locations location ON location.id=balance.location_id
+        LEFT JOIN logistics_warehouses warehouse ON warehouse.id=location.warehouse_id
+        WHERE compliance.id=$1 LIMIT 1`, [assetComplianceAction[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Antecedente técnico no encontrado." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "El antecedente pertenece a otro centro de costo." });
+      }
+      const result = await updateAssetCompliance(pool, assetComplianceAction[1],
+        body.action, body, apiProfile.id);
+      await syncAssetComplianceTask(assetComplianceAction[1]);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el antecedente técnico." });
     }
   }
 
@@ -2621,6 +2761,11 @@ const server = http.createServer(async (req, res) => {
           entityId: body.entityId || body.ref || "",
           relationship: body.relationship || "EVIDENCE"
         }, apiProfile.id);
+        if (canonical?.document?.id && String(body.entityType || "").toLowerCase() === "asset_compliance") {
+          await pool.query(`UPDATE logistics_asset_compliance_records
+            SET canonical_document_id=$1,updated_by=$2,updated_at=NOW() WHERE id=$3`,
+          [canonical.document.id, apiProfile.id, body.entityId]);
+        }
       }
       return json(res, 200, { ...result, canonicalDocumentId: canonical?.document?.id || "" });
     } catch (error) {
