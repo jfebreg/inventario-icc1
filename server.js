@@ -39,6 +39,7 @@ import {
   listInventoryControls,
   listLogisticsKpis,
   listKpiTargets,
+  listScheduledLogisticsJobs,
   listMaterialRequests,
   listMaintenance,
   listPurchaseRequisitions,
@@ -62,6 +63,7 @@ import {
   resolveItemIdentifier,
   returnCustodyAssignment,
   runLogisticsMigrations,
+  runDueLogisticsJobs,
   snapshotLogisticsKpis,
   stockSnapshot,
   suggestPutawayLocations,
@@ -88,7 +90,8 @@ import {
   upsertReplenishmentPolicy,
   upsertItemPresentation,
   upsertSupplierItem,
-  upsertKpiTarget
+  upsertKpiTarget,
+  updateScheduledLogisticsJob
 } from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -867,6 +870,26 @@ function startComplianceScheduler() {
   setInterval(run, 15 * 60 * 1000).unref?.();
 }
 
+let logisticsJobSweepRunning = false;
+async function sweepScheduledLogisticsJobs() {
+  if (!pool || !logisticsReady || logisticsJobSweepRunning) {
+    return { skipped: true, processed: 0 };
+  }
+  logisticsJobSweepRunning = true;
+  try {
+    return await runDueLogisticsJobs(pool);
+  } finally {
+    logisticsJobSweepRunning = false;
+  }
+}
+
+function startLogisticsJobScheduler() {
+  const run = () => sweepScheduledLogisticsJobs()
+    .catch(error => console.error("No se pudieron ejecutar automatizaciones logisticas:", error.message));
+  setTimeout(run, 10_000).unref?.();
+  setInterval(run, 15 * 60 * 1000).unref?.();
+}
+
 async function createCanonicalBackup(actorProfile) {
   const client = await pool.connect();
   try {
@@ -906,7 +929,8 @@ async function createCanonicalBackup(actorProfile) {
       stockReservations: "logistics_stock_reservations",
       pickTasks: "logistics_pick_tasks",
       kpiSnapshots: "logistics_kpi_snapshots",
-      kpiTargets: "logistics_kpi_targets"
+      kpiTargets: "logistics_kpi_targets",
+      scheduledJobs: "logistics_scheduled_jobs"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const result = await client.query(`SELECT * FROM ${table}
@@ -1710,7 +1734,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1734,6 +1758,7 @@ const server = http.createServer(async (req, res) => {
         listAssetFinancials(pool, dashboardProfile, logisticsOrganizationId),
         listAssetCompliance(pool, dashboardProfile, logisticsOrganizationId),
         listLogisticsKpis(pool, dashboardProfile, logisticsOrganizationId, 90),
+        dashboardProfile.admin ? listScheduledLogisticsJobs(pool, logisticsOrganizationId) : Promise.resolve([]),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1773,6 +1798,7 @@ const server = http.createServer(async (req, res) => {
         assetFinancials,
         assetCompliance,
         logisticsKpis,
+        logisticsJobs,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1830,6 +1856,45 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { target });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo guardar la meta." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-jobs" && req.method === "GET") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede consultar automatizaciones." });
+    }
+    try {
+      return json(res, 200, {
+        jobs: await listScheduledLogisticsJobs(pool, logisticsOrganizationId)
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las automatizaciones." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-jobs/kpi-daily" && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede modificar automatizaciones." });
+    }
+    try {
+      const body = await readJson(req);
+      const job = await updateScheduledLogisticsJob(pool, {
+        ...body, organizationId: logisticsOrganizationId, jobCode: "KPI_DAILY_SNAPSHOT"
+      }, apiProfile.id);
+      return json(res, 200, { job });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar la automatizaciÃ³n." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-jobs/run-due" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede ejecutar automatizaciones." });
+    }
+    try {
+      return json(res, 200, await sweepScheduledLogisticsJobs());
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo ejecutar la automatizaciÃ³n." });
     }
   }
 
@@ -3375,6 +3440,7 @@ const server = http.createServer(async (req, res) => {
 setupDatabase()
   .then(() => {
     startComplianceScheduler();
+    startLogisticsJobScheduler();
     server.listen(port, "0.0.0.0", () => console.log(`Inventario ICC escuchando en puerto ${port}`));
   })
   .catch((error) => {
