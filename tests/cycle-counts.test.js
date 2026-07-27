@@ -42,3 +42,8 @@ test("las API y la interfaz cubren el flujo completo del conteo", () => {
   assert.match(app, /function cycleCountModal/);
   assert.match(app, /data-cycle-action="POST"/);
 });
+
+test("el listado de conteos usa el alias SQL correcto", () => {
+  assert.match(logistics, /ORDER BY cycle\.created_at DESC LIMIT 100/);
+  assert.doesNotMatch(logistics, /ORDER BY count\.created_at DESC LIMIT 100/);
+});
