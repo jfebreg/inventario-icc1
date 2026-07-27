@@ -55,4 +55,7 @@ test("API e interfaz cubren orden, recepción, factura y tolerancias", () => {
   assert.match(app, /id="purchaseOrderForm"/);
   assert.match(app, /id="supplierInvoiceForm"/);
   assert.match(app, /Orden cargada: proveedor, bodega, producto, cantidad y costo/);
+  assert.match(app, /uploadProcurementDocument/);
+  assert.match(app, /uploadProcurementDocument\(d\.get\('documentFile'\),'supplier_invoice'/);
+  assert.match(app, /uploadProcurementDocument\(d\.get\('documentFile'\),'inbound_receipt'/);
 });
