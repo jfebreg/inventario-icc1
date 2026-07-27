@@ -10,6 +10,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
   createCycleCount,
+  createAssetDisposal,
   createInspectionRun,
   createCustodyAssignment,
   createInboundReceipt,
@@ -25,6 +26,7 @@ import {
   dispatchTransfer,
   ensureDefaultOrganization,
   listCanonicalItems,
+  listAssetDisposals,
   listCycleCounts,
   listCustodyAssignments,
   listInboundReceipts,
@@ -54,6 +56,7 @@ import {
   stockSnapshot,
   suggestPutawayLocations,
   updateCycleCount,
+  updateAssetDisposal,
   updateItemCost,
   updateInboundReceipt,
   updateInventoryAdjustment,
@@ -712,6 +715,49 @@ async function syncSupplierReturnTask(returnId) {
     waitingCredit ? "warning" : "info", supplierReturn.id, JSON.stringify(supplierReturn)]);
 }
 
+async function syncAssetDisposalTask(disposalId) {
+  const result = await pool.query(`SELECT disposal.*,unit.unit_code,item.name AS item_name,
+      warehouse.name AS warehouse_name,center.name AS cost_center
+    FROM logistics_asset_disposals disposal
+    JOIN logistics_asset_units unit ON unit.id=disposal.asset_unit_id
+    JOIN logistics_items item ON item.id=disposal.item_id
+    JOIN logistics_warehouses warehouse ON warehouse.id=disposal.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    WHERE disposal.id=$1`, [disposalId]);
+  const disposal = result.rows[0];
+  if (!disposal) return;
+  const taskId = `asset-disposal-${disposal.id}`;
+  if (!["SUBMITTED", "APPROVED"].includes(disposal.status)) {
+    await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
+      updated_at=NOW() WHERE id=$1`, [taskId]);
+    return;
+  }
+  const responsible = await pool.query(`SELECT auth_user_id FROM inventory_user_profiles
+    WHERE active=TRUE AND auth_user_id IS NOT NULL AND id<>$1
+      AND (admin=TRUE OR permissions ? 'approve') AND (admin=TRUE OR cost_center=$2)
+    ORDER BY admin DESC,updated_at DESC LIMIT 1`,
+  [disposal.requested_by, disposal.cost_center || "Bodega Central"]);
+  const assignee = responsible.rows[0]?.auth_user_id || null;
+  const title = disposal.status === "SUBMITTED"
+    ? `Baja pendiente de aprobación: ${disposal.unit_code}`
+    : `Baja aprobada pendiente de contabilizar: ${disposal.unit_code}`;
+  const detail = `${disposal.item_name} · ${disposal.reason_code} · ${disposal.disposal_number}`;
+  await pool.query(`INSERT INTO inventory_tasks
+    (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,entity_type,entity_id,payload,updated_at)
+    VALUES ($1,'Baja de activo',$2,$3,'Alta','Pendiente',$4,$5,'asset_disposal',$6,$7::jsonb,NOW())
+    ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,status='Pendiente',
+      center_name=EXCLUDED.center_name,assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,
+      resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
+  [taskId, title, detail, disposal.cost_center || "Bodega Central", assignee, disposal.id,
+    JSON.stringify(disposal)]);
+  await pool.query(`INSERT INTO inventory_notifications
+    (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+    VALUES ($1,$2,$3,'Baja de activo',$4,$5,'warning','asset_disposal',$6,$7::jsonb)
+    ON CONFLICT (id) DO NOTHING`,
+  [`notification-${taskId}-${disposal.status}`, assignee, disposal.cost_center || "Bodega Central",
+    title, detail, disposal.id, JSON.stringify(disposal)]);
+}
+
 function sameCenter(left, right) {
   return Boolean(String(left || "").trim())
     && String(left || "").trim().toLocaleLowerCase("es")
@@ -1324,7 +1370,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement, assetDisposals,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1342,6 +1388,7 @@ const server = http.createServer(async (req, res) => {
         listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
         listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
         listProcurement(pool, dashboardProfile, logisticsOrganizationId),
+        listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1375,6 +1422,7 @@ const server = http.createServer(async (req, res) => {
         inventoryAnalytics,
         inventoryControl,
         procurement,
+        assetDisposals,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1403,6 +1451,60 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await listInventoryControls(pool, apiProfile, logisticsOrganizationId));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo consultar el control de inventario." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-disposals" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar bajas." });
+    try {
+      return json(res, 200, { assetDisposals: await listAssetDisposals(pool, apiProfile, logisticsOrganizationId) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las bajas." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-disposals" && req.method === "POST") {
+    if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede solicitar bajas." });
+    try {
+      const body = await readJson(req);
+      const scope = await pool.query(`SELECT location.warehouse_id
+        FROM logistics_stock_balances balance
+        JOIN logistics_locations location ON location.id=balance.location_id
+        WHERE balance.asset_unit_id=$1 AND balance.quantity>0 LIMIT 1`, [body.assetUnitId]);
+      if (!scope.rows[0]) return json(res, 404, { error: "El activo no tiene ubicación disponible." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "El activo pertenece a otro centro de costo." });
+      }
+      const result = await createAssetDisposal(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      await syncAssetDisposalTask(result.disposal.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo solicitar la baja." });
+    }
+  }
+
+  const assetDisposalAction = url.pathname.match(/^\/api\/v1\/asset-disposals\/([^/]+)$/);
+  if (assetDisposalAction && req.method === "PATCH") {
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const permission = ["APPROVE", "REJECT", "POST"].includes(action) ? "approve" : "move";
+      if (!profileCan(apiProfile, permission)) return json(res, 403, { error: "Tu perfil no puede completar esta etapa." });
+      const scope = await pool.query("SELECT warehouse_id FROM logistics_asset_disposals WHERE id=$1",
+        [assetDisposalAction[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Solicitud de baja no encontrada." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La baja pertenece a otro centro de costo." });
+      }
+      const result = await updateAssetDisposal(pool, assetDisposalAction[1], action, {
+        ...body, allowSelfApproval: Boolean(apiProfile.admin), admin: Boolean(apiProfile.admin)
+      }, apiProfile.id);
+      await syncAssetDisposalTask(assetDisposalAction[1]);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la baja." });
     }
   }
 
