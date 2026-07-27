@@ -116,7 +116,7 @@ async function refreshOperationalData(force=false){if(!activeUserId||!['quick','
 setInterval(()=>{if(document.visibilityState==='visible')refreshOperationalData()},30000);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refreshOperationalData()});
 window.addEventListener('focus',()=>refreshOperationalData());
-function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED','APPROVED','RECEIVED','ISSUED','COMPLETED','AVAILABLE','ACTIVE'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE','DRAFT','SUBMITTED','ORDERED','PARTIALLY_RECEIVED','ALLOCATED','PICKING','OPEN','IN_PROGRESS','WAITING_PARTS','REPAIR','MAINTENANCE','COUNTING','EXPIRING','RENEWED'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED','BLOCKED','EXPIRED','REVOKED'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
+function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED','APPROVED','RECEIVED','ISSUED','COMPLETED','AVAILABLE','ACTIVE','PICKED'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE','DRAFT','SUBMITTED','ORDERED','PARTIALLY_RECEIVED','ALLOCATED','PICKING','OPEN','IN_PROGRESS','WAITING_PARTS','REPAIR','MAINTENANCE','COUNTING','EXPIRING','RENEWED'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED','BLOCKED','EXPIRED','REVOKED','EXCEPTION'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
 function normalizeCode(value){let text=String(value||'').toUpperCase().trim(),m=text.match(/^([A-Z]+)[\s-]*0*(\d+)(?:[\s-]+0*(\d+))?$/);if(m)return `${m[1]}-${Number(m[2])}${m[3]?`-${Number(m[3])}`:''}`;let raw=text.replace(/[^A-Z0-9]/g,''),plain=raw.match(/^([A-Z]+)0*([0-9]+)$/);return plain?`${plain[1]}-${Number(plain[2])}`:raw}
 function assetBaseCode(a){return a?.baseCode||String(a?.code||'').replace(/^([A-Z]+-\d{6})-\d+$/,'$1')}
 function codeMatches(a,b){return normalizeCode(a)===normalizeCode(b)}
@@ -498,10 +498,41 @@ function materialRequestsV2Markup(){
         ${x.status==='SUBMITTED'&&can('approve')?`<button class="link-button" data-material-action="APPROVE" data-material-id="${x.id}">Aprobar</button>`:''}
         ${x.status==='APPROVED'&&can('move')?`<button class="link-button" data-material-action="ALLOCATE" data-material-id="${x.id}">Reservar stock</button>`:''}
         ${x.status==='ALLOCATED'&&can('move')?`<button class="link-button" data-material-action="START_PICK" data-material-id="${x.id}">Iniciar preparación</button>`:''}
-        ${['ALLOCATED','PICKING'].includes(x.status)&&can('move')?`<button class="link-button" data-material-action="ISSUE" data-material-id="${x.id}">Confirmar entrega</button>`:''}
+        ${x.status==='PICKING'&&can('move')?`<button class="link-button" data-open-picking="${x.id}">Abrir preparación</button>`:''}
+        ${x.status==='PICKING'&&can('move')&&(x.pickTasks||[]).length&&(x.pickTasks||[]).every(task=>task.status==='PICKED')?`<button class="link-button" data-material-action="ISSUE" data-material-id="${x.id}">Confirmar entrega</button>`:''}
         ${['DRAFT','SUBMITTED','APPROVED','ALLOCATED','PICKING'].includes(x.status)&&can('move')?`<button class="link-button" data-material-action="CANCEL" data-material-id="${x.id}">Cancelar</button>`:''}
       </div></td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay solicitudes internas registradas.</p>'}
   </section>`;
+}
+function pickingModal(requestId){
+  let request=(logisticsV2.materialRequests||[]).find(x=>x.id===requestId);
+  if(!request)return toast('No encontramos la solicitud.');
+  let tasks=request.pickTasks||[],done=tasks.filter(x=>x.status==='PICKED').length;
+  modal(`Preparación · ${request.request_number}`,`<div class="pick-progress"><strong>${done} de ${tasks.length} tareas verificadas</strong>
+    <p class="page-subtitle">Escanea primero la ubicación y después el producto. La entrega se habilita cuando todas las tareas estén completas.</p></div>
+    <div class="pick-task-list">${tasks.length?tasks.map(task=>`<article class="config-item pick-task ${task.status==='PICKED'?'is-complete':''}">
+      <div><strong>${htmlSafe(task.sku)} · ${htmlSafe(task.itemName)}</strong>
+      <small>Ubicación: ${htmlSafe(task.locationCode||task.locationName)}${task.lotNumber?` · Lote ${htmlSafe(task.lotNumber)}`:''}<br>
+      Cantidad: ${task.quantityPicked||0} / ${task.quantityRequired} · ${tag(task.status)}
+      ${task.discrepancyReason?`<br>Diferencia: ${htmlSafe(task.discrepancyReason)}`:''}</small></div>
+      ${task.status!=='PICKED'?`<button class="button" data-pick-task="${task.id}" data-request-id="${request.id}">Escanear</button>`:'<strong aria-label="Completado">✓</strong>'}
+    </article>`).join(''):'<p class="empty">No hay tareas generadas.</p>'}</div>
+    <div class="form-actions"><button type="button" class="outline" data-close>Cerrar</button>
+    ${tasks.length&&done===tasks.length?`<button class="button" data-material-action="ISSUE" data-material-id="${request.id}">Confirmar entrega</button>`:''}</div>`);
+}
+function pickTaskModal(taskId,requestId){
+  let request=(logisticsV2.materialRequests||[]).find(x=>x.id===requestId),
+    task=(request?.pickTasks||[]).find(x=>x.id===taskId);
+  if(!task)return toast('No encontramos la tarea de preparación.');
+  modal(`Escanear · ${task.sku}`,`<form id="pickTaskForm" data-task-id="${task.id}" data-request-id="${request.id}">
+    <div class="scan-product-summary"><strong>${htmlSafe(task.itemName)}</strong><small>Retirar desde ${htmlSafe(task.locationCode||task.locationName)} · cantidad ${task.quantityRequired}</small></div>
+    <div class="form-grid">
+      <label class="full">Código de ubicación<input name="locationScan" autocomplete="off" autofocus required placeholder="Escanea ${htmlSafe(task.locationCode||'la ubicación')}"></label>
+      <label class="full">Código del producto<input name="itemScan" autocomplete="off" required placeholder="Escanea SKU, código de barras o serie"></label>
+      <label>Cantidad preparada<input name="quantityPicked" type="number" min="0.0001" max="${task.quantityRequired}" step="0.0001" value="${task.quantityRequired}" required></label>
+      <label class="full">Motivo de diferencia<input name="discrepancyReason" placeholder="Obligatorio si la cantidad es menor"></label>
+    </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Verificar tarea</button></div>
+  </form>`);
 }
 function newMaterialRequestModal(){
   let warehouses=logisticsV2.warehouses||[],directory=logisticsV2.warehouseDirectory||warehouses,
@@ -1568,9 +1599,11 @@ document.addEventListener('submit',async e=>{
   }catch(err){toast(err.message||'No se pudo almacenar la recepción.')}finally{unlock()}
 },true);
 document.addEventListener('click',async e=>{
-  let t=e.target.closest?.('[data-new-material-request],[data-material-action]');if(!t)return;e.preventDefault();
+  let t=e.target.closest?.('[data-new-material-request],[data-material-action],[data-open-picking],[data-pick-task]');if(!t)return;e.preventDefault();
   try{
     if(t.dataset.newMaterialRequest!==undefined){newMaterialRequestModal();return}
+    if(t.dataset.openPicking){pickingModal(t.dataset.openPicking);return}
+    if(t.dataset.pickTask){pickTaskModal(t.dataset.pickTask,t.dataset.requestId);return}
     let request=(logisticsV2.materialRequests||[]).find(x=>x.id===t.dataset.materialId),action=t.dataset.materialAction,
       labels={SUBMIT:'enviar a aprobación',APPROVE:'aprobar',ALLOCATE:'reservar el stock disponible',START_PICK:'iniciar la preparación',ISSUE:'confirmar la entrega y descontar el stock',CANCEL:'cancelar y liberar las reservas'};
     if(!request||!confirm(`¿Deseas ${labels[action]||'actualizar'} la solicitud ${request.request_number}?`))return;
@@ -1578,8 +1611,25 @@ document.addEventListener('click',async e=>{
     await logisticsFetch(`/api/v1/material-requests/${encodeURIComponent(request.id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       action,notes:`${labels[action]||action} por ${activeUser().name}`
     })});
-    await loadLogisticsV2(true);toast(`Solicitud ${request.request_number} actualizada.`);render();
+    await loadLogisticsV2(true);toast(`Solicitud ${request.request_number} actualizada.`);
+    if(action==='START_PICK'){render();pickingModal(request.id)}
+    else{closeModal();render()}
   }catch(err){toast(err.message||'No se pudo completar la solicitud interna.');t.disabled=false}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='pickTaskForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Verificando lectura…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target),requestId=e.target.dataset.requestId;
+    await logisticsFetch(`/api/v1/pick-tasks/${encodeURIComponent(e.target.dataset.taskId)}`,{
+      method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        action:'PICK',locationScan:d.get('locationScan'),itemScan:d.get('itemScan'),
+        quantityPicked:Number(d.get('quantityPicked')),discrepancyReason:d.get('discrepancyReason')
+      })
+    });
+    await loadLogisticsV2(true);closeModal();toast('Tarea de preparación registrada.');render();pickingModal(requestId);
+  }catch(err){toast(err.message||'No se pudo verificar la tarea.')}finally{unlock()}
 },true);
 document.addEventListener('submit',async e=>{
   if(e.target.id!=='materialRequestForm')return;

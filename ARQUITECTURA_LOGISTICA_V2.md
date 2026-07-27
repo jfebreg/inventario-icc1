@@ -11,6 +11,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - Unidades de medida, presentaciones de compra/entrega y códigos alternativos por artículo.
 - Catálogo producto–proveedor con código externo, presentación, plazo, mínimo, múltiplo y precio.
 - Clasificación ABC/XYZ persistente y políticas de frecuencia/tolerancia para conteos.
+- Solicitudes internas con reserva, tareas de picking ordenadas por ubicación y verificación por escaneo.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -34,6 +35,9 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 9. El origen y destino de un traslado deben ser distintos.
 10. El estado anterior continúa disponible hasta completar la conciliación.
 
+11. Una solicitud no puede entregarse hasta verificar por escaneo todas sus tareas de picking.
+12. Cada diferencia de cantidad exige una excepción documentada antes de continuar.
+
 ## API V1 disponible
 
 - `GET /api/v1/logistics/status`
@@ -53,6 +57,10 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - `POST /api/v1/transfers`
 - `POST /api/v1/transfers/:id/dispatch`
 - `POST /api/v1/transfers/:id/receive`
+- `GET /api/v1/material-requests`
+- `POST /api/v1/material-requests`
+- `PATCH /api/v1/material-requests/:id`
+- `PATCH /api/v1/pick-tasks/:id`
 
 Todas las rutas requieren autenticación cuando Supabase Auth está activo y validan los permisos del perfil.
 

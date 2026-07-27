@@ -71,6 +71,7 @@ import {
   updateInventoryAdjustment,
   updateClassificationPolicy,
   updateMaterialRequest,
+  updatePickTask,
   updateWorkOrder,
   updatePurchaseOrder,
   updatePurchaseRequisition,
@@ -896,7 +897,8 @@ async function createCanonicalBackup(actorProfile) {
       workOrders: "logistics_work_orders",
       assetDisposals: "logistics_asset_disposals",
       assetFinancials: "logistics_asset_financials",
-      assetCompliance: "logistics_asset_compliance_records"
+      assetCompliance: "logistics_asset_compliance_records",
+      pickTasks: "logistics_pick_tasks"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const result = await client.query(`SELECT * FROM ${table}
@@ -2550,6 +2552,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud interna." });
+    }
+  }
+
+  const pickTaskAction = url.pathname.match(/^\/api\/v1\/pick-tasks\/([^/]+)$/);
+  if (pickTaskAction && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "move")) {
+      return json(res, 403, { error: "Tu perfil no puede preparar materiales." });
+    }
+    try {
+      const body = await readJson(req);
+      const scope = (await pool.query(`SELECT task.warehouse_id
+        FROM logistics_pick_tasks task WHERE task.id=$1`, [pickTaskAction[1]])).rows[0];
+      if (!scope) return json(res, 404, { error: "Tarea de preparación no encontrada." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.warehouse_id))) {
+        return json(res, 403, { error: "La preparación corresponde a otra bodega." });
+      }
+      const result = await updatePickTask(pool, pickTaskAction[1], body.action, body, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la tarea de preparación." });
     }
   }
 
