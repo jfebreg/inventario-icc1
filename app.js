@@ -420,10 +420,11 @@ async function resolveInboundReceipt(receipt,action,{targetLocationId='',notes='
 function replenishmentV2Markup(){
   if(!logisticsV2.loaded||logisticsV2.error)return'';
   let suggestions=logisticsV2.replenishmentSuggestions||[],requests=logisticsV2.purchaseRequisitions||[],
-    open=requests.filter(x=>!['RECEIVED','CANCELLED'].includes(x.status));
+    open=requests.filter(x=>!['RECEIVED','CANCELLED'].includes(x.status)),
+    reviewJob=(logisticsV2.logisticsJobs||[]).find(x=>x.job_code==='REPLENISHMENT_DAILY_REVIEW');
   return `<section class="card logistics-v2" style="margin-top:20px" data-replenishment>
     <div class="heading-row"><div><p class="eyebrow">Planificación de abastecimiento</p><h2 class="section-title">Reposición y solicitudes de compra</h2>
-    <p class="page-subtitle">Sugerencias por stock disponible, mínimo/máximo, compras en curso y proveedor preferido.</p></div>${can('admin')?'<button class="button secondary" data-new-policy>＋ Configurar política</button>':''}</div>
+    <p class="page-subtitle">Sugerencias por stock disponible, mínimo/máximo, compras en curso y proveedor preferido.</p>${reviewJob?`<small>Revisión automática: ${reviewJob.enabled?'activa':'detenida'} · próxima ${reviewJob.next_run_at?new Date(reviewJob.next_run_at).toLocaleString('es-CL'):'—'}</small>`:''}</div>${can('admin')?'<div class="actions"><button class="button secondary" data-review-replenishment>Revisar ahora</button><button class="button secondary" data-new-policy>＋ Configurar política</button></div>':''}</div>
     <div class="grid metrics"><div class="card"><div class="metric-label">Reposiciones sugeridas</div><div class="metric-value">${suggestions.filter(x=>Number(x.suggested_quantity)>0).length}</div></div>
     <div class="card"><div class="metric-label">Solicitudes abiertas</div><div class="metric-value">${open.length}</div></div></div>
     <h3 class="section-title">Sugerencias automáticas</h3>
@@ -716,7 +717,7 @@ function inventoryAnalyticsMarkup(){
 function logisticsKpiMarkup(){
   if(route!=='reports'||!logisticsV2.loaded||logisticsV2.error)return'';
   let data=logisticsV2.logisticsKpis||{summary:{},warehouses:[],snapshots:[],periodDays:90},
-    s=data.summary||{},warehouses=data.warehouses||[],job=(logisticsV2.logisticsJobs||[])[0],hasCompleted=Number(s.completedRequests)>0,
+    s=data.summary||{},warehouses=data.warehouses||[],job=(logisticsV2.logisticsJobs||[]).find(x=>x.job_code==='KPI_DAILY_SNAPSHOT'),hasCompleted=Number(s.completedRequests)>0,
     hasTimed=Number(s.timedCompletedRequests)>0,hasPicks=Number(s.handledPickTasks)>0,
     hasCounts=Number(s.countedLines)>0,
     pct=(value,has)=>has?`${Number(value||0).toLocaleString('es-CL',{maximumFractionDigits:2})}%`:'—',
@@ -754,7 +755,7 @@ function kpiTargetsModal(){
     <div class="form-actions"><button type="button" class="outline" data-close>Cerrar</button></div>`);
 }
 function kpiScheduleModal(){
-  let job=(logisticsV2.logisticsJobs||[])[0]||{enabled:true,timezone_name:'America/Santiago',local_hour:7,period_days:90};
+  let job=(logisticsV2.logisticsJobs||[]).find(x=>x.job_code==='KPI_DAILY_SNAPSHOT')||{enabled:true,timezone_name:'America/Santiago',local_hour:7,period_days:90};
   modal('Cierre automático de indicadores',`<form id="kpiScheduleForm"><div class="access-box"><strong>Automatización segura</strong><div>Render revisará cada 15 minutos y PostgreSQL impedirá ejecuciones duplicadas.</div></div><div class="form-grid" style="margin-top:16px">
     <label>Estado<select name="enabled"><option value="true" ${job.enabled?'selected':''}>Activo</option><option value="false" ${!job.enabled?'selected':''}>Detenido</option></select></label>
     <label>Hora local<input name="localHour" type="number" min="0" max="23" required value="${Number(job.local_hour??7)}"></label>
@@ -1803,8 +1804,14 @@ document.addEventListener('submit',async e=>{
   }catch(err){toast(err.message||'No se pudo crear la solicitud interna.')}finally{unlock()}
 },true);
 document.addEventListener('click',async e=>{
-  let t=e.target.closest?.('[data-new-policy],[data-policy-item],[data-request-replenishment],[data-requisition-action]');if(!t)return;e.preventDefault();
+  let t=e.target.closest?.('[data-review-replenishment],[data-new-policy],[data-policy-item],[data-request-replenishment],[data-requisition-action]');if(!t)return;e.preventDefault();
   try{
+    if(t.dataset.reviewReplenishment!==undefined){
+      if(!requirePerm('admin'))return;t.disabled=true;
+      let result=await logisticsFetch('/api/v1/replenishment/review',{method:'POST'});
+      await window.ICCAuth?.refreshRealtime?.();await loadLogisticsV2(true);
+      toast(`Revisión completada: ${Number(result.suggestions||0)} reposición(es) requieren gestión.`);render();return
+    }
     if(t.dataset.newPolicy!==undefined){newReplenishmentPolicyModal();return}
     if(t.dataset.policyItem){replenishmentPolicyModal(t.dataset.policyItem,t.dataset.warehouse);return}
     if(t.dataset.requestReplenishment){

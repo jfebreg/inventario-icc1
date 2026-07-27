@@ -61,6 +61,7 @@ import {
   registerSupplier,
   registerItemFamily,
   registerWarehouse,
+  reviewReplenishmentTasks,
   resolveItemIdentifier,
   returnCustodyAssignment,
   runLogisticsMigrations,
@@ -1053,9 +1054,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("029_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("030_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("029_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("030_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1797,7 +1798,7 @@ const server = http.createServer(async (req, res) => {
         listSuppliers(pool, logisticsOrganizationId),
         listSupplierItemCatalog(pool, logisticsOrganizationId),
         listInboundReceipts(pool, dashboardProfile),
-        listReplenishmentSuggestions(pool, dashboardProfile),
+        listReplenishmentSuggestions(pool, dashboardProfile, logisticsOrganizationId),
         listPurchaseRequisitions(pool, dashboardProfile),
         listMaterialRequests(pool, dashboardProfile),
         listMaintenance(pool, dashboardProfile),
@@ -2566,9 +2567,23 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/api/v1/replenishment" && req.method === "GET") {
     if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar reposición." });
     try {
-      return json(res, 200, { suggestions: await listReplenishmentSuggestions(pool, apiProfile) });
+      return json(res, 200, {
+        suggestions: await listReplenishmentSuggestions(pool, apiProfile, logisticsOrganizationId)
+      });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo calcular la reposición." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/replenishment/review" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede ejecutar la revisiÃ³n general." });
+    }
+    try {
+      const result = await reviewReplenishmentTasks(pool, logisticsOrganizationId);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo revisar el abastecimiento." });
     }
   }
 
