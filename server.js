@@ -855,6 +855,120 @@ function startComplianceScheduler() {
   setInterval(run, 15 * 60 * 1000).unref?.();
 }
 
+async function createCanonicalBackup(actorProfile) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    const organizationId = logisticsOrganizationId;
+    const datasets = {};
+    const directTables = {
+      organizations: "logistics_organizations",
+      costCenters: "logistics_cost_centers",
+      sites: "logistics_sites",
+      warehouses: "logistics_warehouses",
+      locations: "logistics_locations",
+      itemFamilies: "logistics_item_families",
+      items: "logistics_items",
+      assetUnits: "logistics_asset_units",
+      lots: "logistics_lots",
+      stockMovements: "logistics_stock_movements",
+      stockLedger: "logistics_stock_ledger",
+      stockBalances: "logistics_stock_balances",
+      transferOrders: "logistics_transfer_orders",
+      custodyAssignments: "logistics_custody_assignments",
+      documents: "logistics_documents",
+      auditEvents: "logistics_audit_events",
+      inspectionTemplates: "logistics_inspection_template_versions",
+      inspectionRuns: "logistics_inspection_runs",
+      maintenancePlans: "logistics_maintenance_plans",
+      workOrders: "logistics_work_orders",
+      assetDisposals: "logistics_asset_disposals",
+      assetFinancials: "logistics_asset_financials",
+      assetCompliance: "logistics_asset_compliance_records"
+    };
+    for (const [name, table] of Object.entries(directTables)) {
+      const result = await client.query(`SELECT * FROM ${table}
+        WHERE organization_id=$1 ORDER BY 1`, [organizationId]);
+      datasets[name] = result.rows;
+    }
+    const childQueries = {
+      transferLines: `SELECT line.* FROM logistics_transfer_lines line
+        JOIN logistics_transfer_orders parent ON parent.id=line.transfer_id
+        WHERE parent.organization_id=$1 ORDER BY line.id`,
+      documentLinks: `SELECT link.* FROM logistics_document_links link
+        JOIN logistics_documents parent ON parent.id=link.document_id
+        WHERE parent.organization_id=$1 ORDER BY link.document_id,link.entity_type,link.entity_id`,
+      inspectionTemplateItems: `SELECT child.* FROM logistics_inspection_template_items child
+        JOIN logistics_inspection_template_versions parent ON parent.id=child.template_version_id
+        WHERE parent.organization_id=$1 ORDER BY child.template_version_id,child.item_order`,
+      inspectionAnswers: `SELECT child.* FROM logistics_inspection_answers child
+        JOIN logistics_inspection_runs parent ON parent.id=child.inspection_id
+        WHERE parent.organization_id=$1 ORDER BY child.inspection_id,child.id`,
+      inspectionFindings: `SELECT child.* FROM logistics_inspection_findings child
+        JOIN logistics_inspection_runs parent ON parent.id=child.inspection_id
+        WHERE parent.organization_id=$1 ORDER BY child.inspection_id,child.id`,
+      inspectionApprovals: `SELECT child.* FROM logistics_inspection_approvals child
+        JOIN logistics_inspection_runs parent ON parent.id=child.inspection_id
+        WHERE parent.organization_id=$1 ORDER BY child.inspection_id,child.id`,
+      workOrderParts: `SELECT child.* FROM logistics_work_order_parts child
+        JOIN logistics_work_orders parent ON parent.id=child.work_order_id
+        WHERE parent.organization_id=$1 ORDER BY child.work_order_id,child.id`,
+      fileObjects: `SELECT file.id,file.filename,file.mime_type,file.category,file.reference,
+          file.size_bytes,file.provider,file.storage_path,file.public_url,file.payload,file.created_at
+        FROM inventory_file_objects file
+        JOIN logistics_documents document ON document.file_object_id=file.id
+        WHERE document.organization_id=$1 ORDER BY file.id`
+    };
+    for (const [name, sql] of Object.entries(childQueries)) {
+      datasets[name] = (await client.query(sql, [organizationId])).rows;
+    }
+    datasets.workers = (await client.query(`SELECT id,rut,name,company,job_title,cost_center,
+      email,phone,signature_file_id,status,created_at,updated_at
+      FROM inventory_worker_enrollments ORDER BY id`)).rows;
+    const chain = await client.query(`SELECT COUNT(*)::int AS errors
+      FROM logistics_audit_chain_verification
+      WHERE organization_id=$1 AND (NOT content_valid OR NOT link_valid)`, [organizationId]);
+    const auditHead = await client.query(`SELECT event_hash FROM logistics_audit_events
+      WHERE organization_id=$1 ORDER BY id DESC LIMIT 1`, [organizationId]);
+    const recordCounts = Object.fromEntries(Object.entries(datasets)
+      .map(([name, rows]) => [name, rows.length]));
+    const payload = {
+      format: "ICC-LOGISTICS-BACKUP-1",
+      generatedAt: new Date().toISOString(),
+      organizationId,
+      audit: {
+        chainValid: Number(chain.rows[0]?.errors || 0) === 0,
+        headHash: auditHead.rows[0]?.event_hash || null
+      },
+      recordCounts,
+      datasets
+    };
+    const body = JSON.stringify(payload);
+    const payloadSha256 = createHash("sha256").update(body).digest("hex");
+    const manifest = (await client.query(`INSERT INTO logistics_backup_manifests
+      (organization_id,generated_by,payload_sha256,audit_head_hash,audit_chain_valid,
+       record_counts,metadata)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb) RETURNING *`,
+    [organizationId, actorProfile.id, payloadSha256, payload.audit.headHash,
+      payload.audit.chainValid, JSON.stringify(recordCounts),
+      JSON.stringify({ filePayloadsExcluded: true, storage: "Supabase Storage", bytes: Buffer.byteLength(body) })])).rows[0];
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,
+       source,after_data,metadata)
+      VALUES ($1,'CANONICAL_BACKUP_EXPORTED','backup_manifest',$2,$3,$4,'SYSTEM',$5::jsonb,$6::jsonb)`,
+    [organizationId, manifest.id, actorProfile.id, `backup:${manifest.id}`,
+      JSON.stringify({ payloadSha256, recordCounts }),
+      JSON.stringify({ auditHeadHash: payload.audit.headHash, auditChainValid: payload.audit.chainValid })]);
+    await client.query("COMMIT");
+    return { body, manifest };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 function sameCenter(left, right) {
   return Boolean(String(left || "").trim())
     && String(left || "").trim().toLocaleLowerCase("es")
@@ -2657,6 +2771,35 @@ const server = http.createServer(async (req, res) => {
       WHERE state_revision IS NOT NULL
       ORDER BY saved_at DESC,id DESC LIMIT 30`);
     return json(res, 200, { versions: versions.rows });
+  }
+
+  if (url.pathname === "/api/admin/canonical-backups" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
+    }
+    const result = await pool.query(`SELECT * FROM logistics_backup_manifests
+      WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 30`, [logisticsOrganizationId]);
+    return json(res, 200, { manifests: result.rows });
+  }
+
+  if (url.pathname === "/api/admin/canonical-backups" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede exportar el libro mayor." });
+    }
+    if (!logisticsReady) return json(res, 503, { error: "El libro mayor V2 todavía no está disponible." });
+    try {
+      const backup = await createCanonicalBackup(apiProfile);
+      const date = new Date(backup.manifest.generated_at).toISOString().replace(/[:.]/g, "-");
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="ICC_Logistica_V2_${date}.json"`,
+        "X-Content-SHA256": backup.manifest.payload_sha256,
+        "Cache-Control": "no-store"
+      });
+      return res.end(backup.body);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo exportar el libro mayor V2." });
+    }
   }
 
   if (url.pathname.startsWith("/api/admin/state-versions/") && url.pathname.endsWith("/restore") && req.method === "POST") {
