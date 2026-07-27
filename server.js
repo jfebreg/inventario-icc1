@@ -41,6 +41,7 @@ import {
   listProcurement,
   listReplenishmentSuggestions,
   listSuppliers,
+  listSupplierItemCatalog,
   listTransfers,
   listWarehouses,
   logisticsHealth,
@@ -78,7 +79,8 @@ import {
   closeInventoryPeriod,
   runAssetDepreciation,
   upsertReplenishmentPolicy,
-  upsertItemPresentation
+  upsertItemPresentation,
+  upsertSupplierItem
 } from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -873,6 +875,7 @@ async function createCanonicalBackup(actorProfile) {
       items: "logistics_items",
       unitsOfMeasure: "logistics_units_of_measure",
       itemPresentations: "logistics_item_uoms",
+      supplierItems: "logistics_supplier_items",
       assetUnits: "logistics_asset_units",
       lots: "logistics_lots",
       stockMovements: "logistics_stock_movements",
@@ -1688,7 +1691,7 @@ const server = http.createServer(async (req, res) => {
     if (!profileCan(dashboardProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
-      const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
+      const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
         replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
@@ -1699,6 +1702,7 @@ const server = http.createServer(async (req, res) => {
         listCustodyAssignments(pool, dashboardProfile, { status: "active" }),
         listCycleCounts(pool, dashboardProfile),
         listSuppliers(pool, logisticsOrganizationId),
+        listSupplierItemCatalog(pool, logisticsOrganizationId),
         listInboundReceipts(pool, dashboardProfile),
         listReplenishmentSuggestions(pool, dashboardProfile),
         listPurchaseRequisitions(pool, dashboardProfile),
@@ -1735,6 +1739,7 @@ const server = http.createServer(async (req, res) => {
         custody,
         cycleCounts,
         suppliers,
+        supplierCatalog,
         inboundReceipts,
         replenishmentSuggestions,
         purchaseRequisitions,
@@ -2167,6 +2172,37 @@ const server = http.createServer(async (req, res) => {
       const conflict = error.code === "23505";
       return json(res, conflict ? 409 : 400, {
         error: conflict ? "El código o RUT del proveedor ya está registrado." : (error.message || "No se pudo registrar el proveedor.")
+      });
+    }
+  }
+
+  if (url.pathname === "/api/v1/supplier-items" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el catálogo de proveedores." });
+    try {
+      return json(res, 200, {
+        supplierCatalog: await listSupplierItemCatalog(pool, logisticsOrganizationId)
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar el catálogo de proveedores." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/supplier-items" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede configurar el catálogo de proveedores." });
+    }
+    try {
+      const body = await readJson(req);
+      const supplierItem = await upsertSupplierItem(pool, {
+        ...body,
+        organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 200, { supplierItem });
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, {
+        error: conflict ? "El código del proveedor o proveedor preferente entra en conflicto con otro registro." :
+          (error.message || "No se pudo guardar el producto del proveedor.")
       });
     }
   }
