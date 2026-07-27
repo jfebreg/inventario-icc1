@@ -338,10 +338,10 @@ function inboundV2Markup(){
     <div class="card"><div class="metric-label">En cuarentena</div><div class="metric-value">${pending.length}</div><div class="metric-foot ${pending.length?'alert':''}">${pending.length?'Stock no utilizable':'Sin recepciones pendientes'}</div></div></div>
     ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Recepción</th><th>Proveedor / documento</th><th>Bodega</th><th>Productos</th><th>Estado</th><th>Acciones</th></tr></thead><tbody>${rows.slice(0,40).map(x=>`<tr>
       <td><strong>${htmlSafe(x.receipt_number)}</strong><br><small>${htmlSafe(String(x.received_at||'').slice(0,10))}</small></td>
-      <td>${htmlSafe(x.supplier_name)}<br><small>${htmlSafe(x.document_type)} · ${htmlSafe(x.document_number)}</small></td>
+      <td>${htmlSafe(x.supplier_name)}<br><small>${htmlSafe(x.document_type)} · ${htmlSafe(x.document_number)}</small>${x.return_number?`<br><small>Devolución ${htmlSafe(x.return_number)} · ${htmlSafe(x.return_reason_code||'')}</small>`:''}</td>
       <td>${htmlSafe(x.warehouse_name||x.cost_center||'—')}</td>
       <td>${(x.lines||[]).map(line=>`${htmlSafe(line.sku)} · ${line.quantity}${line.lotNumber?` · Lote ${htmlSafe(line.lotNumber)}`:''}${Number(line.unitCost||0)>0?` · ${moneyV2(line.totalValue,line.currency)}`:''}`).join('<br>')}</td>
-      <td>${tag(x.status)}</td><td>${x.status==='QUARANTINE'&&(can('receive')||can('approve'))?`<div class="actions">${can('receive')?`<button class="link-button" data-inbound-action="RELEASE" data-inbound-id="${x.id}">Liberar</button>`:''}${can('approve')?`<button class="link-button" data-inbound-action="REJECT" data-inbound-id="${x.id}">Rechazar</button>`:''}</div>`:'—'}</td>
+      <td>${tag(x.status)}${x.return_status?`<br>${tag(x.return_status)}`:''}</td><td>${x.status==='QUARANTINE'&&(can('receive')||can('approve'))?`<div class="actions">${can('receive')?`<button class="link-button" data-inbound-action="RELEASE" data-inbound-id="${x.id}">Liberar</button>`:''}${can('approve')?`<button class="link-button" data-inbound-action="REJECT" data-inbound-id="${x.id}">Rechazar</button>`:''}</div>`:x.supplier_return_id&&can('approve')?`<div class="actions">${x.return_status==='SHIPPED'?`<button class="link-button" data-return-action="CONFIRM_DELIVERY" data-return-id="${x.supplier_return_id}">Confirmar entrega</button>`:''}${x.return_status==='CREDIT_PENDING'?`<button class="link-button" data-return-action="REGISTER_CREDIT" data-return-id="${x.supplier_return_id}">Nota de crédito</button>`:''}${x.return_status==='CREDITED'?`<button class="link-button" data-return-action="CLOSE" data-return-id="${x.supplier_return_id}">Cerrar</button>`:''}</div>`:'—'}</td>
     </tr>`).join('')}</tbody></table></div>`:'<p class="empty">Aún no hay recepciones controladas.</p>'}
   </section>`;
 }
@@ -383,6 +383,10 @@ function inboundReceiptModal(){
     <label class="full">Guía o factura (opcional)<input name="documentFile" type="file" accept="application/pdf,image/*"></label>
   </div><div class="access-box" style="margin-top:16px"><strong>Stock bloqueado:</strong> la cantidad quedará en Cuarentena y no podrá entregarse, trasladarse ni consumirse hasta su liberación.</div>
   <div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Recibir en cuarentena</button></div></form>`);
+}
+function rejectInboundModal(receiptId){
+  let receipt=(logisticsV2.inboundReceipts||[]).find(x=>x.id===receiptId);if(!receipt)return toast('No encontramos la recepción.');
+  modal(`Devolver a proveedor · ${receipt.receipt_number}`,`<p class="page-subtitle">El stock saldrá de cuarentena y quedará respaldado por una devolución trazable.</p><form id="rejectInboundForm" data-id="${receipt.id}"><div class="form-grid"><label>Motivo<select name="reasonCode" required><option value="QUALITY">Calidad no conforme</option><option value="DAMAGED">Producto dañado</option><option value="WRONG_ITEM">Producto incorrecto</option><option value="WRONG_QUANTITY">Cantidad incorrecta</option><option value="EXPIRED">Vencido</option><option value="DOCUMENT">Documentación incorrecta</option><option value="OTHER">Otro</option></select></label><label>Documento de devolución<input name="returnDocumentNumber" placeholder="Guía, acta o autorización"></label><label>Transportista<input name="carrier"></label><label>Seguimiento<input name="trackingNumber"></label><label class="full">Detalle de la no conformidad<textarea name="notes" required minlength="10" placeholder="Describe condición, evidencia y acuerdo con proveedor."></textarea></label></div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Registrar devolución</button></div></form>`);
 }
 async function inboundPutawayModal(receiptId){
   let receipt=(logisticsV2.inboundReceipts||[]).find(x=>x.id===receiptId),line=receipt?.lines?.[0];
@@ -1406,12 +1410,34 @@ document.addEventListener('click',async e=>{
   let action=t.dataset.inboundAction,id=t.dataset.inboundId,receipt=(logisticsV2.inboundReceipts||[]).find(x=>x.id===id),
     label=action==='RELEASE'?'liberar y dejar disponible':'rechazar y retirar del stock';
   if(action==='RELEASE')return inboundPutawayModal(id);
+  if(action==='REJECT')return rejectInboundModal(id);
   if(!receipt||!confirm(`¿Deseas ${label} la recepción ${receipt.receipt_number}?`))return;
   t.disabled=true;
   try{
     await resolveInboundReceipt(receipt,action,{notes:`${label} por ${activeUser().name}`});
     toast('Recepción rechazada y retirada del stock.');render();
   }catch(err){toast(err.message||'No se pudo resolver la recepción.');t.disabled=false}
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='rejectInboundForm')return;e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Registrando devolución…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target),receipt=(logisticsV2.inboundReceipts||[]).find(x=>x.id===e.target.dataset.id);
+    await resolveInboundReceipt(receipt,'REJECT',{reasonCode:d.get('reasonCode'),returnDocumentNumber:d.get('returnDocumentNumber'),carrier:d.get('carrier'),trackingNumber:d.get('trackingNumber'),notes:d.get('notes')});
+    closeModal();toast('Devolución registrada y stock retirado de cuarentena.');render();
+  }catch(err){toast(err.message||'No se pudo registrar la devolución.')}finally{unlock()}
+},true);
+document.addEventListener('click',async e=>{
+  let t=e.target.closest?.('[data-return-action]');if(!t)return;e.preventDefault();
+  let action=t.dataset.returnAction,payload={action},message='¿Confirmas esta etapa de la devolución?';
+  if(action==='REGISTER_CREDIT'){
+    let creditNoteNumber=prompt('Número de nota de crédito:')||'';if(!creditNoteNumber)return;
+    let creditAmount=prompt('Monto de la nota de crédito:','0');if(creditAmount===null)return;
+    payload={action,creditNoteNumber,creditAmount:Number(creditAmount),notes:`Nota de crédito registrada por ${activeUser().name}`};
+    message='¿Registrar la nota de crédito y mantener la trazabilidad contable?';
+  }else payload.notes=`${action} por ${activeUser().name}`;
+  if(!confirm(message))return;t.disabled=true;
+  try{await logisticsFetch(`/api/v1/supplier-returns/${encodeURIComponent(t.dataset.returnId)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await loadLogisticsV2(true);toast('Devolución actualizada.');render()}catch(err){toast(err.message||'No se pudo actualizar la devolución.');t.disabled=false}
 },true);
 document.addEventListener('submit',async e=>{
   if(e.target.id!=='releaseInboundForm')return;

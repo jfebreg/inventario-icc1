@@ -63,6 +63,7 @@ import {
   updatePurchaseRequisition,
   updateProcurementSettings,
   updateSupplierInvoice,
+  updateSupplierReturn,
   updateStorageLocation,
   updateInspectionRun,
   closeInventoryPeriod,
@@ -665,6 +666,50 @@ async function syncSupplierInvoiceTask(invoiceId) {
     ON CONFLICT (id) DO NOTHING`,
   [`notification-${taskId}-${invoice.status}`, assignee, invoice.cost_center || "Bodega Central",
     title, detail, exception ? "critical" : "warning", invoice.id, JSON.stringify(invoice)]);
+}
+
+async function syncSupplierReturnTask(returnId) {
+  const result = await pool.query(`SELECT supplier_return.*,supplier.name AS supplier_name,
+      warehouse.name AS warehouse_name,center.name AS cost_center,receipt.receipt_number
+    FROM logistics_supplier_returns supplier_return
+    JOIN logistics_suppliers supplier ON supplier.id=supplier_return.supplier_id
+    JOIN logistics_warehouses warehouse ON warehouse.id=supplier_return.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    JOIN logistics_inbound_receipts receipt ON receipt.id=supplier_return.receipt_id
+    WHERE supplier_return.id=$1`, [returnId]);
+  const supplierReturn = result.rows[0];
+  if (!supplierReturn) return;
+  const taskId = `supplier-return-${supplierReturn.id}`;
+  if (["CLOSED", "CANCELLED"].includes(supplierReturn.status)) {
+    await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
+      updated_at=NOW() WHERE id=$1`, [taskId]);
+    return;
+  }
+  const responsible = await pool.query(`SELECT auth_user_id FROM inventory_user_profiles
+    WHERE active=TRUE AND auth_user_id IS NOT NULL
+      AND (admin=TRUE OR permissions ? 'approve') AND (admin=TRUE OR cost_center=$1)
+    ORDER BY admin DESC,updated_at DESC LIMIT 1`, [supplierReturn.cost_center || "Bodega Central"]);
+  const assignee = responsible.rows[0]?.auth_user_id || null;
+  const waitingCredit = supplierReturn.status === "CREDIT_PENDING";
+  const title = waitingCredit
+    ? `Nota de crédito pendiente: ${supplierReturn.return_number}`
+    : `Devolución a proveedor abierta: ${supplierReturn.return_number}`;
+  const detail = `${supplierReturn.supplier_name} · ${supplierReturn.receipt_number} · ${supplierReturn.reason_code}`;
+  await pool.query(`INSERT INTO inventory_tasks
+    (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,entity_type,entity_id,payload,updated_at)
+    VALUES ($1,'Devolución a proveedor',$2,$3,$4,'Pendiente',$5,$6,'supplier_return',$7,$8::jsonb,NOW())
+    ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,priority=EXCLUDED.priority,
+      status='Pendiente',center_name=EXCLUDED.center_name,assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,
+      resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
+  [taskId, title, detail, waitingCredit ? "Alta" : "Media", supplierReturn.cost_center || "Bodega Central",
+    assignee, supplierReturn.id, JSON.stringify(supplierReturn)]);
+  await pool.query(`INSERT INTO inventory_notifications
+    (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+    VALUES ($1,$2,$3,'Devolución a proveedor',$4,$5,$6,'supplier_return',$7,$8::jsonb)
+    ON CONFLICT (id) DO NOTHING`,
+  [`notification-${taskId}-${supplierReturn.status}`, assignee,
+    supplierReturn.cost_center || "Bodega Central", title, detail,
+    waitingCredit ? "warning" : "info", supplierReturn.id, JSON.stringify(supplierReturn)]);
 }
 
 function sameCenter(left, right) {
@@ -1604,9 +1649,32 @@ const server = http.createServer(async (req, res) => {
         return json(res, 403, { error: "La recepción pertenece a otro centro de costo." });
       }
       const result = await updateInboundReceipt(pool, inboundAction[1], action, body, apiProfile.id);
+      if (result.supplierReturn?.id) await syncSupplierReturnTask(result.supplierReturn.id);
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la recepción." });
+    }
+  }
+
+  const supplierReturnAction = url.pathname.match(/^\/api\/v1\/supplier-returns\/([^/]+)$/);
+  if (supplierReturnAction && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "approve")) {
+      return json(res, 403, { error: "Tu perfil no puede resolver devoluciones a proveedor." });
+    }
+    try {
+      const body = await readJson(req);
+      const scope = await pool.query("SELECT warehouse_id FROM logistics_supplier_returns WHERE id=$1",
+        [supplierReturnAction[1]]);
+      if (!scope.rows[0]) return json(res, 404, { error: "Devolución no encontrada." });
+      if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
+        return json(res, 403, { error: "La devolución pertenece a otro centro de costo." });
+      }
+      const result = await updateSupplierReturn(pool, supplierReturnAction[1],
+        body.action, body, apiProfile.id);
+      await syncSupplierReturnTask(supplierReturnAction[1]);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la devolución." });
     }
   }
 
