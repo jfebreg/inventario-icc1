@@ -12,6 +12,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - Catálogo producto–proveedor con código externo, presentación, plazo, mínimo, múltiplo y precio.
 - Clasificación ABC/XYZ persistente y políticas de frecuencia/tolerancia para conteos.
 - Solicitudes internas con reserva, tareas de picking ordenadas por ubicación y verificación por escaneo.
+- Despacho de solicitudes entre bodegas mediante tránsito y recepción confirmada en destino.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -37,6 +38,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 
 11. Una solicitud no puede entregarse hasta verificar por escaneo todas sus tareas de picking.
 12. Cada diferencia de cantidad exige una excepción documentada antes de continuar.
+13. Un despacho entre bodegas conserva el stock de la empresa en tránsito hasta su recepción.
 
 ## API V1 disponible
 

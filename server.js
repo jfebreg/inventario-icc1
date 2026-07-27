@@ -898,6 +898,8 @@ async function createCanonicalBackup(actorProfile) {
       assetDisposals: "logistics_asset_disposals",
       assetFinancials: "logistics_asset_financials",
       assetCompliance: "logistics_asset_compliance_records",
+      materialRequests: "logistics_material_requests",
+      stockReservations: "logistics_stock_reservations",
       pickTasks: "logistics_pick_tasks"
     };
     for (const [name, table] of Object.entries(directTables)) {
@@ -908,6 +910,9 @@ async function createCanonicalBackup(actorProfile) {
     const childQueries = {
       transferLines: `SELECT line.* FROM logistics_transfer_lines line
         JOIN logistics_transfer_orders parent ON parent.id=line.transfer_id
+        WHERE parent.organization_id=$1 ORDER BY line.id`,
+      materialRequestLines: `SELECT line.* FROM logistics_material_request_lines line
+        JOIN logistics_material_requests parent ON parent.id=line.request_id
         WHERE parent.organization_id=$1 ORDER BY line.id`,
       documentLinks: `SELECT link.* FROM logistics_document_links link
         JOIN logistics_documents parent ON parent.id=link.document_id

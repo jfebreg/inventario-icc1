@@ -116,7 +116,7 @@ async function refreshOperationalData(force=false){if(!activeUserId||!['quick','
 setInterval(()=>{if(document.visibilityState==='visible')refreshOperationalData()},30000);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refreshOperationalData()});
 window.addEventListener('focus',()=>refreshOperationalData());
-function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED','APPROVED','RECEIVED','ISSUED','COMPLETED','AVAILABLE','ACTIVE','PICKED'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE','DRAFT','SUBMITTED','ORDERED','PARTIALLY_RECEIVED','ALLOCATED','PICKING','OPEN','IN_PROGRESS','WAITING_PARTS','REPAIR','MAINTENANCE','COUNTING','EXPIRING','RENEWED'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED','BLOCKED','EXPIRED','REVOKED','EXCEPTION'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
+function family(id){return state.families.find(f=>f.id===id)} function tag(status){let c=['Operativo','Aprobado','Activo','RELEASED','ACCEPTED','POSTED','APPROVED','RECEIVED','ISSUED','COMPLETED','AVAILABLE','ACTIVE','PICKED'].includes(status)?'ok':['Stock bajo','En inspección','Pendiente','Pendiente de plazo','En corrección','Firma pendiente','Pendiente correo','Pendiente invitación','Invitación enviada','Administrador inicial','QUARANTINE','DRAFT','SUBMITTED','ORDERED','PARTIALLY_RECEIVED','ALLOCATED','PICKING','IN_TRANSIT','OPEN','IN_PROGRESS','WAITING_PARTS','REPAIR','MAINTENANCE','COUNTING','EXPIRING','RENEWED'].includes(status)?'warning':['Fuera de servicio','No aprobado','Bloqueado','Deshabilitado','Inactivo','REJECTED','CANCELLED','BLOCKED','EXPIRED','REVOKED','EXCEPTION'].includes(status)?'bad':'neutral';return `<span class="tag ${c}">${status}</span>`}
 function normalizeCode(value){let text=String(value||'').toUpperCase().trim(),m=text.match(/^([A-Z]+)[\s-]*0*(\d+)(?:[\s-]+0*(\d+))?$/);if(m)return `${m[1]}-${Number(m[2])}${m[3]?`-${Number(m[3])}`:''}`;let raw=text.replace(/[^A-Z0-9]/g,''),plain=raw.match(/^([A-Z]+)0*([0-9]+)$/);return plain?`${plain[1]}-${Number(plain[2])}`:raw}
 function assetBaseCode(a){return a?.baseCode||String(a?.code||'').replace(/^([A-Z]+-\d{6})-\d+$/,'$1')}
 function codeMatches(a,b){return normalizeCode(a)===normalizeCode(b)}
@@ -481,7 +481,7 @@ function newReplenishmentPolicyModal(){
 }
 function materialRequestsV2Markup(){
   if(!logisticsV2.loaded||logisticsV2.error)return'';
-  let requests=logisticsV2.materialRequests||[],active=requests.filter(x=>!['ISSUED','CANCELLED'].includes(x.status)),
+  let requests=logisticsV2.materialRequests||[],active=requests.filter(x=>!['ISSUED','RECEIVED','CANCELLED'].includes(x.status)),
     reserved=active.reduce((sum,x)=>sum+(x.lines||[]).reduce((lineSum,line)=>lineSum+Number(line.quantityReserved||0),0),0);
   return `<section class="card logistics-v2" style="margin-top:20px" data-material-requests>
     <div class="heading-row"><div><p class="eyebrow">Demanda interna y asignación</p><h2 class="section-title">Solicitudes y reservas de materiales</h2>
@@ -489,17 +489,18 @@ function materialRequestsV2Markup(){
     <div class="grid metrics"><div class="card"><div class="metric-label">Solicitudes activas</div><div class="metric-value">${active.length}</div></div>
     <div class="card"><div class="metric-label">Cantidad reservada</div><div class="metric-value">${reserved}</div></div></div>
     ${requests.length?`<div class="table-wrap"><table><thead><tr><th>Solicitud</th><th>Solicita / despacha</th><th>Finalidad</th><th>Productos</th><th>Estado</th><th>Acciones</th></tr></thead><tbody>${requests.slice(0,60).map(x=>`<tr>
-      <td><strong>${htmlSafe(x.request_number)}</strong><br><small>${htmlSafe(String(x.created_at||'').slice(0,10))}${x.needed_at?` · requerida ${htmlSafe(String(x.needed_at).slice(0,10))}`:''}</small></td>
+      <td><strong>${htmlSafe(x.request_number)}</strong><br><small>${htmlSafe(String(x.created_at||'').slice(0,10))}${x.needed_at?` · requerida ${htmlSafe(String(x.needed_at).slice(0,10))}`:''}${x.transfer_number?`<br>Traslado ${htmlSafe(x.transfer_number)}`:''}</small></td>
       <td>${htmlSafe(x.requesting_warehouse_name)}<br><small>Despacha: ${htmlSafe(x.fulfillment_warehouse_name)}</small></td>
       <td>${htmlSafe(x.purpose||'Uso operativo')}</td>
       <td>${(x.lines||[]).map(line=>`${htmlSafe(line.sku)} · ${line.quantityRequested} ${htmlSafe(line.unit)}<br><small>Reservado ${line.quantityReserved} · entregado ${line.quantityIssued}</small>`).join('<br>')}</td>
-      <td>${tag(x.status)}</td><td><div class="actions">
+      <td>${tag(x.status)}${x.receiver_name?`<br><small>Recibió: ${htmlSafe(x.receiver_name)}</small>`:''}</td><td><div class="actions">
         ${x.status==='DRAFT'&&can('move')?`<button class="link-button" data-material-action="SUBMIT" data-material-id="${x.id}">Enviar</button>`:''}
         ${x.status==='SUBMITTED'&&can('approve')?`<button class="link-button" data-material-action="APPROVE" data-material-id="${x.id}">Aprobar</button>`:''}
         ${x.status==='APPROVED'&&can('move')?`<button class="link-button" data-material-action="ALLOCATE" data-material-id="${x.id}">Reservar stock</button>`:''}
         ${x.status==='ALLOCATED'&&can('move')?`<button class="link-button" data-material-action="START_PICK" data-material-id="${x.id}">Iniciar preparación</button>`:''}
         ${x.status==='PICKING'&&can('move')?`<button class="link-button" data-open-picking="${x.id}">Abrir preparación</button>`:''}
         ${x.status==='PICKING'&&can('move')&&(x.pickTasks||[]).length&&(x.pickTasks||[]).every(task=>task.status==='PICKED')?`<button class="link-button" data-material-action="ISSUE" data-material-id="${x.id}">Confirmar entrega</button>`:''}
+        ${x.status==='IN_TRANSIT'&&can('move')?`<button class="link-button" data-material-action="RECEIVE" data-material-id="${x.id}">Confirmar recepción</button>`:''}
         ${['DRAFT','SUBMITTED','APPROVED','ALLOCATED','PICKING'].includes(x.status)&&can('move')?`<button class="link-button" data-material-action="CANCEL" data-material-id="${x.id}">Cancelar</button>`:''}
       </div></td></tr>`).join('')}</tbody></table></div>`:'<p class="empty">No hay solicitudes internas registradas.</p>'}
   </section>`;
@@ -1605,11 +1606,11 @@ document.addEventListener('click',async e=>{
     if(t.dataset.openPicking){pickingModal(t.dataset.openPicking);return}
     if(t.dataset.pickTask){pickTaskModal(t.dataset.pickTask,t.dataset.requestId);return}
     let request=(logisticsV2.materialRequests||[]).find(x=>x.id===t.dataset.materialId),action=t.dataset.materialAction,
-      labels={SUBMIT:'enviar a aprobación',APPROVE:'aprobar',ALLOCATE:'reservar el stock disponible',START_PICK:'iniciar la preparación',ISSUE:'confirmar la entrega y descontar el stock',CANCEL:'cancelar y liberar las reservas'};
+      labels={SUBMIT:'enviar a aprobación',APPROVE:'aprobar',ALLOCATE:'reservar el stock disponible',START_PICK:'iniciar la preparación',ISSUE:'confirmar el despacho',RECEIVE:'confirmar la recepción en destino',CANCEL:'cancelar y liberar las reservas'};
     if(!request||!confirm(`¿Deseas ${labels[action]||'actualizar'} la solicitud ${request.request_number}?`))return;
     t.disabled=true;
     await logisticsFetch(`/api/v1/material-requests/${encodeURIComponent(request.id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      action,notes:`${labels[action]||action} por ${activeUser().name}`
+       action,receiverName:action==='RECEIVE'?activeUser().name:'',notes:`${labels[action]||action} por ${activeUser().name}`
     })});
     await loadLogisticsV2(true);toast(`Solicitud ${request.request_number} actualizada.`);
     if(action==='START_PICK'){render();pickingModal(request.id)}
