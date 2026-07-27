@@ -40,6 +40,7 @@ import {
   listLogisticsKpis,
   listKpiTargets,
   listScheduledLogisticsJobs,
+  listOutboxHealth,
   listMaterialRequests,
   listMaintenance,
   listPurchaseRequisitions,
@@ -64,6 +65,7 @@ import {
   returnCustodyAssignment,
   runLogisticsMigrations,
   runDueLogisticsJobs,
+  processOutboxEvents,
   snapshotLogisticsKpis,
   stockSnapshot,
   suggestPutawayLocations,
@@ -91,7 +93,8 @@ import {
   upsertItemPresentation,
   upsertSupplierItem,
   upsertKpiTarget,
-  updateScheduledLogisticsJob
+  updateScheduledLogisticsJob,
+  retryOutboxEvent
 } from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -890,6 +893,26 @@ function startLogisticsJobScheduler() {
   setInterval(run, 15 * 60 * 1000).unref?.();
 }
 
+let outboxSweepRunning = false;
+async function sweepLogisticsOutbox() {
+  if (!pool || !logisticsReady || outboxSweepRunning) {
+    return { skipped: true, processed: 0, published: 0, failed: 0 };
+  }
+  outboxSweepRunning = true;
+  try {
+    return await processOutboxEvents(pool, { limit: 100, maxAttempts: 5 });
+  } finally {
+    outboxSweepRunning = false;
+  }
+}
+
+function startLogisticsOutboxScheduler() {
+  const run = () => sweepLogisticsOutbox()
+    .catch(error => console.error("No se pudo procesar la cola logistica:", error.message));
+  setTimeout(run, 12_000).unref?.();
+  setInterval(run, 60_000).unref?.();
+}
+
 async function createCanonicalBackup(actorProfile) {
   const client = await pool.connect();
   try {
@@ -930,7 +953,8 @@ async function createCanonicalBackup(actorProfile) {
       pickTasks: "logistics_pick_tasks",
       kpiSnapshots: "logistics_kpi_snapshots",
       kpiTargets: "logistics_kpi_targets",
-      scheduledJobs: "logistics_scheduled_jobs"
+      scheduledJobs: "logistics_scheduled_jobs",
+      outboxEvents: "logistics_outbox_events"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const result = await client.query(`SELECT * FROM ${table}
@@ -1029,9 +1053,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("028_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("029_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("028_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("029_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1112,6 +1136,17 @@ async function productionReadiness() {
           : "La automatizacion esta detenida.";
   add("scheduler", "Cierre automatico de indicadores", schedulerStatus, schedulerDetail,
     schedulerStatus === "PASS" ? "" : "Abrir Reportes, entrar a Automatizacion y ejecutar la recuperacion.");
+
+  const outbox = await listOutboxHealth(pool, logisticsOrganizationId);
+  const deadLetters = Number(outbox.summary?.dead_letter || 0);
+  const oldestPendingAge = outbox.summary?.oldest_pending_at
+    ? (Date.now() - new Date(outbox.summary.oldest_pending_at).getTime()) / 60_000 : 0;
+  add("outbox", "Entrega de eventos operativos",
+    deadLetters ? "FAIL" : oldestPendingAge > 15 ? "WARN" : "PASS",
+    deadLetters ? `${deadLetters} evento(s) agotaron sus reintentos.`
+      : `${Number(outbox.summary?.pending || 0)} pendiente(s); ${Number(outbox.summary?.published_24h || 0)} publicados en 24 horas.`,
+    deadLetters || oldestPendingAge > 15
+      ? "Abrir Configuracion, revisar Cola de eventos y ejecutar la recuperacion." : "");
 
   const overall = checks.some(check => check.status === "FAIL") ? "NOT_READY"
     : checks.some(check => check.status === "WARN") ? "DEGRADED" : "READY";
@@ -1750,7 +1785,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1775,6 +1810,7 @@ const server = http.createServer(async (req, res) => {
         listAssetCompliance(pool, dashboardProfile, logisticsOrganizationId),
         listLogisticsKpis(pool, dashboardProfile, logisticsOrganizationId, 90),
         dashboardProfile.admin ? listScheduledLogisticsJobs(pool, logisticsOrganizationId) : Promise.resolve([]),
+        dashboardProfile.admin ? listOutboxHealth(pool, logisticsOrganizationId) : Promise.resolve(null),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1815,6 +1851,7 @@ const server = http.createServer(async (req, res) => {
         assetCompliance,
         logisticsKpis,
         logisticsJobs,
+        outboxHealth,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1927,6 +1964,44 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await sweepScheduledLogisticsJobs());
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo recuperar la automatizaciÃ³n." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/outbox/status" && req.method === "GET") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede supervisar la cola de eventos." });
+    }
+    try {
+      return json(res, 200, await listOutboxHealth(pool, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar la cola de eventos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/outbox/process-now" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede procesar la cola de eventos." });
+    }
+    try {
+      return json(res, 200, await sweepLogisticsOutbox());
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo procesar la cola de eventos." });
+    }
+  }
+
+  if (url.pathname.startsWith("/api/v1/outbox/") && url.pathname.endsWith("/retry")
+      && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede reintentar eventos." });
+    }
+    try {
+      const eventId = decodeURIComponent(url.pathname
+        .replace("/api/v1/outbox/", "").replace(/\/retry$/, ""));
+      const event = await retryOutboxEvent(pool, logisticsOrganizationId, eventId, apiProfile.id);
+      const processing = await sweepLogisticsOutbox();
+      return json(res, 200, { event, processing });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo reintentar el evento." });
     }
   }
 
@@ -3473,6 +3548,7 @@ setupDatabase()
   .then(() => {
     startComplianceScheduler();
     startLogisticsJobScheduler();
+    startLogisticsOutboxScheduler();
     server.listen(port, "0.0.0.0", () => console.log(`Inventario ICC escuchando en puerto ${port}`));
   })
   .catch((error) => {

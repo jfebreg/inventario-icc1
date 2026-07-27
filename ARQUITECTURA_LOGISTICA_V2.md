@@ -17,6 +17,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - Metas configurables por organización o bodega, con tareas críticas y notificaciones ante desviaciones.
 - Cierre diario programado de indicadores, con zona horaria configurable, bloqueo distribuido,
   recuperación manual y alertas críticas ante fallas.
+- Cola transaccional de eventos con reclamo concurrente, reintentos progresivos, descarte
+  controlado, supervisión y recuperación administrativa.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -46,6 +48,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 14. Los cierres de indicadores se calculan desde transacciones auditables y quedan versionados por fecha.
 15. Las desviaciones de KPI generan tareas con prioridad y se cierran automáticamente al recuperar la meta.
 16. Las automatizaciones usan bloqueo PostgreSQL y nunca dependen de una sola instancia del servidor.
+17. Cada publicación conserva un identificador estable; las integraciones consumidoras deben tratarlo
+    como clave de idempotencia.
 
 ## API V1 disponible
 

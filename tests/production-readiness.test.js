@@ -8,7 +8,7 @@ const app = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 test("el diagnóstico cubre dependencias críticas de producción", () => {
   assert.match(server, /async function productionReadiness/);
   for (const check of ["database", "migrations", "auth", "storage", "audit",
-    "backup", "documents", "rls", "criticalTasks", "openai", "scheduler"]) {
+    "backup", "documents", "rls", "criticalTasks", "openai", "scheduler", "outbox"]) {
     assert.match(server, new RegExp(`"${check}"`));
   }
 });
@@ -21,7 +21,7 @@ test("distingue bloqueos, advertencias y ambiente listo", () => {
 });
 
 test("verifica migración, RLS, auditoría y antigüedad del respaldo", () => {
-  assert.match(server, /latestMigration\.startsWith\("028_"\)/);
+  assert.match(server, /latestMigration\.startsWith\("029_"\)/);
   assert.match(server, /logistics_audit_chain_verification/);
   assert.match(server, /relation\.relrowsecurity/);
   assert.match(server, /backupAge > 7/);
