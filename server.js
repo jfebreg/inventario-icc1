@@ -9,6 +9,7 @@ import { createClient } from "@supabase/supabase-js";
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
+  calculateInventoryClassifications,
   createCycleCount,
   createAssetCompliance,
   createAssetDisposal,
@@ -34,6 +35,7 @@ import {
   listCustodyAssignments,
   listInboundReceipts,
   listInventoryAnalytics,
+  listInventoryClassifications,
   listInventoryControls,
   listMaterialRequests,
   listMaintenance,
@@ -67,6 +69,7 @@ import {
   updateItemCost,
   updateInboundReceipt,
   updateInventoryAdjustment,
+  updateClassificationPolicy,
   updateMaterialRequest,
   updateWorkOrder,
   updatePurchaseOrder,
@@ -876,6 +879,8 @@ async function createCanonicalBackup(actorProfile) {
       unitsOfMeasure: "logistics_units_of_measure",
       itemPresentations: "logistics_item_uoms",
       supplierItems: "logistics_supplier_items",
+      classificationPolicies: "logistics_classification_policies",
+      inventoryClassifications: "logistics_inventory_classifications",
       assetUnits: "logistics_asset_units",
       lots: "logistics_lots",
       stockMovements: "logistics_stock_movements",
@@ -1692,7 +1697,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1709,6 +1714,7 @@ const server = http.createServer(async (req, res) => {
         listMaterialRequests(pool, dashboardProfile),
         listMaintenance(pool, dashboardProfile),
         listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
+        listInventoryClassifications(pool, logisticsOrganizationId),
         listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
         listProcurement(pool, dashboardProfile, logisticsOrganizationId),
         listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId),
@@ -1746,6 +1752,7 @@ const server = http.createServer(async (req, res) => {
         materialRequests,
         maintenance,
         inventoryAnalytics,
+        inventoryClassifications,
         inventoryControl,
         procurement,
         assetDisposals,
@@ -1768,6 +1775,46 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await listInventoryAnalytics(pool, apiProfile, logisticsOrganizationId));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo calcular la analítica de inventario." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-classifications" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar clasificaciones." });
+    }
+    try {
+      return json(res, 200, await listInventoryClassifications(pool, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las clasificaciones." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-classifications/calculate" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede recalcular la clasificación." });
+    }
+    try {
+      const body = await readJson(req);
+      const summary = await calculateInventoryClassifications(pool, logisticsOrganizationId,
+        body.analysisMonths, apiProfile.id);
+      return json(res, 200, { summary });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo calcular la clasificación." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-classification-policies" && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede cambiar las políticas de conteo." });
+    }
+    try {
+      const body = await readJson(req);
+      const policy = await updateClassificationPolicy(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 200, { policy });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar la política de conteo." });
     }
   }
 

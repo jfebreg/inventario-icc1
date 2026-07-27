@@ -10,6 +10,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - Familias, artículos maestros, unidades físicas serializadas y lotes.
 - Unidades de medida, presentaciones de compra/entrega y códigos alternativos por artículo.
 - Catálogo producto–proveedor con código externo, presentación, plazo, mínimo, múltiplo y precio.
+- Clasificación ABC/XYZ persistente y políticas de frecuencia/tolerancia para conteos.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -42,6 +43,9 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - `POST /api/v1/item-presentations` — sólo administrador.
 - `GET /api/v1/supplier-items`
 - `POST /api/v1/supplier-items` — sólo administrador.
+- `GET /api/v1/inventory-classifications`
+- `POST /api/v1/inventory-classifications/calculate` — sólo administrador.
+- `PATCH /api/v1/inventory-classification-policies` — sólo administrador.
 - `GET /api/v1/warehouses`
 - `GET /api/v1/stock`
 - `POST /api/v1/stock/movements`
