@@ -969,6 +969,99 @@ async function createCanonicalBackup(actorProfile) {
   }
 }
 
+async function productionReadiness() {
+  const checks = [];
+  const add = (code, label, status, detail, action = "") =>
+    checks.push({ code, label, status, detail, action });
+  const started = Date.now();
+  await pool.query("SELECT 1");
+  add("database", "Base de datos PostgreSQL", "PASS", `Respuesta en ${Date.now() - started} ms.`);
+
+  const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
+    ORDER BY version DESC`);
+  const latestMigration = migrations.rows[0]?.version || "";
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("020_") ? "PASS" : "FAIL",
+    `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
+    latestMigration.startsWith("020_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+
+  const settings = await authSettings();
+  add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
+    authConfigured() ? (settings.migration_complete ? "Activa y migración de acceso finalizada." : "Configurada, pero el acceso seguro no está finalizado.") : "Variables de autenticación incompletas.",
+    "Completar SUPABASE_PUBLISHABLE_KEY y activar la cuenta administradora.");
+
+  let storageStatus = "FAIL";
+  let storageDetail = "Supabase Storage no está configurado.";
+  if (storageConfigured()) {
+    try {
+      const endpoint = `${supabaseBaseUrl()}/storage/v1/bucket/${encodeURIComponent(process.env.SUPABASE_BUCKET)}`;
+      const response = await fetch(endpoint, { headers: {
+        "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY
+      } });
+      storageStatus = response.ok ? "PASS" : "FAIL";
+      storageDetail = response.ok ? `Bucket ${process.env.SUPABASE_BUCKET} accesible.` : `Storage respondió HTTP ${response.status}.`;
+    } catch (error) {
+      storageDetail = error.message;
+    }
+  }
+  add("storage", "Archivos y firmas", storageStatus, storageDetail,
+    storageStatus === "PASS" ? "" : "Revisar SUPABASE_URL, SERVICE_ROLE_KEY y el bucket privado.");
+
+  const audit = await pool.query(`SELECT COUNT(*)::int AS errors
+    FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
+  add("audit", "Cadena de auditoría", Number(audit.rows[0]?.errors || 0) === 0 ? "PASS" : "FAIL",
+    Number(audit.rows[0]?.errors || 0) === 0 ? "Cadena íntegra." : `${audit.rows[0].errors} evento(s) con diferencias.`,
+    "Detener cambios y revisar inmediatamente la auditoría.");
+
+  const backup = await pool.query(`SELECT generated_at,payload_sha256,audit_chain_valid
+    FROM logistics_backup_manifests ORDER BY generated_at DESC LIMIT 1`);
+  const backupAge = backup.rows[0]
+    ? Math.floor((Date.now() - new Date(backup.rows[0].generated_at).getTime()) / 86_400_000)
+    : null;
+  add("backup", "Respaldo integral V2",
+    backupAge === null || backupAge > 7 || !backup.rows[0]?.audit_chain_valid ? "WARN" : "PASS",
+    backupAge === null ? "Nunca se ha exportado." : `Último respaldo hace ${backupAge} día(s) · SHA-256 ${backup.rows[0].payload_sha256.slice(0, 12)}…`,
+    "Generar y guardar un respaldo V2 fuera de Render.");
+
+  const documents = await pool.query(`SELECT COUNT(*)::int AS missing
+    FROM logistics_documents WHERE status='ACTIVE' AND (sha256 IS NULL OR sha256='')`);
+  add("documents", "Integridad documental", Number(documents.rows[0]?.missing || 0) ? "WARN" : "PASS",
+    Number(documents.rows[0]?.missing || 0) ? `${documents.rows[0].missing} documento(s) sin huella SHA-256.` : "Todos los documentos activos tienen huella.",
+    "Volver a archivar los documentos históricos sin huella.");
+
+  const rls = await pool.query(`SELECT COUNT(*)::int AS disabled FROM pg_class relation
+    JOIN pg_namespace schema ON schema.oid=relation.relnamespace
+    WHERE schema.nspname='public' AND relation.relkind='r'
+      AND relation.relname LIKE 'logistics_%'
+      AND relation.relname<>'logistics_schema_migrations' AND NOT relation.relrowsecurity`);
+  add("rls", "Seguridad por filas", Number(rls.rows[0]?.disabled || 0) === 0 ? "PASS" : "FAIL",
+    Number(rls.rows[0]?.disabled || 0) === 0 ? "RLS activo en todas las tablas logísticas." : `${rls.rows[0].disabled} tabla(s) logísticas sin RLS.`,
+    "Aplicar RLS antes de incorporar nuevos usuarios.");
+
+  const critical = await pool.query(`SELECT COUNT(*)::int AS overdue FROM inventory_tasks
+    WHERE status<>'Resuelta' AND priority='Crítica' AND due_at<NOW()`);
+  add("criticalTasks", "Tareas críticas vencidas", Number(critical.rows[0]?.overdue || 0) ? "WARN" : "PASS",
+    Number(critical.rows[0]?.overdue || 0) ? `${critical.rows[0].overdue} tarea(s) crítica(s) vencida(s).` : "Sin tareas críticas vencidas.",
+    "Resolver o reasignar desde Tareas y notificaciones.");
+
+  add("openai", "Digitalización con IA", process.env.OPENAI_API_KEY ? "PASS" : "WARN",
+    process.env.OPENAI_API_KEY ? "Clave configurada; el consumo depende del saldo API." : "Función opcional desactivada.",
+    "Configurar saldo API cuando se habilite la digitalización.");
+
+  const overall = checks.some(check => check.status === "FAIL") ? "NOT_READY"
+    : checks.some(check => check.status === "WARN") ? "DEGRADED" : "READY";
+  return {
+    overall,
+    checkedAt: new Date().toISOString(),
+    summary: {
+      passed: checks.filter(check => check.status === "PASS").length,
+      warnings: checks.filter(check => check.status === "WARN").length,
+      failed: checks.filter(check => check.status === "FAIL").length
+    },
+    checks
+  };
+}
+
 function sameCenter(left, right) {
   return Boolean(String(left || "").trim())
     && String(left || "").trim().toLocaleLowerCase("es")
@@ -2780,6 +2873,17 @@ const server = http.createServer(async (req, res) => {
     const result = await pool.query(`SELECT * FROM logistics_backup_manifests
       WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 30`, [logisticsOrganizationId]);
     return json(res, 200, { manifests: result.rows });
+  }
+
+  if (url.pathname === "/api/admin/readiness" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede revisar la preparación productiva." });
+    }
+    try {
+      return json(res, 200, await productionReadiness());
+    } catch (error) {
+      return json(res, 503, { error: error.message || "No se pudo completar el diagnóstico productivo." });
+    }
   }
 
   if (url.pathname === "/api/admin/canonical-backups" && req.method === "POST") {
