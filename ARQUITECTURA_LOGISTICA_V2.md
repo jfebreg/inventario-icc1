@@ -8,6 +8,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 
 - Organización, centros de costo, sitios, bodegas y ubicaciones jerárquicas.
 - Familias, artículos maestros, unidades físicas serializadas y lotes.
+- Unidades de medida, presentaciones de compra/entrega y códigos alternativos por artículo.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -36,6 +37,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - `GET /api/v1/logistics/status`
 - `GET /api/v1/reconciliation` — sólo administrador.
 - `GET /api/v1/items`
+- `GET /api/v1/item-identifiers/:code`
+- `POST /api/v1/item-presentations` — sólo administrador.
 - `GET /api/v1/warehouses`
 - `GET /api/v1/stock`
 - `POST /api/v1/stock/movements`

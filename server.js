@@ -54,6 +54,7 @@ import {
   registerSupplier,
   registerItemFamily,
   registerWarehouse,
+  resolveItemIdentifier,
   returnCustodyAssignment,
   runLogisticsMigrations,
   stockSnapshot,
@@ -76,7 +77,8 @@ import {
   updateInspectionRun,
   closeInventoryPeriod,
   runAssetDepreciation,
-  upsertReplenishmentPolicy
+  upsertReplenishmentPolicy,
+  upsertItemPresentation
 } from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -869,6 +871,8 @@ async function createCanonicalBackup(actorProfile) {
       locations: "logistics_locations",
       itemFamilies: "logistics_item_families",
       items: "logistics_items",
+      unitsOfMeasure: "logistics_units_of_measure",
+      itemPresentations: "logistics_item_uoms",
       assetUnits: "logistics_asset_units",
       lots: "logistics_lots",
       stockMovements: "logistics_stock_movements",
@@ -2035,6 +2039,38 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { items });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron consultar los artículos." });
+    }
+  }
+
+  const itemIdentifierRoute = url.pathname.match(/^\/api\/v1\/item-identifiers\/([^/]+)$/);
+  if (itemIdentifierRoute && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar artículos." });
+    try {
+      const item = await resolveItemIdentifier(pool, logisticsOrganizationId,
+        decodeURIComponent(itemIdentifierRoute[1]));
+      return json(res, 200, { item });
+    } catch (error) {
+      return json(res, 404, { error: error.message || "Código no reconocido." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/item-presentations" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede configurar unidades y presentaciones." });
+    }
+    try {
+      const body = await readJson(req);
+      const result = await upsertItemPresentation(pool, {
+        ...body,
+        organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 200, result);
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, {
+        error: conflict ? "El código de barras ya está asignado a otro artículo." :
+          (error.message || "No se pudo guardar la presentación.")
+      });
     }
   }
 
