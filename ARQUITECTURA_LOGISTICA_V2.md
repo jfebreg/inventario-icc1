@@ -15,6 +15,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - Despacho de solicitudes entre bodegas mediante tránsito y recepción confirmada en destino.
 - Indicadores de nivel de servicio, puntualidad, exactitud de picking, exactitud de inventario y tiempos de ciclo.
 - Metas configurables por organización o bodega, con tareas críticas y notificaciones ante desviaciones.
+- Cierre diario programado de indicadores, con zona horaria configurable, bloqueo distribuido,
+  recuperación manual y alertas críticas ante fallas.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -43,6 +45,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 13. Un despacho entre bodegas conserva el stock de la empresa en tránsito hasta su recepción.
 14. Los cierres de indicadores se calculan desde transacciones auditables y quedan versionados por fecha.
 15. Las desviaciones de KPI generan tareas con prioridad y se cierran automáticamente al recuperar la meta.
+16. Las automatizaciones usan bloqueo PostgreSQL y nunca dependen de una sola instancia del servidor.
 
 ## API V1 disponible
 

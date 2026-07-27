@@ -1029,9 +1029,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("020_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("028_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("020_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("028_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1096,6 +1096,22 @@ async function productionReadiness() {
   add("openai", "Digitalización con IA", process.env.OPENAI_API_KEY ? "PASS" : "WARN",
     process.env.OPENAI_API_KEY ? "Clave configurada; el consumo depende del saldo API." : "Función opcional desactivada.",
     "Configurar saldo API cuando se habilite la digitalización.");
+
+  const scheduler = (await pool.query(`SELECT enabled,next_run_at,last_completed_at,
+      last_status,last_error FROM logistics_scheduled_jobs
+    WHERE organization_id=$1 AND job_code='KPI_DAILY_SNAPSHOT' LIMIT 1`,
+  [logisticsOrganizationId])).rows[0];
+  const schedulerOverdue = scheduler?.enabled && scheduler.next_run_at
+    && new Date(scheduler.next_run_at).getTime() < Date.now() - 3_600_000;
+  const schedulerStatus = !scheduler || scheduler.last_status === "FAILED" || schedulerOverdue
+    ? "FAIL" : scheduler.enabled ? "PASS" : "WARN";
+  const schedulerDetail = !scheduler ? "No existe una agenda de cierre diario."
+    : scheduler.last_status === "FAILED" ? `Ultima ejecucion fallida: ${scheduler.last_error || "sin detalle"}.`
+      : schedulerOverdue ? `Ejecucion atrasada desde ${new Date(scheduler.next_run_at).toLocaleString("es-CL")}.`
+        : scheduler.enabled ? `Activa; proxima ejecucion ${new Date(scheduler.next_run_at).toLocaleString("es-CL")}.`
+          : "La automatizacion esta detenida.";
+  add("scheduler", "Cierre automatico de indicadores", schedulerStatus, schedulerDetail,
+    schedulerStatus === "PASS" ? "" : "Abrir Reportes, entrar a Automatizacion y ejecutar la recuperacion.");
 
   const overall = checks.some(check => check.status === "FAIL") ? "NOT_READY"
     : checks.some(check => check.status === "WARN") ? "DEGRADED" : "READY";
@@ -1895,6 +1911,22 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await sweepScheduledLogisticsJobs());
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo ejecutar la automatizaciÃ³n." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-jobs/kpi-daily/run-now" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede recuperar automatizaciones." });
+    }
+    try {
+      const scheduled = await pool.query(`UPDATE logistics_scheduled_jobs
+        SET enabled=TRUE,next_run_at=NOW(),updated_by=$2,updated_at=NOW()
+        WHERE organization_id=$1 AND job_code='KPI_DAILY_SNAPSHOT' RETURNING id`,
+      [logisticsOrganizationId, apiProfile.id]);
+      if (!scheduled.rowCount) return json(res, 404, { error: "AutomatizaciÃ³n no encontrada." });
+      return json(res, 200, await sweepScheduledLogisticsJobs());
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo recuperar la automatizaciÃ³n." });
     }
   }
 

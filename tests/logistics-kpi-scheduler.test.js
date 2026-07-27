@@ -37,6 +37,8 @@ test("el ejecutor usa bloqueo global y registra resultado o error", () => {
   assert.match(logistics, /last_status='SUCCESS'/);
   assert.match(logistics, /last_status='FAILED'/);
   assert.match(logistics, /pg_advisory_unlock/);
+  assert.match(logistics, /SCHEDULER_FAILURE/);
+  assert.match(logistics, /scheduler-\$\{job\.id\}/);
 });
 
 test("servidor protege las API y revisa trabajos cada quince minutos", () => {
@@ -45,6 +47,8 @@ test("servidor protege las API y revisa trabajos cada quince minutos", () => {
   assert.match(server, /\/api\/v1\/logistics-jobs\/kpi-daily/);
   assert.match(server, /profileCan\(apiProfile, "admin"\)/);
   assert.match(server, /sweepScheduledLogisticsJobs/);
+  assert.match(server, /logistics-jobs\/kpi-daily\/run-now/);
+  assert.match(server, /next_run_at=NOW\(\)/);
 });
 
 test("la interfaz permite administrar y visualizar el cierre automático", () => {
@@ -53,4 +57,11 @@ test("la interfaz permite administrar y visualizar el cierre automático", () =>
   assert.match(app, /id="kpiScheduleForm"/);
   assert.match(app, /Próxima ejecución/);
   assert.match(app, /Automatización logística actualizada y auditada/);
+  assert.match(app, /Ejecutar y comprobar ahora/);
+});
+
+test("el diagnóstico productivo detecta agendas fallidas o atrasadas", () => {
+  assert.match(server, /schedulerOverdue/);
+  assert.match(server, /scheduler\.last_status === "FAILED"/);
+  assert.match(server, /add\("scheduler"/);
 });

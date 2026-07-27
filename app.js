@@ -760,7 +760,7 @@ function kpiScheduleModal(){
     <label>Hora local<input name="localHour" type="number" min="0" max="23" required value="${Number(job.local_hour??7)}"></label>
     <label>Zona horaria<input name="timezoneName" required value="${htmlSafe(job.timezone_name||'America/Santiago')}"></label>
     <label>Ventana de indicadores<select name="periodDays">${[30,90,365].map(x=>`<option value="${x}" ${Number(job.period_days)===x?'selected':''}>${x} días</option>`).join('')}</select></label>
-    </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Guardar automatización</button></div></form>`);
+    </div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button type="button" class="button secondary" data-run-kpi-job>Ejecutar y comprobar ahora</button><button class="button">Guardar automatización</button></div></form>`);
 }
 function kpiMetricLabel(code){return({FILL_RATE:'Nivel de servicio (%)',ON_TIME_RATE:'Entregas a tiempo (%)',PICKING_ACCURACY:'Exactitud de picking (%)',INVENTORY_ACCURACY:'Exactitud de inventario (%)',AVERAGE_CYCLE_HOURS:'Tiempo de ciclo (horas)',OVERDUE_OPEN_REQUESTS:'Solicitudes atrasadas'})[code]||code}
 function kpiTargetFormModal(id=''){
@@ -1269,9 +1269,20 @@ document.addEventListener('click',async e=>{
   catch(err){toast(err.message||'No se pudieron actualizar los indicadores.');t.disabled=false}
 },true);
 document.addEventListener('click',async e=>{
-  let t=e.target.closest?.('[data-kpi-days],[data-snapshot-kpis],[data-kpi-targets],[data-kpi-schedule],[data-new-kpi-target],[data-edit-kpi-target]');if(!t)return;e.preventDefault();
+  let t=e.target.closest?.('[data-kpi-days],[data-snapshot-kpis],[data-kpi-targets],[data-kpi-schedule],[data-run-kpi-job],[data-new-kpi-target],[data-edit-kpi-target]');if(!t)return;e.preventDefault();
   if(t.dataset.kpiTargets!==undefined)return kpiTargetsModal();
   if(t.dataset.kpiSchedule!==undefined)return kpiScheduleModal();
+  if(t.dataset.runKpiJob!==undefined){
+    if(!requirePerm('admin')||!confirm('¿Ejecutar ahora el cierre y verificar la automatización?'))return;
+    t.disabled=true;
+    try{
+      let result=await logisticsFetch('/api/v1/logistics-jobs/kpi-daily/run-now',{method:'POST'});
+      await loadLogisticsV2(true);closeModal();
+      toast(result.results?.[0]?.ok?'Automatización comprobada correctamente.':'La ejecución terminó con observaciones; revisa Tareas.');
+      render();
+    }catch(err){toast(err.message||'No se pudo comprobar la automatización.');t.disabled=false}
+    return;
+  }
   if(t.dataset.newKpiTarget!==undefined)return kpiTargetFormModal();
   if(t.dataset.editKpiTarget)return kpiTargetFormModal(t.dataset.editKpiTarget);
   t.disabled=true;
