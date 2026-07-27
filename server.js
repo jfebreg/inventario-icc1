@@ -767,6 +767,8 @@ async function syncAssetDisposalTask(disposalId) {
 async function syncAssetComplianceTask(complianceId) {
   const result = await pool.query(`SELECT compliance.*,unit.unit_code,item.name AS item_name,
       center.name AS cost_center,
+      CASE WHEN compliance.expires_at IS NULL THEN NULL
+        ELSE compliance.expires_at-CURRENT_DATE END AS days_remaining,
       CASE WHEN compliance.expires_at<CURRENT_DATE THEN 'EXPIRED'
         WHEN compliance.expires_at<=CURRENT_DATE+compliance.reminder_days THEN 'EXPIRING'
         ELSE compliance.status END AS effective_status
@@ -785,7 +787,7 @@ async function syncAssetComplianceTask(complianceId) {
   const record = result.rows[0];
   if (!record) return;
   const taskId = `asset-compliance-${record.id}`;
-  if (record.status !== "ACTIVE" || !record.expires_at) {
+  if (record.status !== "ACTIVE" || !record.expires_at || record.effective_status === "ACTIVE") {
     await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
       resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW() WHERE id=$1`, [taskId]);
     return;
@@ -810,7 +812,7 @@ async function syncAssetComplianceTask(complianceId) {
       priority=EXCLUDED.priority,status='Pendiente',center_name=EXCLUDED.center_name,
       assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,due_at=EXCLUDED.due_at,
       resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
-  [taskId, title, detail, expired && record.critical ? "Crítica" : "Alta",
+  [taskId, title, detail, expired && record.critical ? "Crítica" : Number(record.days_remaining) <= 7 ? "Alta" : "Media",
     record.cost_center || "Bodega Central", assignee, record.id, record.expires_at,
     JSON.stringify(record)]);
   if (["EXPIRED", "EXPIRING"].includes(record.effective_status)) {
@@ -823,6 +825,34 @@ async function syncAssetComplianceTask(complianceId) {
       record.cost_center || "Bodega Central", title, detail,
       expired && record.critical ? "critical" : "warning", record.id, JSON.stringify(record)]);
   }
+}
+
+let complianceSweepRunning = false;
+async function sweepAssetComplianceTasks() {
+  if (!pool || !logisticsReady || complianceSweepRunning) return { scanned: 0, skipped: true };
+  complianceSweepRunning = true;
+  try {
+    const records = await pool.query(`SELECT id FROM logistics_asset_compliance_records
+      WHERE status='ACTIVE' ORDER BY expires_at NULLS LAST`);
+    for (const record of records.rows) await syncAssetComplianceTask(record.id);
+    const resolved = await pool.query(`UPDATE inventory_tasks task
+      SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+      WHERE task.entity_type='asset_compliance' AND task.status<>'Resuelta'
+        AND NOT EXISTS (
+          SELECT 1 FROM logistics_asset_compliance_records compliance
+          WHERE compliance.id::text=task.entity_id AND compliance.status='ACTIVE'
+        ) RETURNING id`);
+    return { scanned: records.rowCount, resolved: resolved.rowCount };
+  } finally {
+    complianceSweepRunning = false;
+  }
+}
+
+function startComplianceScheduler() {
+  const run = () => sweepAssetComplianceTasks()
+    .catch(error => console.error("No se pudo revisar vencimientos técnicos:", error.message));
+  setTimeout(run, 5_000).unref?.();
+  setInterval(run, 15 * 60 * 1000).unref?.();
 }
 
 function sameCenter(left, right) {
@@ -1563,6 +1593,17 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await listAssetCompliance(pool, apiProfile, logisticsOrganizationId));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo consultar el cumplimiento técnico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-compliance/sweep" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo el administrador puede ejecutar la revisión general." });
+    }
+    try {
+      return json(res, 200, { ok: true, ...(await sweepAssetComplianceTasks()) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo revisar los vencimientos." });
     }
   }
 
@@ -2880,7 +2921,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 setupDatabase()
-  .then(() => server.listen(port, "0.0.0.0", () => console.log(`Inventario ICC escuchando en puerto ${port}`)))
+  .then(() => {
+    startComplianceScheduler();
+    server.listen(port, "0.0.0.0", () => console.log(`Inventario ICC escuchando en puerto ${port}`));
+  })
   .catch((error) => {
     console.error("No se pudo preparar la base de datos; la app seguirá iniciando.", error.message);
     server.listen(port, "0.0.0.0", () => console.log(`Inventario ICC escuchando en puerto ${port}`));
