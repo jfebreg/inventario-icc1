@@ -2488,7 +2488,9 @@ const server = http.createServer(async (req, res) => {
       }
       const result = await createCustodyAssignment(pool, {
         ...body,
-        organizationId: body.organizationId || logisticsOrganizationId
+        organizationId: body.organizationId || logisticsOrganizationId,
+        allowComplianceOverride: Boolean(apiProfile.admin && body.allowComplianceOverride),
+        complianceOverrideReason: apiProfile.admin ? body.complianceOverrideReason : ""
       }, apiProfile.id);
       return json(res, result.replayed ? 200 : 201, result);
     } catch (error) {
@@ -2555,7 +2557,11 @@ const server = http.createServer(async (req, res) => {
       }
       const updated = action === "receive"
         ? await receiveTransfer(pool, transferId, body, apiProfile.id)
-        : await dispatchTransfer(pool, transferId, body, apiProfile.id);
+        : await dispatchTransfer(pool, transferId, {
+          ...body,
+          allowComplianceOverride: Boolean(apiProfile.admin && body.allowComplianceOverride),
+          complianceOverrideReason: apiProfile.admin ? body.complianceOverrideReason : ""
+        }, apiProfile.id);
       return json(res, 200, { transfer: updated });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar el traslado." });
