@@ -27,6 +27,7 @@ import {
   ensureDefaultOrganization,
   listCanonicalItems,
   listAssetDisposals,
+  listAssetFinancials,
   listCycleCounts,
   listCustodyAssignments,
   listInboundReceipts,
@@ -57,6 +58,7 @@ import {
   suggestPutawayLocations,
   updateCycleCount,
   updateAssetDisposal,
+  upsertAssetFinancial,
   updateItemCost,
   updateInboundReceipt,
   updateInventoryAdjustment,
@@ -70,6 +72,7 @@ import {
   updateStorageLocation,
   updateInspectionRun,
   closeInventoryPeriod,
+  runAssetDepreciation,
   upsertReplenishmentPolicy
 } from "./lib/logistics.js";
 
@@ -1370,7 +1373,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement, assetDisposals,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryControl, procurement, assetDisposals, assetFinancials,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1389,6 +1392,7 @@ const server = http.createServer(async (req, res) => {
         listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
         listProcurement(pool, dashboardProfile, logisticsOrganizationId),
         listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId),
+        listAssetFinancials(pool, dashboardProfile, logisticsOrganizationId),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1423,6 +1427,7 @@ const server = http.createServer(async (req, res) => {
         inventoryControl,
         procurement,
         assetDisposals,
+        assetFinancials,
         warehouseDirectory,
         workers,
         reconciliation
@@ -1460,6 +1465,39 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { assetDisposals: await listAssetDisposals(pool, apiProfile, logisticsOrganizationId) });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron consultar las bajas." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-financials" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar valores." });
+    try {
+      return json(res, 200, await listAssetFinancials(pool, apiProfile, logisticsOrganizationId,
+        url.searchParams.get("asOfDate")));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo calcular el registro financiero." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-financials" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede registrar valores." });
+    try {
+      const body = await readJson(req);
+      return json(res, 200, await upsertAssetFinancial(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el registro financiero." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/asset-depreciation-runs" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo el administrador puede cerrar depreciación." });
+    try {
+      const body = await readJson(req);
+      return json(res, 200, await runAssetDepreciation(pool, logisticsOrganizationId,
+        body.asOfDate, apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo ejecutar la depreciación." });
     }
   }
 
