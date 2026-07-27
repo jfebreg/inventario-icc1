@@ -37,6 +37,8 @@ import {
   listInventoryAnalytics,
   listInventoryClassifications,
   listInventoryControls,
+  listLogisticsKpis,
+  listKpiTargets,
   listMaterialRequests,
   listMaintenance,
   listPurchaseRequisitions,
@@ -60,6 +62,7 @@ import {
   resolveItemIdentifier,
   returnCustodyAssignment,
   runLogisticsMigrations,
+  snapshotLogisticsKpis,
   stockSnapshot,
   suggestPutawayLocations,
   updateCycleCount,
@@ -84,7 +87,8 @@ import {
   runAssetDepreciation,
   upsertReplenishmentPolicy,
   upsertItemPresentation,
-  upsertSupplierItem
+  upsertSupplierItem,
+  upsertKpiTarget
 } from "./lib/logistics.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -900,7 +904,9 @@ async function createCanonicalBackup(actorProfile) {
       assetCompliance: "logistics_asset_compliance_records",
       materialRequests: "logistics_material_requests",
       stockReservations: "logistics_stock_reservations",
-      pickTasks: "logistics_pick_tasks"
+      pickTasks: "logistics_pick_tasks",
+      kpiSnapshots: "logistics_kpi_snapshots",
+      kpiTargets: "logistics_kpi_targets"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const result = await client.query(`SELECT * FROM ${table}
@@ -1704,7 +1710,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1727,6 +1733,7 @@ const server = http.createServer(async (req, res) => {
         listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId),
         listAssetFinancials(pool, dashboardProfile, logisticsOrganizationId),
         listAssetCompliance(pool, dashboardProfile, logisticsOrganizationId),
+        listLogisticsKpis(pool, dashboardProfile, logisticsOrganizationId, 90),
         pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
@@ -1765,12 +1772,64 @@ const server = http.createServer(async (req, res) => {
         assetDisposals,
         assetFinancials,
         assetCompliance,
+        logisticsKpis,
         warehouseDirectory,
         workers,
         reconciliation
       });
     } catch (error) {
       return json(res, 500, { error: error.message || "No se pudo preparar el panel logistico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-kpis" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar indicadores logísticos." });
+    }
+    try {
+      const days = Number(url.searchParams.get("days") || 90);
+      return json(res, 200, await listLogisticsKpis(pool, apiProfile, logisticsOrganizationId, days));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron calcular los indicadores." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-kpis/snapshot" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede guardar el cierre de indicadores." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 201, await snapshotLogisticsKpis(pool, apiProfile,
+        logisticsOrganizationId, Number(body.periodDays || 90)));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el cierre de indicadores." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-kpi-targets" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar metas logísticas." });
+    }
+    try {
+      return json(res, 200, { targets: await listKpiTargets(pool, apiProfile, logisticsOrganizationId) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las metas." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/logistics-kpi-targets" && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede modificar metas logísticas." });
+    }
+    try {
+      const body = await readJson(req);
+      const target = await upsertKpiTarget(pool, {
+        ...body, organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 200, { target });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar la meta." });
     }
   }
 

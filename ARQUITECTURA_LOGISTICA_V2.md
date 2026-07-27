@@ -13,6 +13,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - Clasificación ABC/XYZ persistente y políticas de frecuencia/tolerancia para conteos.
 - Solicitudes internas con reserva, tareas de picking ordenadas por ubicación y verificación por escaneo.
 - Despacho de solicitudes entre bodegas mediante tránsito y recepción confirmada en destino.
+- Indicadores de nivel de servicio, puntualidad, exactitud de picking, exactitud de inventario y tiempos de ciclo.
+- Metas configurables por organización o bodega, con tareas críticas y notificaciones ante desviaciones.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -39,6 +41,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 11. Una solicitud no puede entregarse hasta verificar por escaneo todas sus tareas de picking.
 12. Cada diferencia de cantidad exige una excepción documentada antes de continuar.
 13. Un despacho entre bodegas conserva el stock de la empresa en tránsito hasta su recepción.
+14. Los cierres de indicadores se calculan desde transacciones auditables y quedan versionados por fecha.
+15. Las desviaciones de KPI generan tareas con prioridad y se cierran automáticamente al recuperar la meta.
 
 ## API V1 disponible
 
@@ -63,6 +67,10 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 - `POST /api/v1/material-requests`
 - `PATCH /api/v1/material-requests/:id`
 - `PATCH /api/v1/pick-tasks/:id`
+- `GET /api/v1/logistics-kpis`
+- `POST /api/v1/logistics-kpis/snapshot` — sólo administrador.
+- `GET /api/v1/logistics-kpi-targets`
+- `PATCH /api/v1/logistics-kpi-targets` — sólo administrador.
 
 Todas las rutas requieren autenticación cuando Supabase Auth está activo y validan los permisos del perfil.
 
