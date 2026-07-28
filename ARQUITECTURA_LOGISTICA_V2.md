@@ -145,3 +145,12 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Los reportes muestran exactitud, cumplimiento de tolerancia y tasa de reconteo.
 - Las diferencias se analizan por bodega, causa, fecha, cantidad y valor.
 - Los usuarios de centro sólo ven los indicadores correspondientes a su ámbito.
+
+## Gobierno de datos maestros
+
+- Una revisión diaria detecta artículos sin familia o unidad base.
+- Se identifican existencias sin costo y materiales sin política de reposición.
+- Las unidades serializadas sin serie de fabricante quedan visibles como incidencia.
+- Cada incidencia mantiene historial y crea una tarea según su severidad.
+- Cuando el dato se corrige, la siguiente revisión resuelve la incidencia y su tarea.
+- La revisión manual y el panel completo están restringidos a administración.

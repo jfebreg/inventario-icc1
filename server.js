@@ -36,6 +36,7 @@ import {
   listInboundReceipts,
   listInventoryAnalytics,
   listInventoryAccuracy,
+  listCatalogDataQuality,
   listInventoryClassifications,
   listInventoryControls,
   listLogisticsKpis,
@@ -64,6 +65,7 @@ import {
   registerWarehouse,
   reviewReplenishmentTasks,
   reviewCycleCountTasks,
+  reviewCatalogDataQuality,
   resolveItemIdentifier,
   returnCustodyAssignment,
   runLogisticsMigrations,
@@ -1056,9 +1058,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("034_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("035_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("034_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("035_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1797,7 +1799,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryAccuracy, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryAccuracy, catalogQuality, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1815,6 +1817,8 @@ const server = http.createServer(async (req, res) => {
         listMaintenance(pool, dashboardProfile),
         listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
         listInventoryAccuracy(pool, dashboardProfile, logisticsOrganizationId, 90),
+        dashboardProfile.admin ? listCatalogDataQuality(pool, logisticsOrganizationId)
+          : Promise.resolve({ rows: [], summary: {} }),
         listInventoryClassifications(pool, logisticsOrganizationId),
         listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
         listProcurement(pool, dashboardProfile, logisticsOrganizationId),
@@ -1857,6 +1861,7 @@ const server = http.createServer(async (req, res) => {
         maintenance,
         inventoryAnalytics,
         inventoryAccuracy,
+        catalogQuality,
         inventoryClassifications,
         inventoryControl,
         procurement,
@@ -1899,6 +1904,32 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, {
         error: error.message || "No se pudo calcular la exactitud del inventario."
       });
+    }
+  }
+
+  if (url.pathname === "/api/v1/catalog-quality" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede revisar la calidad del catálogo." });
+    }
+    try {
+      return json(res, 200, await listCatalogDataQuality(pool, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar la calidad del catálogo." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/catalog-quality/review" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede ejecutar esta revisión." });
+    }
+    try {
+      const result = await reviewCatalogDataQuality(pool, logisticsOrganizationId);
+      return json(res, 200, {
+        ...result,
+        catalogQuality: await listCatalogDataQuality(pool, logisticsOrganizationId)
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo revisar el catálogo." });
     }
   }
 
