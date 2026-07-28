@@ -21,6 +21,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
   controlado, supervisión y recuperación administrativa.
 - Revisión diaria de reposición que propone cantidades y genera tareas por bodega, sin emitir
   solicitudes de compra ni comprometer presupuesto automáticamente.
+- Programa diario de conteos cíclicos por bodega, basado en ABC/XYZ, saldo físico y último
+  conteo contabilizado.
 - Movimientos confirmados y libro mayor inalterable.
 - Proyección de saldos con versión para concurrencia.
 - Traslados con líneas, tránsito, despacho, recepción parcial y recepción completa.
@@ -54,6 +56,8 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
     como clave de idempotencia.
 18. La automatización de abastecimiento propone y alerta; una persona autorizada conserva la decisión
     de crear, enviar y aprobar cada solicitud de compra.
+19. La planificación de conteos nunca altera saldos; el ajuste sólo ocurre tras conteo, revisión,
+    aprobación y contabilización.
 
 ## API V1 disponible
 

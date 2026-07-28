@@ -62,6 +62,7 @@ import {
   registerItemFamily,
   registerWarehouse,
   reviewReplenishmentTasks,
+  reviewCycleCountTasks,
   resolveItemIdentifier,
   returnCustodyAssignment,
   runLogisticsMigrations,
@@ -1054,9 +1055,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("030_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("031_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("030_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("031_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -2039,6 +2040,17 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { summary });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo calcular la clasificación." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-classifications/review-counts" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "SÃ³lo administraciÃ³n puede revisar el programa de conteos." });
+    }
+    try {
+      return json(res, 200, await reviewCycleCountTasks(pool, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo revisar el programa de conteos." });
     }
   }
 
