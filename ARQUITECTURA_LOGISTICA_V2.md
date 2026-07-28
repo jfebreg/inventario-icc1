@@ -137,3 +137,11 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - La tarea sólo se resuelve al aprobar y contabilizar el conteo.
 - Cada diferencia genera un movimiento de ajuste individual, idempotente y auditado.
 - Una tarea de conteo no puede marcarse manualmente como resuelta.
+- Las diferencias se comparan con la tolerancia configurada para la clase ABC.
+- Una diferencia fuera de tolerancia exige reconteo ciego por otra persona.
+- El reconteo conserva el primer resultado y exige un motivo normalizado.
+- El aprobador no puede ser quien realizó el conteo ni el reconteo.
+- La exactitud utiliza una vista canónica con el resultado final aprobado.
+- Los reportes muestran exactitud, cumplimiento de tolerancia y tasa de reconteo.
+- Las diferencias se analizan por bodega, causa, fecha, cantidad y valor.
+- Los usuarios de centro sólo ven los indicadores correspondientes a su ámbito.

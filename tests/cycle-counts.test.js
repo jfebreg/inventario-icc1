@@ -16,20 +16,20 @@ test("el modelo de conteo controla estados, líneas y permisos directos", () => 
 
 test("el conteo es ciego y excluye activos serializados", () => {
   assert.match(logistics, /item\.tracking_type<>'SERIAL'/);
-  assert.match(logistics, /cycle\.blind_count AND cycle\.status IN \('DRAFT','IN_PROGRESS'\)/);
+  assert.match(logistics, /cycle\.blind_count AND cycle\.status IN \('DRAFT','IN_PROGRESS','RECOUNT_REQUIRED'\)/);
   assert.match(app, /El conteo será ciego/);
 });
 
 test("la contabilización conserva la diferencia física, es idempotente y usa ajustes V2", () => {
   assert.match(logistics, /const currentStock = await currentQuantity/);
-  assert.match(logistics, /number\(line\.counted_quantity\) - number\(line\.expected_quantity\)/);
+  assert.match(logistics, /const difference = finalCounted - number\(line\.expected_quantity\)/);
   assert.match(logistics, /movementType: "ADJUSTMENT"/);
   assert.match(logistics, /idempotencyKey: `cycle-count:\$\{countId\}:\$\{line\.id\}`/);
   assert.match(logistics, /Quien realizó el conteo no puede aprobarlo/);
 });
 
-test("el stock queda bloqueado sólo durante el levantamiento del conteo", () => {
-  assert.match(logistics, /cycle\.status IN \('DRAFT','IN_PROGRESS'\)/);
+test("el stock queda bloqueado hasta contabilizar o cancelar el conteo", () => {
+  assert.match(logistics, /cycle\.status IN \('DRAFT','IN_PROGRESS','RECOUNT_REQUIRED','SUBMITTED','APPROVED'\)/);
   assert.match(logistics, /temporalmente bloqueado por el conteo/);
   assert.match(logistics, /normalizedAction === "CANCEL"/);
   assert.match(app, /cancelar y liberar el stock/);

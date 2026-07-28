@@ -35,6 +35,7 @@ import {
   listCustodyAssignments,
   listInboundReceipts,
   listInventoryAnalytics,
+  listInventoryAccuracy,
   listInventoryClassifications,
   listInventoryControls,
   listLogisticsKpis,
@@ -1055,9 +1056,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("032_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("034_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("032_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("034_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1796,7 +1797,7 @@ const server = http.createServer(async (req, res) => {
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryAccuracy, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
         warehouseDirectory, workers, reconciliation] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -1813,6 +1814,7 @@ const server = http.createServer(async (req, res) => {
         listMaterialRequests(pool, dashboardProfile),
         listMaintenance(pool, dashboardProfile),
         listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
+        listInventoryAccuracy(pool, dashboardProfile, logisticsOrganizationId, 90),
         listInventoryClassifications(pool, logisticsOrganizationId),
         listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
         listProcurement(pool, dashboardProfile, logisticsOrganizationId),
@@ -1854,6 +1856,7 @@ const server = http.createServer(async (req, res) => {
         materialRequests,
         maintenance,
         inventoryAnalytics,
+        inventoryAccuracy,
         inventoryClassifications,
         inventoryControl,
         procurement,
@@ -1881,6 +1884,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await listLogisticsKpis(pool, apiProfile, logisticsOrganizationId, days));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron calcular los indicadores." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inventory-accuracy" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar la exactitud del inventario." });
+    }
+    try {
+      const days = Number(url.searchParams.get("days") || 90);
+      return json(res, 200,
+        await listInventoryAccuracy(pool, apiProfile, logisticsOrganizationId, days));
+    } catch (error) {
+      return json(res, 400, {
+        error: error.message || "No se pudo calcular la exactitud del inventario."
+      });
     }
   }
 
