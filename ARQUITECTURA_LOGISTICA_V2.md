@@ -127,3 +127,13 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Las recepciones confirman el traslado V2, incluyendo los pendientes migrados.
 - Si V2 rechaza una operación, el estado anterior no se modifica.
 - Los movimientos guardan la referencia canónica para conservar trazabilidad entre ambos modelos.
+
+## Conteos cíclicos programados
+
+- La revisión diaria genera tareas por bodega según clasificación ABC/XYZ.
+- Desde la bandeja, el usuario inicia un conteo ciego que incluye sólo los productos vencidos.
+- Una tarea y su conteo quedan vinculados para impedir duplicidades.
+- Cancelar el conteo reactiva la tarea; no la elimina ni altera saldos.
+- La tarea sólo se resuelve al aprobar y contabilizar el conteo.
+- Cada diferencia genera un movimiento de ajuste individual, idempotente y auditado.
+- Una tarea de conteo no puede marcarse manualmente como resuelta.
