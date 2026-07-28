@@ -169,3 +169,12 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Una coincidencia bloquea el alta para usuarios de bodega.
 - Sólo administración puede autorizar la excepción con un fundamento obligatorio.
 - La autorización conserva los candidatos comparados en auditoría y en la cola de eventos.
+
+## Identificadores GS1 y códigos operativos
+
+- SKU, GTIN/EAN/UPC y códigos de presentación viven en un registro canónico único.
+- La lectura consulta primero ese registro y conserva compatibilidad con el catálogo anterior.
+- Los códigos comerciales numéricos de 8, 12, 13 o 14 dígitos validan su dígito GS1.
+- Un identificador activo no puede pertenecer a dos artículos de la misma organización.
+- Cambiar el código de una presentación desactiva el anterior para evitar lecturas ambiguas.
+- Los códigos internos alfanuméricos continúan disponibles para etiquetas propias de ICC.
