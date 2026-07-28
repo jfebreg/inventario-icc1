@@ -154,3 +154,8 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Cada incidencia mantiene historial y crea una tarea según su severidad.
 - Cuando el dato se corrige, la siguiente revisión resuelve la incidencia y su tarea.
 - La revisión manual y el panel completo están restringidos a administración.
+- Cada incidencia abierta ofrece una corrección guiada según su regla.
+- Familia, unidad, bodega y serie se validan dentro de la organización antes de guardar.
+- La política de reposición exige mínimo, punto de pedido y máximo coherentes.
+- Toda corrección conserva valor anterior, valor nuevo, responsable, fecha y fundamento.
+- Después de guardar, el sistema repite la revisión y sólo confirma si la causa desapareció.

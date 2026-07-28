@@ -66,6 +66,7 @@ import {
   reviewReplenishmentTasks,
   reviewCycleCountTasks,
   reviewCatalogDataQuality,
+  remediateCatalogDataIssue,
   resolveItemIdentifier,
   returnCustodyAssignment,
   runLogisticsMigrations,
@@ -1058,9 +1059,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("035_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("036_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("035_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("036_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1930,6 +1931,37 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo revisar el catálogo." });
+    }
+  }
+
+  const catalogRemediationRoute = url.pathname.match(
+    /^\/api\/v1\/catalog-quality\/([^/]+)\/remediate$/
+  );
+  if (catalogRemediationRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede corregir datos maestros." });
+    }
+    try {
+      const body = await readJson(req);
+      const remediation = await remediateCatalogDataIssue(
+        pool,
+        catalogRemediationRoute[1],
+        { ...body, organizationId: logisticsOrganizationId },
+        apiProfile.id
+      );
+      const review = await reviewCatalogDataQuality(pool, logisticsOrganizationId);
+      return json(res, 200, {
+        remediation,
+        ...review,
+        catalogQuality: await listCatalogDataQuality(pool, logisticsOrganizationId)
+      });
+    } catch (error) {
+      const conflict = error.code === "23505";
+      return json(res, conflict ? 409 : 400, {
+        error: conflict
+          ? "El valor ingresado ya está asociado a otro registro."
+          : (error.message || "No se pudo aplicar la corrección.")
+      });
     }
   }
 
