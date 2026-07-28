@@ -66,6 +66,7 @@ import {
   reviewReplenishmentTasks,
   reviewCycleCountTasks,
   reviewCatalogDataQuality,
+  reviewCatalogDuplicateDecision,
   remediateCatalogDataIssue,
   resolveItemIdentifier,
   returnCustodyAssignment,
@@ -1059,9 +1060,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("036_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("037_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("036_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("037_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1961,6 +1962,32 @@ const server = http.createServer(async (req, res) => {
         error: conflict
           ? "El valor ingresado ya está asociado a otro registro."
           : (error.message || "No se pudo aplicar la corrección.")
+      });
+    }
+  }
+
+  const catalogDuplicateReviewRoute = url.pathname.match(
+    /^\/api\/v1\/catalog-quality\/([^/]+)\/duplicate-decision$/
+  );
+  if (catalogDuplicateReviewRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede revisar duplicados." });
+    }
+    try {
+      const body = await readJson(req);
+      const issue = await reviewCatalogDuplicateDecision(
+        pool,
+        catalogDuplicateReviewRoute[1],
+        { ...body, organizationId: logisticsOrganizationId },
+        apiProfile.id
+      );
+      return json(res, 200, {
+        issue,
+        catalogQuality: await listCatalogDataQuality(pool, logisticsOrganizationId)
+      });
+    } catch (error) {
+      return json(res, 400, {
+        error: error.message || "No se pudo registrar la decisión."
       });
     }
   }

@@ -159,3 +159,8 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - La política de reposición exige mínimo, punto de pedido y máximo coherentes.
 - Toda corrección conserva valor anterior, valor nuevo, responsable, fecha y fundamento.
 - Después de guardar, el sistema repite la revisión y sólo confirma si la causa desapareció.
+- La revisión compara artículos por nombre, familia, tipo, marca y modelo para advertir duplicados.
+- Cada candidato conserva un porcentaje y los factores que originaron la coincidencia.
+- Administración decide si son productos distintos o confirma la duplicidad con fundamento.
+- Un caso descartado no reaparece en revisiones posteriores.
+- Confirmar una duplicidad no fusiona códigos ni modifica saldos; crea una tarea prioritaria.

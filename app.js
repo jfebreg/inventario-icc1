@@ -761,8 +761,14 @@ function catalogQualityMarkup(){
       <div class="card"><div class="metric-label">Prioridad alta</div><div class="metric-value">${s.high||0}</div></div>
       <div class="card"><div class="metric-label">Resueltas automáticamente</div><div class="metric-value">${s.resolved||0}</div></div>
     </div>
-    ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Estado</th><th>Prioridad</th><th>Artículo / unidad</th><th>Incidencia</th><th>Corrección recomendada</th><th>Última detección</th><th></th></tr></thead><tbody>${rows.slice(0,100).map(x=>`<tr><td>${tag(x.status==='OPEN'?'Pendiente':'Resuelta')}</td><td><strong>${htmlSafe(severity[x.severity]||x.severity)}</strong></td><td><span class="code">${htmlSafe(x.unit_code||x.sku||x.entity_id)}</span><br><small>${htmlSafe(x.item_name||x.entity_type)}</small></td><td><strong>${htmlSafe(x.title)}</strong><br><small>${htmlSafe(x.detail||'')}</small></td><td>${htmlSafe(x.recommendation||'—')}</td><td>${String(x.last_detected_at||'').slice(0,10)}</td><td>${x.status==='OPEN'?`<button class="button secondary" data-remediate-quality="${x.id}">Corregir</button>`:`<small>${x.corrected_at?new Date(x.corrected_at).toLocaleString('es-CL'):'Verificado'}</small>`}</td></tr>`).join('')}</tbody></table></div>`:'<div class="access-box"><strong>Sin incidencias registradas.</strong><div>Ejecuta la revisión para comprobar el catálogo actual.</div></div>'}
+    ${rows.length?`<div class="table-wrap"><table><thead><tr><th>Estado</th><th>Prioridad</th><th>Artículo / unidad</th><th>Incidencia</th><th>Corrección recomendada</th><th>Última detección</th><th></th></tr></thead><tbody>${rows.slice(0,100).map(x=>`<tr><td>${tag(x.status==='OPEN'?'Pendiente':x.status==='WAIVED'?'No duplicado':'Resuelta')}</td><td><strong>${htmlSafe(severity[x.severity]||x.severity)}</strong></td><td><span class="code">${htmlSafe(x.unit_code||x.sku||x.entity_id)}</span><br><small>${htmlSafe(x.item_name||x.entity_type)}</small></td><td><strong>${htmlSafe(x.title)}</strong><br><small>${htmlSafe(x.detail||'')}</small></td><td>${htmlSafe(x.recommendation||'—')}</td><td>${String(x.last_detected_at||'').slice(0,10)}</td><td>${x.status==='OPEN'?(x.rule_code==='POSSIBLE_DUPLICATE'?`<button class="button secondary" data-review-duplicate="${x.id}">Comparar</button>`:`<button class="button secondary" data-remediate-quality="${x.id}">Corregir</button>`):`<small>${x.reviewed_at?new Date(x.reviewed_at).toLocaleString('es-CL'):x.corrected_at?new Date(x.corrected_at).toLocaleString('es-CL'):'Verificado'}</small>`}</td></tr>`).join('')}</tbody></table></div>`:'<div class="access-box"><strong>Sin incidencias registradas.</strong><div>Ejecuta la revisión para comprobar el catálogo actual.</div></div>'}
   </section>`;
+}
+function catalogDuplicateReviewModal(issueId){
+  let issue=(logisticsV2.catalogQuality?.rows||[]).find(x=>x.id===issueId);
+  if(!issue)return toast('No encontramos el candidato.');
+  let confidence=Math.round(Number(issue.metadata?.confidence||0)*100);
+  modal('Comparar artículos',`<form id="catalogDuplicateReviewForm" data-id="${issue.id}"><div class="access-box"><strong>Coincidencia estimada: ${confidence}%</strong><div>La coincidencia es una alerta preventiva; nunca fusiona existencias automáticamente.</div></div><div class="table-wrap" style="margin-top:16px"><table><thead><tr><th>Dato</th><th>Artículo A</th><th>Artículo B</th></tr></thead><tbody><tr><td>Código</td><td><span class="code">${htmlSafe(issue.sku||'—')}</span></td><td><span class="code">${htmlSafe(issue.duplicate_sku||issue.metadata?.otherSku||'—')}</span></td></tr><tr><td>Nombre</td><td><strong>${htmlSafe(issue.item_name||'—')}</strong></td><td><strong>${htmlSafe(issue.duplicate_name||issue.metadata?.otherName||'—')}</strong></td></tr><tr><td>Marca</td><td>${htmlSafe(issue.brand||'—')}</td><td>${htmlSafe(issue.duplicate_brand||issue.metadata?.otherBrand||'—')}</td></tr><tr><td>Modelo</td><td>${htmlSafe(issue.model||'—')}</td><td>${htmlSafe(issue.duplicate_model||issue.metadata?.otherModel||'—')}</td></tr></tbody></table></div><div class="form-grid" style="margin-top:16px"><label class="full">Decisión<select name="decision" required><option value="">Seleccionar resultado</option><option value="NOT_DUPLICATE">Son productos diferentes</option><option value="CONFIRMED_DUPLICATE">Confirmar posible duplicado</option></select></label><label class="full">Fundamento<textarea name="notes" required minlength="5" placeholder="Indica la especificación que los diferencia o la evidencia que confirma la duplicidad."></textarea></label></div><div class="access-box" style="margin-top:16px">Si confirmas la duplicidad, permanecerá como tarea prioritaria para una futura consolidación controlada. Los movimientos y saldos no serán modificados.</div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Registrar decisión</button></div></form>`);
 }
 function catalogQualityRemediationModal(issueId){
   let data=logisticsV2.catalogQuality||{},issue=(data.rows||[]).find(x=>x.id===issueId),
@@ -1370,6 +1376,26 @@ document.addEventListener('click',e=>{
   let t=e.target.closest?.('[data-remediate-quality]');if(!t)return;e.preventDefault();
   if(!requirePerm('admin'))return;
   catalogQualityRemediationModal(t.dataset.remediateQuality);
+},true);
+document.addEventListener('click',e=>{
+  let t=e.target.closest?.('[data-review-duplicate]');if(!t)return;e.preventDefault();
+  if(!requirePerm('admin'))return;
+  catalogDuplicateReviewModal(t.dataset.reviewDuplicate);
+},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='catalogDuplicateReviewForm')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Registrando decisión…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target);
+    let result=await logisticsFetch(`/api/v1/catalog-quality/${encodeURIComponent(e.target.dataset.id)}/duplicate-decision`,{
+      method:'PATCH',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({decision:d.get('decision'),notes:d.get('notes')})
+    });
+    logisticsV2.catalogQuality=result.catalogQuality;
+    await window.ICCAuth?.refreshRealtime?.();
+    closeModal();toast(d.get('decision')==='NOT_DUPLICATE'?'Candidatos diferenciados y documentados.':'Duplicidad confirmada; quedó como tarea prioritaria.');render();
+  }catch(err){toast(err.message||'No se pudo registrar la decisión.')}finally{unlock()}
 },true);
 document.addEventListener('submit',async e=>{
   if(e.target.id!=='catalogQualityRemediationForm')return;
