@@ -164,3 +164,8 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Administración decide si son productos distintos o confirma la duplicidad con fundamento.
 - Un caso descartado no reaparece en revisiones posteriores.
 - Confirmar una duplicidad no fusiona códigos ni modifica saldos; crea una tarea prioritaria.
+- Antes de crear un SKU nuevo, el servidor compara nombre, familia, tipo y marca.
+- Agregar unidades a un SKU existente continúa permitido y no genera un falso positivo.
+- Una coincidencia bloquea el alta para usuarios de bodega.
+- Sólo administración puede autorizar la excepción con un fundamento obligatorio.
+- La autorización conserva los candidatos comparados en auditoría y en la cola de eventos.

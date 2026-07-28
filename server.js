@@ -2538,12 +2538,19 @@ const server = http.createServer(async (req, res) => {
       }
       const result = await registerCanonicalItem(pool, {
         ...body,
-        organizationId: body.organizationId || logisticsOrganizationId
+        organizationId: body.organizationId || logisticsOrganizationId,
+        canOverrideDuplicate: Boolean(apiProfile.admin)
       }, apiProfile.id);
       return json(res, 201, result);
     } catch (error) {
       const conflict = error.code === "23505";
-      return json(res, conflict ? 409 : 400, { error: conflict ? "El código o número de serie ya existe." : (error.message || "No se pudo registrar el artículo.") });
+      const possibleDuplicate = error.code === "POSSIBLE_DUPLICATE";
+      return json(res, conflict || possibleDuplicate ? 409 : 400, {
+        error: conflict ? "El código o número de serie ya existe."
+          : (error.message || "No se pudo registrar el artículo."),
+        code: possibleDuplicate ? "POSSIBLE_DUPLICATE" : undefined,
+        candidates: possibleDuplicate ? error.candidates : undefined
+      });
     }
   }
 
