@@ -198,3 +198,17 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Cada cambio de rol, centro, activación o desactivación incrementa la versión de seguridad.
 - Las revisiones de acceso y los eventos de seguridad son inalterables y quedan vinculados
   a la auditoría logística.
+
+## Confiabilidad operativa en terreno
+
+- Cada celular, lector USB, estación de trabajo e impresora de etiquetas puede registrarse
+  como un perfil operativo asociado a la organización y, cuando corresponda, a una bodega.
+- El diagnóstico guiado verifica contexto seguro, conexión, almacenamiento local,
+  cámara y QR, comportamiento del lector USB e impresión física de una etiqueta.
+- La impresora inicial queda documentada como Xprinter XP-360B, USB, 203 DPI y
+  etiqueta de 51 × 27 mm, sin impedir registrar otros modelos posteriormente.
+- Cada prueba conserva resultado, responsable, fecha, mediciones y observaciones.
+- Una ventana anti-rebote evita que una misma lectura de QR o pistola abra dos
+  operaciones por el mismo disparo.
+- Las comprobaciones se registran en auditoría y en la cola transaccional; la
+  confirmación de impresión exige validar físicamente legibilidad y lectura del QR.

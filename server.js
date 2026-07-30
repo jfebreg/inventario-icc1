@@ -737,6 +737,139 @@ async function profileMayAccessWarehouse(profile, warehouseId) {
   return Boolean(result.rowCount);
 }
 
+async function deviceReadinessOverview(profile) {
+  const params = [logisticsOrganizationId];
+  let scope = "";
+  if (!profile.admin) {
+    params.push(profile.cost_center);
+    scope = ` AND (p.warehouse_id IS NULL OR EXISTS (
+      SELECT 1 FROM logistics_warehouses w
+      JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
+      WHERE w.id=p.warehouse_id AND cc.name=$2
+    ))`;
+  }
+  const profiles = await pool.query(`SELECT p.*,
+      w.name AS warehouse_name,
+      COALESCE(c.check_count,0)::integer AS check_count,
+      c.last_check_type,c.last_check_status,c.last_checked_at
+    FROM logistics_device_profiles p
+    LEFT JOIN logistics_warehouses w ON w.id=p.warehouse_id
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) AS check_count,
+        (ARRAY_AGG(check_type ORDER BY performed_at DESC))[1] AS last_check_type,
+        (ARRAY_AGG(status ORDER BY performed_at DESC))[1] AS last_check_status,
+        MAX(performed_at) AS last_checked_at
+      FROM logistics_device_checks WHERE device_profile_id=p.id
+    ) c ON TRUE
+    WHERE p.organization_id=$1 AND p.active=TRUE ${scope}
+    ORDER BY p.profile_type,p.device_name`, params);
+  const checks = await pool.query(`SELECT c.*,p.device_name,p.profile_type
+    FROM logistics_device_checks c
+    JOIN logistics_device_profiles p ON p.id=c.device_profile_id
+    WHERE c.organization_id=$1 ${scope.replaceAll("p.", "p.")}
+    ORDER BY c.performed_at DESC LIMIT 40`, params);
+  const required = ["CAMERA_QR", "KEYBOARD_SCANNER", "PRINT_LABEL"];
+  const recent = new Map();
+  for (const check of checks.rows) {
+    if (!recent.has(check.check_type)) recent.set(check.check_type, check);
+  }
+  return {
+    profiles: profiles.rows,
+    recentChecks: checks.rows,
+    summary: required.map(type => {
+      const check = recent.get(type);
+      return {
+        type,
+        status: check?.status || "WARN",
+        checkedAt: check?.performed_at || null,
+        detail: check ? `${check.device_name}: ${check.status}` : "Sin prueba registrada"
+      };
+    })
+  };
+}
+
+async function upsertDeviceProfile(profile, body) {
+  const type = String(body.profileType || "").toUpperCase();
+  if (!["MOBILE", "USB_SCANNER", "LABEL_PRINTER", "WORKSTATION"].includes(type)) {
+    throw new Error("Tipo de dispositivo inválido.");
+  }
+  const deviceKey = String(body.deviceKey || "").trim();
+  const deviceName = String(body.deviceName || "").trim();
+  if (!deviceKey || !deviceName) throw new Error("Nombre e identificador del dispositivo son obligatorios.");
+  if (body.warehouseId && !profile.admin &&
+      !(await profileMayAccessWarehouse(profile, body.warehouseId))) {
+    throw new Error("El dispositivo pertenece a otro centro.");
+  }
+  const result = await pool.query(`INSERT INTO logistics_device_profiles
+    (organization_id,profile_type,device_name,device_key,warehouse_id,manufacturer,
+      model,connection_type,label_width_mm,label_height_mm,dpi,metadata,created_by,updated_by)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$13)
+    ON CONFLICT (organization_id,device_key) DO UPDATE SET
+      profile_type=EXCLUDED.profile_type,device_name=EXCLUDED.device_name,
+      warehouse_id=EXCLUDED.warehouse_id,manufacturer=EXCLUDED.manufacturer,
+      model=EXCLUDED.model,connection_type=EXCLUDED.connection_type,
+      label_width_mm=EXCLUDED.label_width_mm,label_height_mm=EXCLUDED.label_height_mm,
+      dpi=EXCLUDED.dpi,metadata=EXCLUDED.metadata,updated_by=EXCLUDED.updated_by,
+      updated_at=NOW(),active=TRUE RETURNING *`,
+  [logisticsOrganizationId, type, deviceName, deviceKey, body.warehouseId || null,
+    body.manufacturer || "", body.model || "", body.connectionType || "",
+    body.labelWidthMm || null, body.labelHeightMm || null, body.dpi || null,
+    asJson(body.metadata || {}), profile.id]);
+  return result.rows[0];
+}
+
+async function recordDeviceCheck(profile, body) {
+  const type = String(body.checkType || "").toUpperCase();
+  const status = String(body.status || "").toUpperCase();
+  if (!["CAMERA_QR", "KEYBOARD_SCANNER", "PRINT_LABEL", "NETWORK",
+    "SECURE_CONTEXT", "LOCAL_STORAGE"].includes(type)) throw new Error("Prueba inválida.");
+  if (!["PASS", "WARN", "FAIL"].includes(status)) throw new Error("Resultado inválido.");
+  if (!body.deviceProfileId || !body.idempotencyKey) {
+    throw new Error("Falta identificar el dispositivo o la prueba.");
+  }
+  const scope = await pool.query(`SELECT warehouse_id FROM logistics_device_profiles
+    WHERE id=$1 AND organization_id=$2 AND active=TRUE`,
+  [body.deviceProfileId, logisticsOrganizationId]);
+  if (!scope.rows[0]) throw new Error("Dispositivo inexistente.");
+  if (!profile.admin && scope.rows[0].warehouse_id &&
+      !(await profileMayAccessWarehouse(profile, scope.rows[0].warehouse_id))) {
+    throw new Error("El dispositivo pertenece a otro centro.");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const check = (await client.query(`INSERT INTO logistics_device_checks
+      (organization_id,device_profile_id,check_type,status,idempotency_key,
+        measurements,notes,performed_by)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)
+      ON CONFLICT (organization_id,idempotency_key) DO UPDATE SET
+        idempotency_key=EXCLUDED.idempotency_key
+      RETURNING *`,
+    [logisticsOrganizationId, body.deviceProfileId, type, status,
+      String(body.idempotencyKey), asJson(body.measurements || {}),
+      String(body.notes || ""), profile.id])).rows[0];
+    await client.query(`UPDATE logistics_device_profiles SET last_status=$1,
+      last_verified_at=NOW(),updated_by=$2,updated_at=NOW() WHERE id=$3`,
+    [status, profile.id, body.deviceProfileId]);
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+      VALUES ($1,'DEVICE_CHECK_RECORDED','device_profile',$2,$3,'WEB',$4::jsonb)`,
+    [logisticsOrganizationId, body.deviceProfileId, profile.id, asJson(check)]);
+    await client.query(`INSERT INTO logistics_outbox_events
+      (organization_id,event_type,aggregate_type,aggregate_id,payload,status,available_at)
+      VALUES ($1,'DEVICE_CHECK_RECORDED','device_profile',$2,$3::jsonb,'PENDING',NOW())`,
+    [logisticsOrganizationId, body.deviceProfileId,
+      asJson({ deviceProfileId: body.deviceProfileId, checkType: type, status })]);
+    await client.query("COMMIT");
+    return check;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function profileMayAccessLocation(profile, locationId) {
   if (!profile || !locationId) return false;
   if (profile.admin) return true;
@@ -1192,9 +1325,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("040_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("041_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("040_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("041_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1297,6 +1430,27 @@ async function productionReadiness() {
       : `${Number(outbox.summary?.pending || 0)} pendiente(s); ${Number(outbox.summary?.published_24h || 0)} publicados en 24 horas.`,
     deadLetters || oldestPendingAge > 15
       ? "Abrir Configuracion, revisar Cola de eventos y ejecutar la recuperacion." : "");
+
+  const deviceChecks = await pool.query(`SELECT check_type,
+      (ARRAY_AGG(status ORDER BY performed_at DESC))[1] AS status,
+      MAX(performed_at) AS checked_at
+    FROM logistics_device_checks WHERE organization_id=$1
+      AND check_type IN ('CAMERA_QR','KEYBOARD_SCANNER','PRINT_LABEL')
+    GROUP BY check_type`, [logisticsOrganizationId]);
+  const verifiedTypes = new Map(deviceChecks.rows.map(row => [row.check_type, row]));
+  const requiredDevices = ["CAMERA_QR", "KEYBOARD_SCANNER", "PRINT_LABEL"];
+  const failedDevices = requiredDevices.filter(type => verifiedTypes.get(type)?.status === "FAIL");
+  const staleDevices = requiredDevices.filter(type => {
+    const row = verifiedTypes.get(type);
+    return !row || Date.now() - new Date(row.checked_at).getTime() > 90 * 86_400_000;
+  });
+  add("fieldDevices", "Equipos de operación en terreno",
+    failedDevices.length ? "FAIL" : staleDevices.length ? "WARN" : "PASS",
+    failedDevices.length ? `${failedDevices.length} equipo(s) con prueba fallida.`
+      : staleDevices.length ? `${staleDevices.length} prueba(s) sin vigencia de 90 días.`
+        : "Cámara, lector USB e impresora verificados físicamente.",
+    failedDevices.length || staleDevices.length
+      ? "Abrir Configuración y ejecutar las pruebas de celular, lector e impresora." : "");
 
   const cutover = await getCutoverStatus(pool, logisticsOrganizationId);
   const canonicalPrimary = cutover.control?.mode === "CANONICAL_PRIMARY";
@@ -2638,6 +2792,41 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (error) {
       return json(res, 500, { error: error.message || "No se pudo consultar el modelo logístico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/devices/readiness" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar dispositivos." });
+    }
+    try {
+      return json(res, 200, await deviceReadinessOverview(apiProfile));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar el diagnóstico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/devices" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede configurar dispositivos." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, { profile: await upsertDeviceProfile(apiProfile, body) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el dispositivo." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/devices/checks" && req.method === "POST") {
+    if (!profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede registrar pruebas." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, { check: await recordDeviceCheck(apiProfile, body) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar la prueba." });
     }
   }
 
