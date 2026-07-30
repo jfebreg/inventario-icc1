@@ -27,3 +27,14 @@ test("el panel no conserva uniones directas text igual uuid conocidas", () => {
     /owner\.id=incident\.owner_profile_id/
   ]) assert.doesNotMatch(`${logistics}\n${server}`, pattern);
 });
+
+test("los eventos de auditoría comparan sus IDs de texto con UUID convertidos", () => {
+  assert.match(
+    logistics,
+    /event\.entity_type='pick_task' AND event\.entity_id=task\.id::text/
+  );
+  assert.doesNotMatch(
+    logistics,
+    /event\.entity_type='pick_task' AND event\.entity_id=task\.id(?!::text)/
+  );
+});
