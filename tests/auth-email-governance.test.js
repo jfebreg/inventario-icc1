@@ -25,3 +25,12 @@ test("el formulario de activación impide envíos simultáneos", () => {
   assert.match(authClient, /submitButton\.disabled = true/);
   assert.match(authClient, /Enviando una sola vez/);
 });
+
+test("el bootstrap limita intentos, no registra el token y queda auditado", () => {
+  assert.match(server, /consumeBootstrapAttempt/);
+  assert.match(server, /BOOTSTRAP_TOKEN_REJECTED/);
+  assert.match(server, /BOOTSTRAP_INVITATION_SENT/);
+  assert.match(server, /BOOTSTRAP_REJECTED_ALREADY_ACTIVE/);
+  assert.match(server, /requestFingerprint/);
+  assert.doesNotMatch(server, /metadata:\s*\{[^}]*token/i);
+});

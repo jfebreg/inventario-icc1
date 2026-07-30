@@ -133,6 +133,7 @@ const ROLE_PERMISSIONS = Object.freeze({
     "print", "workers", "admin", "ai", "audit"]
 });
 const KNOWN_PERMISSIONS = new Set(Object.values(ROLE_PERMISSIONS).flat());
+const bootstrapAttemptWindows = new Map();
 
 function supabaseBaseUrl() {
   return String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "").replace(/\/rest\/v1$/i, "");
@@ -156,6 +157,46 @@ function safeTokenEqual(actual, expected) {
   const a = Buffer.from(String(actual || ""));
   const b = Buffer.from(String(expected || ""));
   return a.length > 0 && a.length === b.length && timingSafeEqual(a, b);
+}
+
+function requestFingerprint(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const address = forwarded || req.socket?.remoteAddress || "unknown";
+  return createHash("sha256").update(address).digest("hex").slice(0, 20);
+}
+
+function consumeBootstrapAttempt(req) {
+  const key = requestFingerprint(req);
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  let entry = bootstrapAttemptWindows.get(key);
+  if (!entry || now - entry.startedAt >= windowMs) entry = { startedAt: now, count: 0 };
+  if (entry.count >= 5) {
+    return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((windowMs - (now - entry.startedAt)) / 1000)) };
+  }
+  entry.count += 1;
+  bootstrapAttemptWindows.set(key, entry);
+  if (bootstrapAttemptWindows.size > 1000) {
+    for (const [candidate, value] of bootstrapAttemptWindows) {
+      if (now - value.startedAt >= windowMs) bootstrapAttemptWindows.delete(candidate);
+    }
+  }
+  return { allowed: true, fingerprint: key };
+}
+
+async function recordBootstrapSecurityEvent(eventType, req, metadata = {}) {
+  if (!pool) return;
+  try {
+    await pool.query(`INSERT INTO inventory_security_events
+      (event_type,target_profile_id,metadata)
+      VALUES ($1,$2,$3::jsonb)`,
+    [eventType, initialAdmin.legacyUserId, asJson({
+      ...metadata,
+      requestFingerprint: requestFingerprint(req)
+    })]);
+  } catch (error) {
+    console.warn("No se pudo registrar el evento de activación:", error.message);
+  }
 }
 
 function json(res, status, value) {
@@ -2313,17 +2354,33 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/api/auth/bootstrap" && req.method === "POST") {
     if (!authConfigured()) return json(res, 503, { error: "Supabase Auth aún no está configurado en Render." });
     if (!process.env.AUTH_BOOTSTRAP_TOKEN) return json(res, 503, { error: "AUTH_BOOTSTRAP_TOKEN no está configurado en Render." });
+    const attempt = consumeBootstrapAttempt(req);
+    if (!attempt.allowed) {
+      res.setHeader("Retry-After", String(attempt.retryAfterSeconds));
+      await recordBootstrapSecurityEvent("BOOTSTRAP_RATE_LIMITED", req);
+      return json(res, 429, { error: "Demasiados intentos de activación. Espera 15 minutos antes de volver a intentarlo." });
+    }
     try {
+      const settings = await authSettings();
+      if (settings.migration_complete) {
+        await recordBootstrapSecurityEvent("BOOTSTRAP_REJECTED_ALREADY_ACTIVE", req);
+        return json(res, 409, { error: "La activación inicial ya fue completada. Ingresa con tu correo y contraseña." });
+      }
       const body = await readJson(req);
-      if (!safeTokenEqual(body.token, process.env.AUTH_BOOTSTRAP_TOKEN)) return json(res, 403, { error: "Código de activación incorrecto." });
+      if (!safeTokenEqual(body.token, process.env.AUTH_BOOTSTRAP_TOKEN)) {
+        await recordBootstrapSecurityEvent("BOOTSTRAP_TOKEN_REJECTED", req);
+        return json(res, 403, { error: "Código de activación incorrecto." });
+      }
       const result = await pool.query("SELECT * FROM inventory_user_profiles WHERE id=$1", [initialAdmin.legacyUserId]);
       const profile = result.rows[0];
       if (!profile) return json(res, 500, { error: "No se pudo preparar el perfil de Julio Febre." });
       await inviteProfile(profile, initialAdmin.email);
       await pool.query("UPDATE inventory_auth_settings SET bootstrap_used=TRUE, updated_at=NOW() WHERE id=1");
+      await recordBootstrapSecurityEvent("BOOTSTRAP_INVITATION_SENT", req, { email: initialAdmin.email });
       return json(res, 200, { ok: true, message: `Invitación enviada a ${initialAdmin.email}.` });
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo enviar la invitación inicial." });
+      await recordBootstrapSecurityEvent("BOOTSTRAP_INVITATION_FAILED", req, { code: error.code || "ERROR" });
+      return json(res, error.status === 429 ? 429 : 400, { error: error.message || "No se pudo enviar la invitación inicial." });
     }
   }
 
