@@ -1152,7 +1152,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("044_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("045_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -1713,9 +1713,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("044_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("045_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("044_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("045_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4373,6 +4373,156 @@ const server = http.createServer(async (req, res) => {
       return res.end(backup.body);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo exportar el libro mayor V2." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/document-governance" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede consultar conservación documental." });
+    }
+    const [policies, holds, reviews] = await Promise.all([
+      pool.query(`SELECT policy.*,creator.name AS created_by_name,updater.name AS updated_by_name
+        FROM logistics_retention_policies policy
+        LEFT JOIN inventory_user_profiles creator ON creator.id::text=policy.created_by::text
+        LEFT JOIN inventory_user_profiles updater ON updater.id::text=policy.updated_by::text
+        WHERE policy.organization_id=$1 ORDER BY policy.document_type`, [logisticsOrganizationId]),
+      pool.query(`SELECT hold.*,placer.name AS placed_by_name,releaser.name AS released_by_name
+        FROM logistics_legal_holds hold
+        LEFT JOIN inventory_user_profiles placer ON placer.id::text=hold.placed_by::text
+        LEFT JOIN inventory_user_profiles releaser ON releaser.id::text=hold.released_by::text
+        WHERE hold.organization_id=$1 ORDER BY hold.placed_at DESC LIMIT 100`, [logisticsOrganizationId]),
+      pool.query(`SELECT review.*,profile.name AS reviewed_by_name
+        FROM logistics_retention_reviews review
+        LEFT JOIN inventory_user_profiles profile ON profile.id::text=review.reviewed_by::text
+        WHERE review.organization_id=$1 ORDER BY review.reviewed_at DESC LIMIT 30`, [logisticsOrganizationId])
+    ]);
+    return json(res, 200, {
+      policies: policies.rows,
+      holds: holds.rows,
+      reviews: reviews.rows
+    });
+  }
+
+  const retentionPolicyRoute = url.pathname.match(/^\/api\/admin\/retention-policies\/([0-9a-f-]+)$/i);
+  if (retentionPolicyRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede modificar conservación documental." });
+    }
+    try {
+      const body = await readJson(req);
+      const years = Number(body.retentionYears);
+      if (!Number.isInteger(years) || years < 1 || years > 30) {
+        throw new Error("El plazo debe estar entre 1 y 30 años.");
+      }
+      const disposition = String(body.disposition || "REVIEW").toUpperCase();
+      if (!["REVIEW", "ARCHIVE"].includes(disposition)) throw new Error("Disposición documental no permitida.");
+      const policy = (await pool.query(`UPDATE logistics_retention_policies SET
+        retention_years=$1,disposition=$2,legal_basis=$3,active=$4,updated_by=$5,updated_at=NOW()
+        WHERE id=$6 AND organization_id=$7 RETURNING *`, [years, disposition,
+        String(body.legalBasis || "").trim() || null, body.active !== false, apiProfile.id,
+        retentionPolicyRoute[1], logisticsOrganizationId])).rows[0];
+      if (!policy) throw new Error("Política de conservación no encontrada.");
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'RETENTION_POLICY_UPDATED','retention_policy',$2,$3,$4,'WEB',$5::jsonb)`,
+      [logisticsOrganizationId, policy.id, apiProfile.id,
+        `retention-policy:${policy.id}:${Date.now()}`, asJson(policy)]);
+      return json(res, 200, { policy });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la política." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/legal-holds" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede crear bloqueos documentales." });
+    }
+    try {
+      const body = await readJson(req);
+      const title = String(body.title || "").trim();
+      const reason = String(body.reason || "").trim();
+      if (title.length < 5 || reason.length < 10) throw new Error("Indica título y fundamento del bloqueo.");
+      const holdNumber = `LH-${new Date().toISOString().replace(/\D/g, "").slice(0, 17)}`;
+      const hold = (await pool.query(`INSERT INTO logistics_legal_holds
+        (organization_id,hold_number,title,reason,document_type,entity_type,entity_id,placed_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`, [logisticsOrganizationId,
+        holdNumber, title, reason, String(body.documentType || "").trim() || null,
+        String(body.entityType || "").trim() || null, String(body.entityId || "").trim() || null,
+        apiProfile.id])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'LEGAL_HOLD_PLACED','legal_hold',$2,$3,$4,'WEB',$5::jsonb)`,
+      [logisticsOrganizationId, hold.id, apiProfile.id, `legal-hold:${hold.id}`, asJson(hold)]);
+      return json(res, 201, { hold });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear el bloqueo documental." });
+    }
+  }
+
+  const legalHoldRoute = url.pathname.match(/^\/api\/admin\/legal-holds\/([0-9a-f-]+)$/i);
+  if (legalHoldRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede liberar bloqueos." });
+    try {
+      const body = await readJson(req);
+      const reason = String(body.reason || "").trim();
+      if (reason.length < 10) throw new Error("Indica el fundamento para liberar el bloqueo.");
+      const hold = (await pool.query(`UPDATE logistics_legal_holds SET status='RELEASED',
+        released_by=$1,released_at=NOW(),release_reason=$2,updated_at=NOW()
+        WHERE id=$3 AND organization_id=$4 AND status='ACTIVE' RETURNING *`,
+      [apiProfile.id, reason, legalHoldRoute[1], logisticsOrganizationId])).rows[0];
+      if (!hold) throw new Error("El bloqueo no existe o ya fue liberado.");
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'LEGAL_HOLD_RELEASED','legal_hold',$2,$3,$4,'WEB',$5::jsonb)`,
+      [logisticsOrganizationId, hold.id, apiProfile.id,
+        `legal-hold:${hold.id}:released`, asJson(hold)]);
+      return json(res, 200, { hold });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo liberar el bloqueo." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/retention-reviews" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede revisar conservación documental." });
+    }
+    try {
+      const result = await pool.query(`WITH candidates AS (
+          SELECT document.id,document.document_type,policy.retention_years
+          FROM logistics_documents document
+          JOIN logistics_retention_policies policy
+            ON policy.organization_id=document.organization_id
+           AND policy.document_type=document.document_type AND policy.active=TRUE
+          WHERE document.organization_id=$1
+            AND document.created_at<NOW()-(policy.retention_years::text||' years')::interval
+        ), classified AS (
+          SELECT candidate.*,
+            EXISTS (SELECT 1 FROM logistics_legal_holds hold
+              WHERE hold.organization_id=$1 AND hold.status='ACTIVE'
+                AND (hold.document_type IS NULL OR hold.document_type=candidate.document_type))
+              AS protected
+          FROM candidates candidate
+        )
+        SELECT COUNT(*)::int AS candidate_count,
+          COUNT(*) FILTER (WHERE protected)::int AS protected_count,
+          COALESCE(jsonb_object_agg(document_type,type_count)
+            FILTER (WHERE document_type IS NOT NULL),'{}'::jsonb) AS by_type
+        FROM (SELECT document_type,protected,COUNT(*) OVER (PARTITION BY document_type)::int AS type_count
+          FROM classified) summary`, [logisticsOrganizationId]);
+      const summary = result.rows[0] || { candidate_count: 0, protected_count: 0, by_type: {} };
+      const review = (await pool.query(`INSERT INTO logistics_retention_reviews
+        (organization_id,reviewed_by,candidate_count,protected_count,summary,notes)
+        VALUES ($1,$2,$3,$4,$5::jsonb,$6) RETURNING *`, [logisticsOrganizationId,
+        apiProfile.id, Number(summary.candidate_count || 0), Number(summary.protected_count || 0),
+        asJson(summary), "Revisión informativa; no elimina archivos automáticamente."])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'RETENTION_REVIEW_COMPLETED','retention_review',$2,$3,$4,'SYSTEM',$5::jsonb)`,
+      [logisticsOrganizationId, review.id, apiProfile.id,
+        `retention-review:${review.id}`, asJson(review)]);
+      return json(res, 200, { review });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo revisar la conservación documental." });
     }
   }
 
