@@ -1152,7 +1152,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("043_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("044_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -1713,9 +1713,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("043_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("044_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("043_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("044_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4373,6 +4373,125 @@ const server = http.createServer(async (req, res) => {
       return res.end(backup.body);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo exportar el libro mayor V2." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/recovery-drills" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede consultar pruebas de recuperación." });
+    }
+    const result = await pool.query(`SELECT drill.*,manifest.payload_sha256,
+        owner.name AS owner_name,reviewer.name AS reviewer_name
+      FROM logistics_recovery_drills drill
+      LEFT JOIN logistics_backup_manifests manifest ON manifest.id=drill.backup_manifest_id
+      LEFT JOIN inventory_user_profiles owner ON owner.id::text=drill.owner_profile_id::text
+      LEFT JOIN inventory_user_profiles reviewer ON reviewer.id::text=drill.reviewed_by::text
+      WHERE drill.organization_id=$1
+      ORDER BY drill.planned_at DESC,drill.created_at DESC LIMIT 100`, [logisticsOrganizationId]);
+    return json(res, 200, { drills: result.rows });
+  }
+
+  if (url.pathname === "/api/admin/recovery-drills" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede programar pruebas de recuperación." });
+    }
+    try {
+      const body = await readJson(req);
+      const drillType = String(body.drillType || "EXPORT_VERIFY").toUpperCase();
+      if (!["TABLETOP", "EXPORT_VERIFY", "ISOLATED_RESTORE"].includes(drillType)) {
+        throw new Error("Tipo de prueba de recuperación no permitido.");
+      }
+      const targetRpo = Number(body.targetRpoMinutes || 1440);
+      const targetRto = Number(body.targetRtoMinutes || 240);
+      if (!Number.isInteger(targetRpo) || targetRpo <= 0 || !Number.isInteger(targetRto) || targetRto <= 0) {
+        throw new Error("Los objetivos RPO y RTO deben expresarse en minutos positivos.");
+      }
+      const scope = String(body.scope || "").trim();
+      if (scope.length < 10) throw new Error("Describe el alcance de la prueba.");
+      const latestManifest = (await pool.query(`SELECT id FROM logistics_backup_manifests
+        WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 1`, [logisticsOrganizationId])).rows[0];
+      const drillNumber = `DR-${new Date().toISOString().replace(/\D/g, "").slice(0, 17)}`;
+      const checklist = [
+        { code: "BACKUP_IDENTIFIED", label: "Respaldo y punto de recuperación identificados", status: "PENDING" },
+        { code: "INTEGRITY_VERIFIED", label: "Integridad SHA-256 verificada", status: "PENDING" },
+        { code: "DATA_VALIDATED", label: "Catálogo, saldos, movimientos y auditoría validados", status: "PENDING" },
+        { code: "ACCESS_VALIDATED", label: "Acceso y permisos validados en ambiente aislado", status: "PENDING" }
+      ];
+      const drill = (await pool.query(`INSERT INTO logistics_recovery_drills
+        (organization_id,drill_number,drill_type,environment,backup_manifest_id,
+         target_rpo_minutes,target_rto_minutes,scope,checklist,owner_profile_id,planned_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,COALESCE($11::timestamptz,NOW()))
+        RETURNING *`, [logisticsOrganizationId, drillNumber, drillType,
+        String(body.environment || "isolated"), body.backupManifestId || latestManifest?.id || null,
+        targetRpo, targetRto, scope, asJson(checklist), apiProfile.id, body.plannedAt || null])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'RECOVERY_DRILL_PLANNED','recovery_drill',$2,$3,$4,'WEB',$5::jsonb)`,
+      [logisticsOrganizationId, drill.id, apiProfile.id, `recovery-drill:${drill.id}`, asJson(drill)]);
+      return json(res, 201, { drill });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo programar la prueba de recuperación." });
+    }
+  }
+
+  const recoveryDrillRoute = url.pathname.match(/^\/api\/admin\/recovery-drills\/([0-9a-f-]+)$/i);
+  if (recoveryDrillRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede actualizar pruebas de recuperación." });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const before = (await client.query(`SELECT * FROM logistics_recovery_drills
+        WHERE id=$1 AND organization_id=$2 FOR UPDATE`,
+      [recoveryDrillRoute[1], logisticsOrganizationId])).rows[0];
+      if (!before) throw new Error("Prueba de recuperación no encontrada.");
+      let drill;
+      if (action === "START") {
+        if (before.status !== "PLANNED") throw new Error("Sólo una prueba planificada puede iniciarse.");
+        drill = (await client.query(`UPDATE logistics_recovery_drills SET
+          status='IN_PROGRESS',started_at=NOW(),updated_at=NOW() WHERE id=$1 RETURNING *`,
+        [before.id])).rows[0];
+      } else if (action === "COMPLETE") {
+        if (!["PLANNED", "IN_PROGRESS"].includes(before.status)) throw new Error("La prueba ya está cerrada.");
+        const result = String(body.result || "").toUpperCase();
+        if (!["PASSED", "FAILED"].includes(result)) throw new Error("Indica si la prueba fue aprobada o fallida.");
+        const measuredRpo = Number(body.measuredRpoMinutes);
+        const measuredRto = Number(body.measuredRtoMinutes);
+        if (!Number.isInteger(measuredRpo) || measuredRpo < 0 || !Number.isInteger(measuredRto) || measuredRto < 0) {
+          throw new Error("Registra los tiempos RPO y RTO medidos.");
+        }
+        const findings = String(body.findings || "").trim();
+        const correctiveActions = String(body.correctiveActions || "").trim();
+        if (result === "FAILED" && (findings.length < 10 || correctiveActions.length < 10)) {
+          throw new Error("Una prueba fallida requiere hallazgos y acciones correctivas.");
+        }
+        const checklist = Array.isArray(body.checklist) ? body.checklist : before.checklist;
+        drill = (await client.query(`UPDATE logistics_recovery_drills SET
+          status=$2,measured_rpo_minutes=$3,measured_rto_minutes=$4,checklist=$5::jsonb,
+          findings=$6,corrective_actions=$7,evidence_file_id=$8,reviewed_by=$9,
+          completed_at=NOW(),reviewed_at=NOW(),updated_at=NOW()
+          WHERE id=$1 RETURNING *`, [before.id, result, measuredRpo, measuredRto,
+          asJson(checklist), findings || null, correctiveActions || null,
+          body.evidenceFileId || null, apiProfile.id])).rows[0];
+      } else {
+        throw new Error("Acción de recuperación no permitida.");
+      }
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,
+         source,before_data,after_data)
+        VALUES ($1,$2,'recovery_drill',$3,$4,$5,'WEB',$6::jsonb,$7::jsonb)`,
+      [logisticsOrganizationId, `RECOVERY_DRILL_${action}`, before.id, apiProfile.id,
+        `recovery-drill:${before.id}:${action}`, asJson(before), asJson(drill)]);
+      await client.query("COMMIT");
+      return json(res, 200, { drill });
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch {}
+      return json(res, 400, { error: error.message || "No se pudo actualizar la prueba de recuperación." });
+    } finally {
+      client.release();
     }
   }
 
