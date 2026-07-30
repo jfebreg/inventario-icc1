@@ -1079,6 +1079,185 @@ async function updateOperationalIncident(profile, incidentId, body) {
   }
 }
 
+function runtimeReleaseMetadata(latestMigration = "") {
+  const commit = String(process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "local").trim();
+  return {
+    releaseKey: `${commit}:${latestMigration || "no-migration"}`,
+    versionLabel: process.env.APP_VERSION || "1.1.0",
+    commitSha: commit,
+    serviceId: process.env.RENDER_SERVICE_ID || "",
+    environment: process.env.RENDER ? "production" : (process.env.NODE_ENV || "development"),
+    latestMigration,
+    metadata: {
+      instanceId: process.env.RENDER_INSTANCE_ID || "",
+      serviceName: process.env.RENDER_SERVICE_NAME || "inventario-icc1"
+    }
+  };
+}
+
+async function registerCurrentRelease() {
+  const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
+    ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
+  const meta = runtimeReleaseMetadata(latestMigration);
+  const result = await pool.query(`INSERT INTO logistics_release_records
+    (organization_id,release_key,version_label,commit_sha,service_id,environment,
+     latest_migration,metadata)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+    ON CONFLICT (organization_id,release_key) DO UPDATE SET
+      service_id=EXCLUDED.service_id,environment=EXCLUDED.environment,
+      metadata=EXCLUDED.metadata,updated_at=NOW()
+    RETURNING *,(xmax=0) AS created`,
+  [logisticsOrganizationId, meta.releaseKey, meta.versionLabel, meta.commitSha,
+    meta.serviceId, meta.environment, meta.latestMigration, asJson(meta.metadata)]);
+  const release = result.rows[0];
+  if (release.created) {
+    await pool.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,source,after_data)
+      VALUES ($1,'RELEASE_DEPLOYED','release',$2,'SYSTEM',$3::jsonb)`,
+    [logisticsOrganizationId, release.id, asJson(release)]);
+  }
+  return release;
+}
+
+async function releasesOverview() {
+  const current = await registerCurrentRelease();
+  const releases = await pool.query(`SELECT release.*,
+      approver.name AS approved_by_name,
+      COALESCE(checks.total,0)::int AS check_count,
+      COALESCE(checks.failures,0)::int AS failed_checks
+    FROM logistics_release_records release
+    LEFT JOIN inventory_user_profiles approver ON approver.id=release.approved_by
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE mandatory=TRUE AND status<>'PASS') AS failures
+      FROM logistics_release_checks WHERE release_id=release.id
+    ) checks ON TRUE
+    WHERE release.organization_id=$1 ORDER BY release.deployed_at DESC LIMIT 20`,
+  [logisticsOrganizationId]);
+  const checks = await pool.query(`SELECT DISTINCT ON (check_code) *
+    FROM logistics_release_checks WHERE release_id=$1
+    ORDER BY check_code,measured_at DESC`, [current.id]);
+  return { current, releases: releases.rows, checks: checks.rows };
+}
+
+async function validateRelease(releaseId, actorProfileId) {
+  const release = (await pool.query(`SELECT * FROM logistics_release_records
+    WHERE id=$1 AND organization_id=$2`, [releaseId, logisticsOrganizationId])).rows[0];
+  if (!release) throw new Error("Versión inexistente.");
+  const checks = [];
+  const add = (checkCode, status, detail, mandatory = true) =>
+    checks.push({ checkCode, status, detail, mandatory });
+  const dbStarted = Date.now();
+  await pool.query("SELECT 1");
+  add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
+  const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
+    ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
+  add("MIGRATIONS", latestMigration.startsWith("043_") ? "PASS" : "FAIL",
+    `Última migración: ${latestMigration || "ninguna"}.`);
+  const audit = await pool.query(`SELECT COUNT(*)::int AS errors
+    FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
+  add("AUDIT_CHAIN", Number(audit.rows[0]?.errors || 0) ? "FAIL" : "PASS",
+    Number(audit.rows[0]?.errors || 0) ? `${audit.rows[0].errors} diferencia(s).` : "Cadena íntegra.");
+  add("AUTH", authConfigured() ? "PASS" : "FAIL",
+    authConfigured() ? "Supabase Auth configurado." : "Variables de acceso incompletas.");
+  add("STORAGE", storageConfigured() ? "PASS" : "FAIL",
+    storageConfigured() ? "Supabase Storage configurado." : "Variables de archivos incompletas.");
+  const health = (await pool.query(`SELECT overall_status,checked_at FROM logistics_health_runs
+    WHERE organization_id=$1 ORDER BY checked_at DESC LIMIT 1`, [logisticsOrganizationId])).rows[0];
+  const healthCurrent = health && Date.now() - new Date(health.checked_at).getTime() < 15 * 60_000;
+  add("CONTINUITY", healthCurrent && health.overall_status !== "DOWN" ? "PASS" : "FAIL",
+    !health ? "Sin diagnóstico operacional." : `${health.overall_status} · ${health.checked_at}.`);
+  const outbox = await pool.query(`SELECT COUNT(*)::int AS dead FROM logistics_outbox_events
+    WHERE organization_id=$1 AND status='DEAD_LETTER'`, [logisticsOrganizationId]);
+  add("OUTBOX", Number(outbox.rows[0]?.dead || 0) ? "FAIL" : "PASS",
+    `${Number(outbox.rows[0]?.dead || 0)} evento(s) descartado(s).`);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const check of checks) {
+      await client.query(`INSERT INTO logistics_release_checks
+        (organization_id,release_id,check_code,mandatory,status,detail,measured_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [logisticsOrganizationId, releaseId, check.checkCode, check.mandatory,
+        check.status, check.detail, actorProfileId]);
+    }
+    const mandatoryFailures = checks.filter(check => check.mandatory && check.status !== "PASS");
+    await client.query(`UPDATE logistics_release_records SET status=$1,
+      validated_at=NOW(),latest_migration=$2,updated_at=NOW() WHERE id=$3`,
+    [mandatoryFailures.length ? "FAILED" : "VALIDATING", latestMigration, releaseId]);
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+      VALUES ($1,'RELEASE_VALIDATED','release',$2,$3,'WEB',$4::jsonb)`,
+    [logisticsOrganizationId, releaseId, actorProfileId,
+      asJson({ checks, mandatoryFailures: mandatoryFailures.length })]);
+    await client.query("COMMIT");
+    return { checks, mandatoryFailures: mandatoryFailures.length };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function changeReleaseStatus(releaseId, action, actorProfileId, reason = "") {
+  const normalized = String(action || "").toUpperCase();
+  const release = (await pool.query(`SELECT * FROM logistics_release_records
+    WHERE id=$1 AND organization_id=$2`, [releaseId, logisticsOrganizationId])).rows[0];
+  if (!release) throw new Error("Versión inexistente.");
+  if (normalized === "APPROVE") {
+    const latest = await pool.query(`SELECT DISTINCT ON (check_code)
+      check_code,mandatory,status FROM logistics_release_checks
+      WHERE release_id=$1 ORDER BY check_code,measured_at DESC`, [releaseId]);
+    const required = ["DATABASE", "MIGRATIONS", "AUDIT_CHAIN", "AUTH", "STORAGE", "CONTINUITY", "OUTBOX"];
+    const byCode = new Map(latest.rows.map(row => [row.check_code, row]));
+    const mandatoryFailures = required.filter(code => !byCode.has(code) ||
+      byCode.get(code).status !== "PASS");
+    if (mandatoryFailures.length) {
+      throw new Error("No puedes aprobar una versión con controles obligatorios pendientes.");
+    }
+  } else if (normalized === "ROLLBACK") {
+    if (String(reason || "").trim().length < 10) {
+      throw new Error("La reversa requiere un fundamento de al menos 10 caracteres.");
+    }
+  } else {
+    throw new Error("Acción de versión inválida.");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (normalized === "APPROVE") {
+      await client.query(`UPDATE logistics_release_records SET status='DEPLOYED',
+        updated_at=NOW() WHERE organization_id=$1 AND status='APPROVED' AND id<>$2`,
+      [logisticsOrganizationId, releaseId]);
+    }
+    const nextStatus = normalized === "APPROVE" ? "APPROVED" : "ROLLED_BACK";
+    const updated = (await client.query(`UPDATE logistics_release_records SET status=$1,
+      approved_at=CASE WHEN $1='APPROVED' THEN NOW() ELSE approved_at END,
+      approved_by=CASE WHEN $1='APPROVED' THEN $2 ELSE approved_by END,
+      rollback_reason=CASE WHEN $1='ROLLED_BACK' THEN $3 ELSE rollback_reason END,
+      updated_at=NOW() WHERE id=$4 RETURNING *`,
+    [nextStatus, actorProfileId, String(reason || "").trim(), releaseId])).rows[0];
+    const eventType = normalized === "APPROVE" ? "RELEASE_APPROVED" : "RELEASE_ROLLED_BACK";
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,before_data,after_data)
+      VALUES ($1,$2,'release',$3,$4,'WEB',$5::jsonb,$6::jsonb)`,
+    [logisticsOrganizationId, eventType, releaseId, actorProfileId, asJson(release), asJson(updated)]);
+    await client.query(`INSERT INTO logistics_outbox_events
+      (organization_id,event_type,aggregate_type,aggregate_id,payload,status,available_at)
+      VALUES ($1,$2,'release',$3,$4::jsonb,'PENDING',NOW())`,
+    [logisticsOrganizationId, eventType, releaseId,
+      asJson({ releaseId, commitSha: release.commit_sha, reason })]);
+    await client.query("COMMIT");
+    return updated;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function profileMayAccessLocation(profile, locationId) {
   if (!profile || !locationId) return false;
   if (profile.admin) return true;
@@ -1534,9 +1713,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("042_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("043_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("042_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("043_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1679,6 +1858,17 @@ async function productionReadiness() {
       : `${Number(continuity.rows[0]?.open || 0)} incidente(s) abierto(s); último control hace ${Math.floor(healthAge)} minuto(s).`,
   continuityFailed || healthAge > 15 || !lastHealth
     ? "Abrir Configuración y revisar Continuidad operacional." : "");
+
+  const runtimeRelease = runtimeReleaseMetadata(latestMigration);
+  const release = (await pool.query(`SELECT status,validated_at,approved_at,commit_sha
+    FROM logistics_release_records WHERE organization_id=$1 AND release_key=$2`,
+  [logisticsOrganizationId, runtimeRelease.releaseKey])).rows[0];
+  add("release", "Versión publicada", release?.status === "APPROVED" ? "PASS"
+    : release?.status === "FAILED" || release?.status === "ROLLED_BACK" ? "FAIL" : "WARN",
+  !release ? "La versión activa aún no está registrada."
+    : `${String(release.commit_sha || "").slice(0, 10)} · ${release.status}.`,
+  release?.status === "APPROVED" ? ""
+    : "Abrir Configuración, validar la versión y aprobarla después de las pruebas.");
 
   const cutover = await getCutoverStatus(pool, logisticsOrganizationId);
   const canonicalPrimary = cutover.control?.mode === "CANONICAL_PRIMARY";
@@ -2047,6 +2237,7 @@ async function setupDatabase() {
     logisticsStartup = await backfillLegacyState(pool);
     logisticsOrganizationId = logisticsStartup.organizationId || logisticsOrganizationId;
     logisticsReady = true;
+    await registerCurrentRelease();
   } catch (error) {
     console.error("Base de datos no disponible al iniciar; la app seguirá funcionando en modo temporal.", error.message);
   }
@@ -3104,6 +3295,44 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar el incidente." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/releases" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede consultar versiones." });
+    }
+    try {
+      return json(res, 200, await releasesOverview());
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar las versiones." });
+    }
+  }
+
+  const releaseRoute = url.pathname.match(/^\/api\/v1\/releases\/([^/]+)$/);
+  if (releaseRoute && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede validar versiones." });
+    }
+    try {
+      return json(res, 200, await validateRelease(releaseRoute[1], apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo validar la versión." });
+    }
+  }
+
+  if (releaseRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede aprobar o revertir versiones." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, {
+        release: await changeReleaseStatus(releaseRoute[1], body.action,
+          apiProfile.id, body.reason)
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la versión." });
     }
   }
 

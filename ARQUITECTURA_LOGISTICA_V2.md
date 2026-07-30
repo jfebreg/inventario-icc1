@@ -226,3 +226,17 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   con los controles automáticos anteriores.
 - El historial permite demostrar continuidad, tiempos de respuesta y aprendizaje
   frente a fallas sin depender únicamente de los registros temporales de Render.
+
+## Gobierno de versiones y despliegues
+
+- Cada publicación registra el commit de GitHub, servicio Render, migración más reciente,
+  ambiente, fecha y estado de aprobación.
+- El despliegue ejecuta verificaciones obligatorias de base de datos, migraciones,
+  auditoría, autenticación, almacenamiento y continuidad.
+- Una versión no puede aprobarse mientras exista un control obligatorio fallido.
+- Aprobar una nueva versión reemplaza formalmente la aprobación anterior, pero no elimina
+  su historial ni sus verificaciones.
+- Registrar una reversa exige fundamento y conserva el commit afectado; la ejecución
+  material de la reversa se realiza mediante Render o GitHub.
+- El panel administrativo muestra qué versión está operando y evita confundir código
+  desplegado con código formalmente validado para producción.
