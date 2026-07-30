@@ -178,3 +178,13 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Un identificador activo no puede pertenecer a dos artículos de la misma organización.
 - Cambiar el código de una presentación desactiva el anterior para evitar lecturas ambiguas.
 - Los códigos internos alfanuméricos continúan disponibles para etiquetas propias de ICC.
+
+## Corte controlado a fuente canónica
+
+- El inventario permanece en escritura paralela mientras se compara el respaldo con el libro mayor.
+- La activación exige tres conciliaciones limpias consecutivas, cadena de auditoría íntegra,
+  ausencia de eventos descartados y ningún ajuste pendiente de aprobación.
+- Cualquier falla reinicia el contador para impedir un corte basado en una comprobación aislada.
+- La activación y toda reversa quedan registradas en auditoría y en la cola transaccional.
+- Una reversa requiere motivo y vuelve a escritura paralela; nunca elimina movimientos canónicos.
+- El respaldo heredado permanece disponible para consulta y recuperación durante la estabilización.

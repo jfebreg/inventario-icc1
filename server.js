@@ -27,6 +27,7 @@ import {
   createTransfer,
   dispatchTransfer,
   ensureDefaultOrganization,
+  getCutoverStatus,
   listCanonicalItems,
   listAssetCompliance,
   listAssetDisposals,
@@ -57,6 +58,7 @@ import {
   registerCanonicalDocument,
   registerCanonicalItem,
   reconcileLegacyState,
+  assessCutoverReadiness,
   receiveTransfer,
   receiveLot,
   registerStorageLocation,
@@ -101,6 +103,7 @@ import {
   upsertSupplierItem,
   upsertKpiTarget,
   updateScheduledLogisticsJob,
+  updateCutoverMode,
   retryOutboxEvent
 } from "./lib/logistics.js";
 
@@ -1060,9 +1063,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("038_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("039_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("038_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("039_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1154,6 +1157,13 @@ async function productionReadiness() {
       : `${Number(outbox.summary?.pending || 0)} pendiente(s); ${Number(outbox.summary?.published_24h || 0)} publicados en 24 horas.`,
     deadLetters || oldestPendingAge > 15
       ? "Abrir Configuracion, revisar Cola de eventos y ejecutar la recuperacion." : "");
+
+  const cutover = await getCutoverStatus(pool, logisticsOrganizationId);
+  const canonicalPrimary = cutover.control?.mode === "CANONICAL_PRIMARY";
+  add("cutover", "Fuente oficial de inventario", canonicalPrimary ? "PASS" : "WARN",
+    canonicalPrimary ? "El libro mayor canónico es la fuente oficial."
+      : `${Number(cutover.control?.consecutive_clean_reconciliations || 0)} de ${Number(cutover.control?.required_clean_reconciliations || 3)} verificaciones limpias.`,
+    canonicalPrimary ? "" : "Completar las verificaciones desde Configuración antes de activar el corte.");
 
   const overall = checks.some(check => check.status === "FAIL") ? "NOT_READY"
     : checks.some(check => check.status === "WARN") ? "DEGRADED" : "READY";
@@ -1802,7 +1812,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
         replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryAccuracy, catalogQuality, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
-        warehouseDirectory, workers, reconciliation] = await Promise.all([
+        warehouseDirectory, workers, reconciliation, cutover] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
         listWarehouses(pool, dashboardProfile),
@@ -1838,7 +1848,8 @@ const server = http.createServer(async (req, res) => {
         pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
           ${dashboardProfile.admin ? "" : "WHERE cost_center=$1"}
           ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows),
-        dashboardProfile.admin ? reconcileLegacyState(pool) : Promise.resolve(null)
+        dashboardProfile.admin ? reconcileLegacyState(pool) : Promise.resolve(null),
+        dashboardProfile.admin ? getCutoverStatus(pool, logisticsOrganizationId) : Promise.resolve(null)
       ]);
       return json(res, 200, {
         ok: true,
@@ -1875,7 +1886,8 @@ const server = http.createServer(async (req, res) => {
         outboxHealth,
         warehouseDirectory,
         workers,
-        reconciliation
+        reconciliation,
+        cutover
       });
     } catch (error) {
       return json(res, 500, { error: error.message || "No se pudo preparar el panel logistico." });
@@ -2449,6 +2461,42 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await reconcileLegacyState(pool));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo conciliar el inventario." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/cutover" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede gestionar el corte de datos." });
+    }
+    try {
+      return json(res, 200, await getCutoverStatus(pool, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo revisar el corte de datos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/cutover/assess" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede gestionar el corte de datos." });
+    }
+    try {
+      return json(res, 200, await assessCutoverReadiness(pool,
+        logisticsOrganizationId, apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo verificar el corte de datos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/cutover" && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede gestionar el corte de datos." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, await updateCutoverMode(pool, logisticsOrganizationId,
+        body.mode, apiProfile.id, body.reason));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo cambiar la fuente oficial." });
     }
   }
 
