@@ -240,3 +240,18 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   material de la reversa se realiza mediante Render o GitHub.
 - El panel administrativo muestra qué versión está operando y evita confundir código
   desplegado con código formalmente validado para producción.
+
+## Gobierno de datos personales
+
+- El sistema mantiene un registro de los tratamientos que utilizan identificación,
+  datos de contacto, cargo, centro de costo y firmas de trabajadores.
+- Las solicitudes de acceso, corrección, restricción u oposición conservan número,
+  plazo, responsable, verificación de identidad, respuesta y estado.
+- Antes de entregar información personal se exige registrar el medio utilizado para
+  verificar la identidad del titular.
+- Los accesos administrativos quedan en un registro inalterable con usuario, fecha,
+  propósito y categoría consultada.
+- Una solicitud de privacidad no elimina movimientos, inspecciones, firmas ni otros
+  documentos sujetos a conservación legal o contractual.
+- Las tablas permanecen protegidas por RLS y sólo el servidor con perfil administrador
+  puede tramitar solicitudes o consultar la trazabilidad completa.

@@ -1152,7 +1152,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("045_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("046_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -1713,9 +1713,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("045_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("046_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("045_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("046_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4523,6 +4523,147 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { review });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo revisar la conservación documental." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/privacy-governance" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede consultar datos personales." });
+    }
+    const [activities, requests, accessLog] = await Promise.all([
+      pool.query(`SELECT * FROM logistics_privacy_activities
+        WHERE organization_id=$1 ORDER BY activity_code`, [logisticsOrganizationId]),
+      pool.query(`SELECT request.*,assignee.name AS assigned_to_name,
+          creator.name AS created_by_name,updater.name AS updated_by_name
+        FROM logistics_data_subject_requests request
+        LEFT JOIN inventory_user_profiles assignee
+          ON assignee.id::text=request.assigned_to::text
+        LEFT JOIN inventory_user_profiles creator
+          ON creator.id::text=request.created_by::text
+        LEFT JOIN inventory_user_profiles updater
+          ON updater.id::text=request.updated_by::text
+        WHERE request.organization_id=$1
+        ORDER BY request.received_at DESC LIMIT 100`, [logisticsOrganizationId]),
+      pool.query(`SELECT access.id,access.purpose,access.data_category,
+          access.subject_reference,access.entity_type,access.entity_id,
+          access.accessed_at,profile.name AS actor_name
+        FROM logistics_personal_data_access_log access
+        LEFT JOIN inventory_user_profiles profile
+          ON profile.id::text=access.actor_profile_id::text
+        WHERE access.organization_id=$1
+        ORDER BY access.accessed_at DESC LIMIT 50`, [logisticsOrganizationId])
+    ]);
+    await pool.query(`INSERT INTO logistics_personal_data_access_log
+      (organization_id,actor_profile_id,purpose,data_category,metadata)
+      VALUES ($1,$2,'Administración y revisión de cumplimiento','GOVERNANCE',$3::jsonb)`,
+    [logisticsOrganizationId, apiProfile.id,
+      asJson({ requestCount: requests.rowCount, activityCount: activities.rowCount })]);
+    return json(res, 200, {
+      activities: activities.rows,
+      requests: requests.rows,
+      accessLog: accessLog.rows
+    });
+  }
+
+  if (url.pathname === "/api/admin/data-subject-requests" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede registrar solicitudes de titulares." });
+    }
+    try {
+      const body = await readJson(req);
+      const requestType = String(body.requestType || "").toUpperCase();
+      if (!["ACCESS", "CORRECTION", "RESTRICTION", "OBJECTION"].includes(requestType)) {
+        throw new Error("Tipo de solicitud no permitido.");
+      }
+      const subjectName = String(body.subjectName || "").trim();
+      const scope = String(body.requestedScope || "").trim();
+      if (subjectName.length < 3 || scope.length < 10) {
+        throw new Error("Indica el titular y el alcance de su solicitud.");
+      }
+      const dueDays = Number(body.dueDays || 20);
+      if (!Number.isInteger(dueDays) || dueDays < 1 || dueDays > 90) {
+        throw new Error("El plazo interno debe estar entre 1 y 90 días.");
+      }
+      const requestNumber = `DSR-${new Date().toISOString().replace(/\D/g, "").slice(0, 17)}`;
+      const request = (await pool.query(`INSERT INTO logistics_data_subject_requests
+        (organization_id,request_number,request_type,subject_name,subject_identifier,
+         subject_email,due_at,assigned_to,requested_scope,created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,NOW()+($7::text||' days')::interval,$8,$9,$8)
+        RETURNING *`, [logisticsOrganizationId, requestNumber, requestType, subjectName,
+        String(body.subjectIdentifier || "").trim() || null,
+        String(body.subjectEmail || "").trim() || null, dueDays, apiProfile.id, scope])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,after_data)
+        VALUES ($1,'DATA_SUBJECT_REQUEST_RECEIVED','data_subject_request',$2,$3,$4,'WEB',$5::jsonb)`,
+      [logisticsOrganizationId, request.id, apiProfile.id,
+        `data-subject-request:${request.id}`, asJson({
+          id: request.id,
+          request_number: request.request_number,
+          request_type: request.request_type,
+          status: request.status,
+          due_at: request.due_at
+        })]);
+      return json(res, 201, { request });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar la solicitud." });
+    }
+  }
+
+  const dataSubjectRoute = url.pathname.match(
+    /^\/api\/admin\/data-subject-requests\/([0-9a-f-]+)$/i);
+  if (dataSubjectRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede tramitar solicitudes de titulares." });
+    }
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const current = (await pool.query(`SELECT * FROM logistics_data_subject_requests
+        WHERE id=$1 AND organization_id=$2`, [dataSubjectRoute[1], logisticsOrganizationId])).rows[0];
+      if (!current) throw new Error("Solicitud no encontrada.");
+      if (["COMPLETED", "REJECTED"].includes(current.status)) {
+        throw new Error("La solicitud ya está cerrada y no puede modificarse.");
+      }
+      let status;
+      let verificationMethod = current.verification_method;
+      let responseSummary = current.response_summary;
+      let rejectionReason = current.rejection_reason;
+      if (action === "VERIFY") {
+        verificationMethod = String(body.verificationMethod || "").trim();
+        if (verificationMethod.length < 5) throw new Error("Registra cómo se verificó la identidad.");
+        status = "IN_PROGRESS";
+      } else if (action === "START") {
+        status = current.status === "RECEIVED" ? "VERIFYING" : "IN_PROGRESS";
+      } else if (action === "COMPLETE") {
+        responseSummary = String(body.responseSummary || "").trim();
+        if (!verificationMethod) throw new Error("Verifica la identidad antes de responder.");
+        if (responseSummary.length < 10) throw new Error("Resume la respuesta entregada al titular.");
+        status = "COMPLETED";
+      } else if (action === "REJECT") {
+        rejectionReason = String(body.rejectionReason || "").trim();
+        if (rejectionReason.length < 10) throw new Error("Fundamenta el rechazo.");
+        status = "REJECTED";
+      } else {
+        throw new Error("Acción de solicitud no permitida.");
+      }
+      const request = (await pool.query(`UPDATE logistics_data_subject_requests SET
+        status=$1,verification_method=$2,response_summary=$3,rejection_reason=$4,
+        completed_at=CASE WHEN $1 IN ('COMPLETED','REJECTED') THEN NOW() ELSE NULL END,
+        updated_by=$5,updated_at=NOW()
+        WHERE id=$6 AND organization_id=$7 RETURNING *`, [status, verificationMethod,
+        responseSummary, rejectionReason, apiProfile.id, current.id,
+        logisticsOrganizationId])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,before_data,after_data)
+        VALUES ($1,'DATA_SUBJECT_REQUEST_UPDATED','data_subject_request',$2,$3,$4,
+          'WEB',$5::jsonb,$6::jsonb)`, [logisticsOrganizationId, request.id,
+        apiProfile.id, `data-subject-request:${request.id}:${action}`,
+        asJson({ status: current.status }), asJson({ status: request.status })]);
+      return json(res, 200, { request });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud." });
     }
   }
 
