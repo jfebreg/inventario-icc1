@@ -210,6 +210,14 @@
     if (!["authLoginForm", "authBootstrapForm", "authPasswordForm"].includes(event.target.id)) return;
     event.preventDefault();
     event.stopImmediatePropagation();
+    if (event.target.dataset.submitting === "true") return;
+    event.target.dataset.submitting = "true";
+    const submitButton = event.submitter || event.target.querySelector('button[type="submit"],button:not([type])');
+    const originalButtonText = submitButton?.textContent || "";
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = event.target.id === "authBootstrapForm" ? "Enviando una sola vez…" : "Procesando…";
+    }
     const data = new FormData(event.target);
     try {
       if (event.target.id === "authLoginForm") {
@@ -240,6 +248,12 @@
       }
     } catch (error) {
       window.dispatchEvent(new CustomEvent("icc-auth-error", { detail: error.message || "No se pudo completar el acceso." }));
+    } finally {
+      event.target.dataset.submitting = "false";
+      if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = originalButtonText;
+      }
     }
   }, true);
 

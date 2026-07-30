@@ -594,22 +594,57 @@ async function findAuthUserByEmail(email) {
   return data.users.find(user => String(user.email || "").toLowerCase() === String(email || "").toLowerCase()) || null;
 }
 
+function authEmailCooldownSeconds() {
+  const configured = Number(process.env.AUTH_EMAIL_COOLDOWN_SECONDS || 3600);
+  return Number.isFinite(configured) ? Math.max(60, Math.floor(configured)) : 3600;
+}
+
+function authEmailCooldownRemaining(profile) {
+  if (!profile?.invited_at) return 0;
+  const elapsed = Math.floor((Date.now() - new Date(profile.invited_at).getTime()) / 1000);
+  return Math.max(0, authEmailCooldownSeconds() - elapsed);
+}
+
+function friendlyAuthEmailError(error) {
+  const message = String(error?.message || "");
+  if (error?.status === 429 || /rate.*limit|email.*limit|too many/i.test(message)) {
+    const limited = new Error("Supabase alcanzó el límite de correos. Espera una hora antes de solicitar otro enlace.");
+    limited.code = "AUTH_EMAIL_RATE_LIMIT";
+    limited.status = 429;
+    return limited;
+  }
+  return error;
+}
+
 async function inviteProfile(profile, email) {
+  const remaining = authEmailCooldownRemaining(profile);
+  if (remaining > 0) {
+    const minutes = Math.max(1, Math.ceil(remaining / 60));
+    const error = new Error(`Ya se envió un enlace recientemente. Espera ${minutes} minuto(s) antes de solicitar otro.`);
+    error.code = "AUTH_EMAIL_COOLDOWN";
+    error.status = 429;
+    throw error;
+  }
   const redirectTo = `${String(process.env.APP_BASE_URL || "").replace(/\/+$/, "") || "https://inventario-icc1.onrender.com"}/?auth=invite`;
-  let authUser = await findAuthUserByEmail(email);
-  if (!authUser) {
-    const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-      redirectTo,
-      data: { name: profile.name, legacy_user_id: profile.legacy_user_id }
-    });
-    if (error) throw error;
-    authUser = data.user;
-  } else {
-    const { error } = await supabaseAdmin.auth.resetPasswordForEmail(email, { redirectTo });
-    if (error) throw error;
+  let authUser;
+  try {
+    authUser = await findAuthUserByEmail(email);
+    if (!authUser) {
+      const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+        redirectTo,
+        data: { name: profile.name, legacy_user_id: profile.legacy_user_id }
+      });
+      if (error) throw error;
+      authUser = data.user;
+    } else {
+      const { error } = await supabaseAdmin.auth.resetPasswordForEmail(email, { redirectTo });
+      if (error) throw error;
+    }
+  } catch (error) {
+    throw friendlyAuthEmailError(error);
   }
   await pool.query(`UPDATE inventory_user_profiles SET auth_user_id=$1, email=$2, invitation_status=$3,
-    invited_at=COALESCE(invited_at,NOW()), updated_at=NOW() WHERE id=$4`,
+    invited_at=NOW(), updated_at=NOW() WHERE id=$4`,
     [authUser.id, email, authUser.email_confirmed_at ? "Activo" : "Invitación enviada", profile.id]);
   return authUser;
 }
