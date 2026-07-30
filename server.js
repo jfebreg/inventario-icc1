@@ -2569,6 +2569,18 @@ const server = http.createServer(async (req, res) => {
     if (!profileCan(dashboardProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar el modelo logistico." });
     if (!logisticsReady) return json(res, 503, { error: "El modelo logistico todavia no esta disponible." });
     try {
+      const panelWarnings = [];
+      const panelQuery = async (module, operation, fallback) => {
+        try {
+          return await operation();
+        } catch (error) {
+          panelWarnings.push({
+            module,
+            error: error.message || "No fue posible consultar este módulo."
+          });
+          return fallback;
+        }
+      };
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
         replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryAccuracy, catalogQuality, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
         warehouseDirectory, workers, reconciliation, cutover] = await Promise.all([
@@ -2577,38 +2589,38 @@ const server = http.createServer(async (req, res) => {
         listWarehouses(pool, dashboardProfile),
         stockSnapshot(pool, dashboardProfile, { itemId: "" }),
         listTransfers(pool, dashboardProfile),
-        listCustodyAssignments(pool, dashboardProfile, { status: "active" }),
-        listCycleCounts(pool, dashboardProfile),
-        listSuppliers(pool, logisticsOrganizationId),
-        listSupplierItemCatalog(pool, logisticsOrganizationId),
-        listInboundReceipts(pool, dashboardProfile),
-        listReplenishmentSuggestions(pool, dashboardProfile, logisticsOrganizationId),
-        listPurchaseRequisitions(pool, dashboardProfile),
-        listMaterialRequests(pool, dashboardProfile),
-        listMaintenance(pool, dashboardProfile),
-        listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId),
-        listInventoryAccuracy(pool, dashboardProfile, logisticsOrganizationId, 90),
-        dashboardProfile.admin ? listCatalogDataQuality(pool, logisticsOrganizationId)
+        panelQuery("Custodias", () => listCustodyAssignments(pool, dashboardProfile, { status: "active" }), []),
+        panelQuery("Conteos cíclicos", () => listCycleCounts(pool, dashboardProfile), []),
+        panelQuery("Proveedores", () => listSuppliers(pool, logisticsOrganizationId), []),
+        panelQuery("Catálogo de proveedores", () => listSupplierItemCatalog(pool, logisticsOrganizationId), []),
+        panelQuery("Recepciones", () => listInboundReceipts(pool, dashboardProfile), []),
+        panelQuery("Reposición", () => listReplenishmentSuggestions(pool, dashboardProfile, logisticsOrganizationId), []),
+        panelQuery("Solicitudes de compra", () => listPurchaseRequisitions(pool, dashboardProfile), []),
+        panelQuery("Solicitudes de materiales", () => listMaterialRequests(pool, dashboardProfile), []),
+        panelQuery("Mantenimiento", () => listMaintenance(pool, dashboardProfile), { plans: [], workOrders: [] }),
+        panelQuery("Analítica de inventario", () => listInventoryAnalytics(pool, dashboardProfile, logisticsOrganizationId), { rows: [], summary: {} }),
+        panelQuery("Exactitud de inventario", () => listInventoryAccuracy(pool, dashboardProfile, logisticsOrganizationId, 90), { summary: {}, warehouses: [], causes: [], values: [], trend: [], periodDays: 90 }),
+        dashboardProfile.admin ? panelQuery("Calidad del catálogo", () => listCatalogDataQuality(pool, logisticsOrganizationId), { rows: [], summary: {}, options: {} })
           : Promise.resolve({ rows: [], summary: {} }),
-        listInventoryClassifications(pool, logisticsOrganizationId),
-        listInventoryControls(pool, dashboardProfile, logisticsOrganizationId),
-        listProcurement(pool, dashboardProfile, logisticsOrganizationId),
-        listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId),
-        listAssetFinancials(pool, dashboardProfile, logisticsOrganizationId),
-        listAssetCompliance(pool, dashboardProfile, logisticsOrganizationId),
-        listLogisticsKpis(pool, dashboardProfile, logisticsOrganizationId, 90),
-        dashboardProfile.admin ? listScheduledLogisticsJobs(pool, logisticsOrganizationId) : Promise.resolve([]),
-        dashboardProfile.admin ? listOutboxHealth(pool, logisticsOrganizationId) : Promise.resolve(null),
-        pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
+        panelQuery("Clasificación ABC/XYZ", () => listInventoryClassifications(pool, logisticsOrganizationId), { rows: [], policies: [], summary: {} }),
+        panelQuery("Control de inventario", () => listInventoryControls(pool, dashboardProfile, logisticsOrganizationId), { periods: [], adjustments: [] }),
+        panelQuery("Compras", () => listProcurement(pool, dashboardProfile, logisticsOrganizationId), { settings: null, purchaseOrders: [], supplierInvoices: [], supplierPerformance: [] }),
+        panelQuery("Bajas de activos", () => listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId), []),
+        panelQuery("Registro financiero", () => listAssetFinancials(pool, dashboardProfile, logisticsOrganizationId), { rows: [], totals: {} }),
+        panelQuery("Cumplimiento de activos", () => listAssetCompliance(pool, dashboardProfile, logisticsOrganizationId), { rows: [], summary: {} }),
+        panelQuery("Indicadores logísticos", () => listLogisticsKpis(pool, dashboardProfile, logisticsOrganizationId, 90), { summary: {}, warehouses: [], snapshots: [], periodDays: 90 }),
+        dashboardProfile.admin ? panelQuery("Trabajos programados", () => listScheduledLogisticsJobs(pool, logisticsOrganizationId), []) : Promise.resolve([]),
+        dashboardProfile.admin ? panelQuery("Cola de eventos", () => listOutboxHealth(pool, logisticsOrganizationId), null) : Promise.resolve(null),
+        panelQuery("Directorio de bodegas", () => pool.query(`SELECT warehouse.id,warehouse.name,center.name AS cost_center
           FROM logistics_warehouses warehouse
           LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
           WHERE warehouse.organization_id=$1 AND warehouse.active=TRUE
-          ORDER BY center.name,warehouse.name`, [logisticsOrganizationId]).then(result => result.rows),
-        pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
+          ORDER BY center.name,warehouse.name`, [logisticsOrganizationId]).then(result => result.rows), []),
+        panelQuery("Trabajadores", () => pool.query(`SELECT id,name,rut,email,phone,cost_center,status FROM inventory_worker_enrollments
           ${dashboardProfile.admin ? "" : "WHERE cost_center=$1"}
-          ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows),
-        dashboardProfile.admin ? reconcileLegacyState(pool) : Promise.resolve(null),
-        dashboardProfile.admin ? getCutoverStatus(pool, logisticsOrganizationId) : Promise.resolve(null)
+          ORDER BY cost_center,name`, dashboardProfile.admin ? [] : [dashboardProfile.cost_center]).then(result => result.rows), []),
+        dashboardProfile.admin ? panelQuery("Conciliación", () => reconcileLegacyState(pool), null) : Promise.resolve(null),
+        dashboardProfile.admin ? panelQuery("Corte canónico", () => getCutoverStatus(pool, logisticsOrganizationId), null) : Promise.resolve(null)
       ]);
       return json(res, 200, {
         ok: true,
@@ -2646,7 +2658,8 @@ const server = http.createServer(async (req, res) => {
         warehouseDirectory,
         workers,
         reconciliation,
-        cutover
+        cutover,
+        panelWarnings
       });
     } catch (error) {
       return json(res, 500, { error: error.message || "No se pudo preparar el panel logistico." });
