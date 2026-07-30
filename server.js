@@ -2344,6 +2344,7 @@ const server = http.createServer(async (req, res) => {
       publishableKeyConfigured: Boolean(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY),
       bootstrapTokenConfigured: Boolean(process.env.AUTH_BOOTSTRAP_TOKEN),
       appBaseUrlConfigured: Boolean(process.env.APP_BASE_URL),
+      authIdleMinutes: Math.min(480, Math.max(10, Number(process.env.AUTH_IDLE_MINUTES || 30) || 30)),
       migrationComplete: Boolean(settings.migration_complete),
       bootstrapUsed: Boolean(settings.bootstrap_used),
       appBaseUrl: process.env.APP_BASE_URL || "https://inventario-icc1.onrender.com",

@@ -12,6 +12,10 @@
     tasks: [],
     notifications: [],
     realtimeChannel: null,
+    idleTimer: null,
+    idleWarningTimer: null,
+    lastActivityAt: Date.now(),
+    idleExpiring: false,
     passwordSetup: /(?:\?|&)auth=(?:invite|recovery)/.test(location.search) || /type=(?:invite|recovery)/.test(location.hash),
     onChange: null
   };
@@ -19,6 +23,73 @@
   function esc(value) {
     return String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   }
+
+  function idleMinutes() {
+    const configured = Number(auth.config?.authIdleMinutes || 30);
+    return Math.min(480, Math.max(10, Number.isFinite(configured) ? configured : 30));
+  }
+
+  function clearIdleTimers() {
+    clearTimeout(auth.idleTimer);
+    clearTimeout(auth.idleWarningTimer);
+    auth.idleTimer = null;
+    auth.idleWarningTimer = null;
+  }
+
+  async function expireIdleSession() {
+    if (!auth.session || auth.idleExpiring) return;
+    auth.idleExpiring = true;
+    clearIdleTimers();
+    try {
+      await auth.client?.auth.signOut({ scope: "local" });
+    } finally {
+      auth.session = null;
+      auth.profile = null;
+      auth.idleExpiring = false;
+      await clearRealtime();
+      if (typeof auth.onChange === "function") auth.onChange(null);
+      window.dispatchEvent(new CustomEvent("icc-session-expired", {
+        detail: "La sesión se cerró por inactividad. Ingresa nuevamente."
+      }));
+    }
+  }
+
+  function scheduleIdleTimers(preserveActivity = false) {
+    clearIdleTimers();
+    if (!auth.session) return;
+    if (!preserveActivity) auth.lastActivityAt = Date.now();
+    const timeoutMs = idleMinutes() * 60 * 1000;
+    const remainingMs = timeoutMs - (Date.now() - auth.lastActivityAt);
+    if (remainingMs <= 0) {
+      expireIdleSession();
+      return;
+    }
+    const warningMinutes = Math.min(5, Math.max(1, Math.floor(idleMinutes() / 3)));
+    const warningDelay = remainingMs - warningMinutes * 60 * 1000;
+    if (warningDelay > 0) {
+      auth.idleWarningTimer = setTimeout(() => {
+        window.dispatchEvent(new CustomEvent("icc-session-warning", {
+          detail: `La sesión se cerrará en ${warningMinutes} minuto(s) si no registras actividad.`
+        }));
+      }, warningDelay);
+    }
+    auth.idleTimer = setTimeout(expireIdleSession, remainingMs);
+  }
+
+  function registerUserActivity() {
+    if (!auth.session || auth.idleExpiring) return;
+    const now = Date.now();
+    if (now - auth.lastActivityAt < 1000) return;
+    auth.lastActivityAt = now;
+    scheduleIdleTimers(true);
+  }
+
+  ["pointerdown", "keydown", "touchstart"].forEach(type =>
+    window.addEventListener(type, registerUserActivity, { passive: true })
+  );
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && auth.session) scheduleIdleTimers(true);
+  });
 
   async function apiFetch(input, init = {}) {
     const url = typeof input === "string" ? input : input.url;
@@ -104,6 +175,8 @@
       await loadProfile();
       subscribeRealtime();
     }
+    if (auth.session) scheduleIdleTimers();
+    else clearIdleTimers();
     if (notify && typeof auth.onChange === "function") auth.onChange(appUser());
   }
 
@@ -124,6 +197,7 @@
         if (auth.session && !auth.passwordSetup) {
           await loadProfile();
           subscribeRealtime();
+          scheduleIdleTimers();
         }
         auth.client.auth.onAuthStateChange((_event, session) => {
           setTimeout(() => handleSession(session).catch(error => window.dispatchEvent(new CustomEvent("icc-auth-error", { detail: error.message }))), 0);
@@ -162,6 +236,7 @@
   }
 
   async function logout() {
+    clearIdleTimers();
     if (auth.client) await auth.client.auth.signOut();
     await clearRealtime();
     auth.session = null;
