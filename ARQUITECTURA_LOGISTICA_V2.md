@@ -188,3 +188,13 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - La activación y toda reversa quedan registradas en auditoría y en la cola transaccional.
 - Una reversa requiere motivo y vuelve a escritura paralela; nunca elimina movimientos canónicos.
 - El respaldo heredado permanece disponible para consulta y recuperación durante la estabilización.
+
+## Gobierno de accesos
+
+- Los permisos se asignan mediante una matriz cerrada de roles basada en mínimo privilegio.
+- Inspector, operador de bodega, responsable y aprobador son perfiles independientes.
+- La separación entre operación y aprobación se revisa para cada usuario no administrador.
+- Los permisos desconocidos, invitaciones antiguas y cuentas sin uso generan observaciones.
+- Cada cambio de rol, centro, activación o desactivación incrementa la versión de seguridad.
+- Las revisiones de acceso y los eventos de seguridad son inalterables y quedan vinculados
+  a la auditoría logística.

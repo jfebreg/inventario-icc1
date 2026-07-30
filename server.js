@@ -123,6 +123,16 @@ const initialAdmin = {
   costCenter: "Bodega Central",
   initials: "JF"
 };
+const ROLE_PERMISSIONS = Object.freeze({
+  "Usuario": ["view"],
+  "Inspector": ["view", "inspect"],
+  "Operador de bodega": ["view", "move", "receive", "terrain", "print"],
+  "Responsable centro de costo": ["view", "inspect", "move", "receive", "terrain", "print", "workers"],
+  "Aprobador centro de costo": ["view", "approve", "audit"],
+  "Administrador central": ["view", "inspect", "approve", "move", "receive", "terrain",
+    "print", "workers", "admin", "ai", "audit"]
+});
+const KNOWN_PERMISSIONS = new Set(Object.values(ROLE_PERMISSIONS).flat());
 
 function supabaseBaseUrl() {
   return String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "").replace(/\/rest\/v1$/i, "");
@@ -498,9 +508,14 @@ async function createAuthAndRealtimeTables(client) {
 }
 
 function defaultPermissions(role, admin = false) {
-  if (admin || role === "Administrador central") return ["view", "inspect", "approve", "move", "receive", "terrain", "print", "workers", "admin", "ai", "audit"];
-  if (role === "Responsable centro de costo") return ["view", "inspect", "approve", "move", "receive", "terrain", "print", "workers"];
-  return ["view", "inspect"];
+  if (admin) return [...ROLE_PERMISSIONS["Administrador central"]];
+  return [...(ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.Usuario)];
+}
+
+function normalizedRole(value, fallback = "Usuario") {
+  const role = String(value || fallback).trim();
+  if (!Object.hasOwn(ROLE_PERMISSIONS, role)) throw new Error("Rol de acceso no permitido.");
+  return role;
 }
 
 async function migrateLegacyIdentityData(client) {
@@ -551,7 +566,14 @@ async function requestProfile(req) {
   if (!token) return null;
   const { data, error } = await supabaseAdmin.auth.getUser(token);
   if (error || !data?.user) return null;
-  const result = await pool.query("SELECT * FROM inventory_user_profiles WHERE auth_user_id=$1 AND active=TRUE", [data.user.id]);
+  let result = await pool.query(`UPDATE inventory_user_profiles SET last_seen_at=NOW()
+    WHERE auth_user_id=$1 AND active=TRUE
+      AND (last_seen_at IS NULL OR last_seen_at<NOW()-INTERVAL '15 minutes')
+    RETURNING *`, [data.user.id]);
+  if (!result.rows[0]) {
+    result = await pool.query(`SELECT * FROM inventory_user_profiles
+      WHERE auth_user_id=$1 AND active=TRUE`, [data.user.id]);
+  }
   const profile = result.rows[0];
   return profile ? { ...profile, authUser: data.user } : null;
 }
@@ -594,9 +616,116 @@ async function inviteProfile(profile, email) {
 
 function profileCan(profile, permission) {
   if (!profile) return false;
+  if (!KNOWN_PERMISSIONS.has(permission)) return false;
   if (profile.admin) return true;
   const permissions = Array.isArray(profile.permissions) ? profile.permissions : [];
   return permissions.includes(permission);
+}
+
+async function securityGovernanceOverview() {
+  const [profilesResult, rolesResult, lastReviewResult] = await Promise.all([
+    pool.query(`SELECT id,auth_user_id,name,email,role,cost_center,admin,permissions,
+      active,invitation_status,invited_at,activated_at,last_seen_at,
+      security_version,last_security_change_at
+      FROM inventory_user_profiles ORDER BY admin DESC,name`),
+    pool.query(`SELECT role_code,role_name,permissions,privileged,can_initiate,
+      can_approve,description FROM inventory_role_templates
+      WHERE active=TRUE ORDER BY privileged,role_name`),
+    pool.query(`SELECT * FROM inventory_access_reviews ORDER BY reviewed_at DESC LIMIT 1`)
+  ]);
+  const issues = [];
+  for (const profile of profilesResult.rows) {
+    const permissions = Array.isArray(profile.permissions) ? profile.permissions : [];
+    const unknown = permissions.filter(permission => !KNOWN_PERMISSIONS.has(permission));
+    if (unknown.length) {
+      issues.push({
+        code: "UNKNOWN_PERMISSION",
+        severity: "HIGH",
+        profileId: profile.id,
+        name: profile.name,
+        detail: `Permisos no reconocidos: ${unknown.join(", ")}`
+      });
+    }
+    const initiates = ["move", "receive", "terrain"].some(permission =>
+      permissions.includes(permission));
+    if (!profile.admin && initiates && permissions.includes("approve")) {
+      issues.push({
+        code: "SOD_CONFLICT",
+        severity: "HIGH",
+        profileId: profile.id,
+        name: profile.name,
+        detail: "El perfil puede iniciar y aprobar operaciones."
+      });
+    }
+    const invitationAge = profile.invited_at
+      ? (Date.now() - new Date(profile.invited_at).getTime()) / 86_400_000 : 0;
+    if (profile.active && profile.invitation_status !== "Activo" && invitationAge > 7) {
+      issues.push({
+        code: "STALE_INVITATION",
+        severity: "MEDIUM",
+        profileId: profile.id,
+        name: profile.name,
+        detail: `Invitación pendiente hace ${Math.floor(invitationAge)} días.`
+      });
+    }
+    const inactivityDays = profile.last_seen_at
+      ? (Date.now() - new Date(profile.last_seen_at).getTime()) / 86_400_000 : null;
+    if (profile.active && profile.activated_at && inactivityDays !== null && inactivityDays > 90) {
+      issues.push({
+        code: "INACTIVE_ACCOUNT",
+        severity: "MEDIUM",
+        profileId: profile.id,
+        name: profile.name,
+        detail: `Sin uso hace ${Math.floor(inactivityDays)} días.`
+      });
+    }
+  }
+  return {
+    profiles: profilesResult.rows,
+    roleTemplates: rolesResult.rows,
+    issues,
+    summary: {
+      profiles: profilesResult.rowCount,
+      active: profilesResult.rows.filter(profile => profile.active).length,
+      privileged: profilesResult.rows.filter(profile => profile.admin).length,
+      highRisk: issues.filter(issue => issue.severity === "HIGH").length,
+      observations: issues.length
+    },
+    lastReview: lastReviewResult.rows[0] || null
+  };
+}
+
+async function completeAccessReview(actorProfileId) {
+  const overview = await securityGovernanceOverview();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const review = (await client.query(`INSERT INTO inventory_access_reviews
+      (reviewed_by,status,profile_count,issue_count,findings)
+      VALUES ($1,$2,$3,$4,$5::jsonb) RETURNING *`,
+    [actorProfileId, overview.issues.length ? "REQUIRES_ACTION" : "COMPLETED",
+      overview.summary.profiles, overview.issues.length, asJson(overview.issues)])).rows[0];
+    await client.query(`INSERT INTO inventory_security_events
+      (event_type,actor_profile_id,metadata)
+      VALUES ('ACCESS_REVIEW_COMPLETED',$1,$2::jsonb)`,
+    [actorProfileId, asJson({ reviewId: review.id, summary: overview.summary })]);
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+      VALUES ($1,'ACCESS_REVIEW_COMPLETED','access_review',$2,$3,'WEB',$4::jsonb)`,
+    [logisticsOrganizationId, review.id, actorProfileId, asJson(review)]);
+    await client.query(`INSERT INTO logistics_outbox_events
+      (organization_id,event_type,aggregate_type,aggregate_id,payload,status,available_at)
+      VALUES ($1,'ACCESS_REVIEW_COMPLETED','access_review',$2,$3::jsonb,'PENDING',NOW())`,
+    [logisticsOrganizationId, review.id, asJson({ reviewId: review.id,
+      issueCount: overview.issues.length })]);
+    await client.query("COMMIT");
+    return { ...overview, lastReview: review };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function profileMayAccessWarehouse(profile, warehouseId) {
@@ -1063,14 +1192,25 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("039_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("040_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("039_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("040_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
     authConfigured() ? (settings.migration_complete ? "Activa y migración de acceso finalizada." : "Configurada, pero el acceso seguro no está finalizado.") : "Variables de autenticación incompletas.",
     "Completar SUPABASE_PUBLISHABLE_KEY y activar la cuenta administradora.");
+
+  const accessReview = (await pool.query(`SELECT reviewed_at,issue_count
+    FROM inventory_access_reviews ORDER BY reviewed_at DESC LIMIT 1`)).rows[0];
+  const accessReviewAge = accessReview
+    ? Math.floor((Date.now() - new Date(accessReview.reviewed_at).getTime()) / 86_400_000) : null;
+  add("accessReview", "Revisión de accesos",
+    accessReviewAge === null || accessReviewAge > 90 || Number(accessReview?.issue_count || 0) > 0
+      ? "WARN" : "PASS",
+    accessReviewAge === null ? "Aún no se ha registrado una revisión."
+      : `Última revisión hace ${accessReviewAge} día(s) · ${Number(accessReview.issue_count || 0)} observación(es).`,
+    "Abrir Configuración y registrar la revisión de separación de funciones.");
 
   let storageStatus = "FAIL";
   let storageDetail = "Supabase Storage no está configurado.";
@@ -1645,6 +1785,28 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (url.pathname === "/api/admin/security" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede revisar accesos." });
+    }
+    try {
+      return json(res, 200, await securityGovernanceOverview());
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo revisar la seguridad." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/security/review" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede revisar accesos." });
+    }
+    try {
+      return json(res, 200, await completeAccessReview(apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo cerrar la revisión de accesos." });
+    }
+  }
+
   if (url.pathname === "/api/admin/users" && req.method === "GET") {
     if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede gestionar usuarios." });
     const result = await pool.query(`SELECT id, legacy_user_id, auth_user_id, name, email, initials, role, cost_center, admin, permissions, active, invitation_status, invited_at, activated_at
@@ -1659,17 +1821,22 @@ const server = http.createServer(async (req, res) => {
       const email = String(body.email || "").trim().toLowerCase();
       if (!email || !email.includes("@")) return json(res, 400, { error: "Ingresa un correo válido." });
       const id = String(body.id || body.legacyUserId || `user-${Date.now()}`);
-      const role = body.role || "Usuario";
+      const role = normalizedRole(body.role || "Usuario");
       const admin = role === "Administrador central";
       await pool.query(`INSERT INTO inventory_user_profiles
         (id, legacy_user_id, name, email, initials, role, cost_center, admin, permissions, active, invitation_status, updated_at)
         VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8::jsonb,TRUE,'Pendiente invitación',NOW())
         ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, email=EXCLUDED.email, initials=EXCLUDED.initials,
         role=EXCLUDED.role, cost_center=EXCLUDED.cost_center, admin=EXCLUDED.admin, permissions=EXCLUDED.permissions,
-        active=TRUE, updated_at=NOW()`,
-        [id, body.name || email, email, body.initials || "", role, body.costCenter || "Bodega Central", admin, asJson(body.permissions || defaultPermissions(role, admin))]);
+        active=TRUE,security_version=inventory_user_profiles.security_version+1,
+        last_security_change_at=NOW(),updated_at=NOW()`,
+        [id, body.name || email, email, body.initials || "", role, body.costCenter || "Bodega Central", admin, asJson(defaultPermissions(role, admin))]);
       const profileResult = await pool.query("SELECT * FROM inventory_user_profiles WHERE id=$1", [id]);
       await inviteProfile(profileResult.rows[0], email);
+      await pool.query(`INSERT INTO inventory_security_events
+        (event_type,actor_profile_id,target_profile_id,after_data)
+        VALUES ('ACCESS_PROFILE_INVITED',$1,$2,$3::jsonb)`,
+      [apiProfile.id, id, asJson(profileResult.rows[0])]);
       return json(res, 200, { ok: true, message: `Invitación enviada a ${email}.` });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo invitar al usuario." });
@@ -1683,13 +1850,32 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       const current = await pool.query("SELECT * FROM inventory_user_profiles WHERE id=$1", [id]);
       if (!current.rows[0]) return json(res, 404, { error: "Usuario no encontrado." });
-      const role = body.role || current.rows[0].role;
+      const role = normalizedRole(body.role || current.rows[0].role);
       const admin = role === "Administrador central";
       const active = body.active !== false;
       const email = String(body.email ?? current.rows[0].email ?? "").trim().toLowerCase();
-      await pool.query(`UPDATE inventory_user_profiles SET name=$1, email=$2, initials=$3, role=$4, cost_center=$5, admin=$6,
-        permissions=$7::jsonb, active=$8, invitation_status=CASE WHEN $8 THEN invitation_status ELSE 'Deshabilitado' END, updated_at=NOW() WHERE id=$9`,
-        [body.name || current.rows[0].name, email, body.initials ?? current.rows[0].initials, role, body.costCenter || current.rows[0].cost_center, admin, asJson(body.permissions || defaultPermissions(role, admin)), active, id]);
+      if (current.rows[0].admin && (!admin || !active)) {
+        const otherAdmins = await pool.query(`SELECT COUNT(*)::int AS count
+          FROM inventory_user_profiles
+          WHERE admin=TRUE AND active=TRUE AND id<>$1`, [id]);
+        if (Number(otherAdmins.rows[0]?.count || 0) === 0) {
+          throw new Error("Debe permanecer al menos un administrador central activo.");
+        }
+      }
+      const updated = await pool.query(`UPDATE inventory_user_profiles SET name=$1, email=$2,
+        initials=$3,role=$4,cost_center=$5,admin=$6,permissions=$7::jsonb,active=$8,
+        invitation_status=CASE WHEN $8 THEN invitation_status ELSE 'Deshabilitado' END,
+        security_version=security_version+1,last_security_change_at=NOW(),updated_at=NOW()
+        WHERE id=$9 RETURNING *`,
+        [body.name || current.rows[0].name, email, body.initials ?? current.rows[0].initials,
+          role, body.costCenter || current.rows[0].cost_center, admin,
+          asJson(defaultPermissions(role, admin)), active, id]);
+      await pool.query(`INSERT INTO inventory_security_events
+        (event_type,actor_profile_id,target_profile_id,before_data,after_data,metadata)
+        VALUES ('ACCESS_PROFILE_CHANGED',$1,$2,$3::jsonb,$4::jsonb,$5::jsonb)`,
+      [apiProfile.id, id, asJson(current.rows[0]), asJson(updated.rows[0]),
+        asJson({ roleChanged: role !== current.rows[0].role,
+          activeChanged: active !== current.rows[0].active })]);
       if (current.rows[0].auth_user_id && supabaseAdmin) {
         await supabaseAdmin.auth.admin.updateUserById(current.rows[0].auth_user_id, { email: email || undefined, ban_duration: active ? "none" : "876000h" });
       }
