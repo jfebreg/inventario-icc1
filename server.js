@@ -1152,7 +1152,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("046_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("047_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -1713,9 +1713,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("046_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("047_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("046_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("047_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4530,7 +4530,7 @@ const server = http.createServer(async (req, res) => {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar datos personales." });
     }
-    const [activities, requests, accessLog] = await Promise.all([
+    const [activities, requests, accessLog, privacyIncidents] = await Promise.all([
       pool.query(`SELECT * FROM logistics_privacy_activities
         WHERE organization_id=$1 ORDER BY activity_code`, [logisticsOrganizationId]),
       pool.query(`SELECT request.*,assignee.name AS assigned_to_name,
@@ -4551,7 +4551,15 @@ const server = http.createServer(async (req, res) => {
         LEFT JOIN inventory_user_profiles profile
           ON profile.id::text=access.actor_profile_id::text
         WHERE access.organization_id=$1
-        ORDER BY access.accessed_at DESC LIMIT 50`, [logisticsOrganizationId])
+        ORDER BY access.accessed_at DESC LIMIT 50`, [logisticsOrganizationId]),
+      pool.query(`SELECT incident.*,owner.name AS owner_name,detector.name AS detected_by_name
+        FROM logistics_privacy_incidents incident
+        LEFT JOIN inventory_user_profiles owner
+          ON owner.id::text=incident.owner_profile_id::text
+        LEFT JOIN inventory_user_profiles detector
+          ON detector.id::text=incident.detected_by::text
+        WHERE incident.organization_id=$1
+        ORDER BY incident.detected_at DESC LIMIT 100`, [logisticsOrganizationId])
     ]);
     await pool.query(`INSERT INTO logistics_personal_data_access_log
       (organization_id,actor_profile_id,purpose,data_category,metadata)
@@ -4561,7 +4569,8 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, {
       activities: activities.rows,
       requests: requests.rows,
-      accessLog: accessLog.rows
+      accessLog: accessLog.rows,
+      incidents: privacyIncidents.rows
     });
   }
 
@@ -4664,6 +4673,211 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { request });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la solicitud." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/privacy-incidents" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede registrar incidentes de privacidad." });
+    }
+    const client = await pool.connect();
+    try {
+      const body = await readJson(req);
+      const title = String(body.title || "").trim();
+      const description = String(body.description || "").trim();
+      const dataCategories = Array.isArray(body.dataCategories)
+        ? body.dataCategories.map(value => String(value).trim()).filter(Boolean) : [];
+      if (title.length < 5 || description.length < 10 || !dataCategories.length) {
+        throw new Error("Indica título, descripción y al menos una categoría de datos.");
+      }
+      const riskScore = Number(body.riskScore ?? 40);
+      if (!Number.isInteger(riskScore) || riskScore < 0 || riskScore > 100) {
+        throw new Error("El riesgo debe estar entre 0 y 100.");
+      }
+      const affectedCount = body.affectedCount === "" || body.affectedCount == null
+        ? null : Number(body.affectedCount);
+      if (affectedCount != null && (!Number.isInteger(affectedCount) || affectedCount < 0)) {
+        throw new Error("La cantidad de personas afectadas debe ser un entero positivo.");
+      }
+      const severity = riskScore >= 80 ? "CRITICAL"
+        : riskScore >= 60 ? "HIGH" : riskScore >= 30 ? "MEDIUM" : "LOW";
+      const incidentNumber = `PI-${new Date().toISOString().replace(/\D/g, "").slice(0, 17)}`;
+      await client.query("BEGIN");
+      const incident = (await client.query(`INSERT INTO logistics_privacy_incidents
+        (organization_id,incident_number,title,description,detected_by,owner_profile_id,
+         data_categories,subject_categories,affected_count,confidentiality_affected,
+         integrity_affected,availability_affected,severity,risk_score)
+        VALUES ($1,$2,$3,$4,$5,$5,$6::jsonb,$7::jsonb,$8,$9,$10,$11,$12,$13)
+        RETURNING *`, [logisticsOrganizationId, incidentNumber, title, description,
+        apiProfile.id, asJson(dataCategories),
+        asJson(Array.isArray(body.subjectCategories) ? body.subjectCategories : []),
+        affectedCount,
+        body.confidentialityAffected !== false, Boolean(body.integrityAffected),
+        Boolean(body.availabilityAffected), severity, riskScore])).rows[0];
+      await client.query(`INSERT INTO logistics_privacy_incident_events
+        (organization_id,incident_id,event_type,new_status,actor_profile_id,detail,payload)
+        VALUES ($1,$2,'INCIDENT_DETECTED','DETECTED',$3,$4,$5::jsonb)`,
+      [logisticsOrganizationId, incident.id, apiProfile.id, description,
+        asJson({ severity, riskScore, dataCategories })]);
+      const taskId = `privacy-incident-${incident.id}`;
+      await client.query(`INSERT INTO inventory_tasks
+        (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,
+         entity_type,entity_id,payload,updated_at)
+        VALUES ($1,'Incidente de privacidad',$2,$3,$4,'Pendiente','Bodega Central',$5,
+          'privacy_incident',$6,$7::jsonb,NOW())
+        ON CONFLICT (id) DO NOTHING`, [taskId,
+        `Evaluar incidente ${incident.incident_number}: ${incident.title}`,
+        incident.description, ["HIGH", "CRITICAL"].includes(severity) ? "Crítica" : "Alta",
+        apiProfile.auth_user_id || null, incident.id, asJson(incident)]);
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,after_data)
+        VALUES ($1,'PRIVACY_INCIDENT_DETECTED','privacy_incident',$2,$3,$4,'WEB',$5::jsonb)`,
+      [logisticsOrganizationId, incident.id, apiProfile.id,
+        `privacy-incident:${incident.id}`, asJson(incident)]);
+      await client.query("COMMIT");
+      return json(res, 201, { incident });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 400, { error: error.message || "No se pudo registrar el incidente." });
+    } finally {
+      client.release();
+    }
+  }
+
+  const privacyIncidentRoute = url.pathname.match(
+    /^\/api\/admin\/privacy-incidents\/([0-9a-f-]+)$/i);
+  if (privacyIncidentRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede gestionar incidentes de privacidad." });
+    }
+    const client = await pool.connect();
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      await client.query("BEGIN");
+      const current = (await client.query(`SELECT * FROM logistics_privacy_incidents
+        WHERE id=$1 AND organization_id=$2 FOR UPDATE`,
+      [privacyIncidentRoute[1], logisticsOrganizationId])).rows[0];
+      if (!current) throw new Error("Incidente de privacidad no encontrado.");
+      if (current.status === "CLOSED") throw new Error("El incidente ya está cerrado.");
+      let status;
+      const values = {
+        dataCategories: current.data_categories,
+        subjectCategories: current.subject_categories,
+        affectedCount: current.affected_count,
+        confidentialityAffected: current.confidentiality_affected,
+        integrityAffected: current.integrity_affected,
+        availabilityAffected: current.availability_affected,
+        riskScore: current.risk_score,
+        severity: current.severity,
+        containmentActions: current.containment_actions,
+        notificationRequired: current.notification_required,
+        notificationReason: current.notification_reason,
+        authorityNotifiedAt: current.authority_notified_at,
+        subjectsNotifiedAt: current.subjects_notified_at,
+        rootCause: current.root_cause,
+        correctiveActions: current.corrective_actions
+      };
+      if (action === "ASSESS") {
+        values.riskScore = Number(body.riskScore);
+        if (!Number.isInteger(values.riskScore) || values.riskScore < 0 || values.riskScore > 100) {
+          throw new Error("El riesgo debe estar entre 0 y 100.");
+        }
+        values.severity = values.riskScore >= 80 ? "CRITICAL"
+          : values.riskScore >= 60 ? "HIGH" : values.riskScore >= 30 ? "MEDIUM" : "LOW";
+        values.affectedCount = body.affectedCount === "" || body.affectedCount == null
+          ? null : Number(body.affectedCount);
+        if (values.affectedCount != null
+            && (!Number.isInteger(values.affectedCount) || values.affectedCount < 0)) {
+          throw new Error("La cantidad de personas afectadas debe ser un entero positivo.");
+        }
+        values.dataCategories = Array.isArray(body.dataCategories)
+          ? body.dataCategories : values.dataCategories;
+        values.subjectCategories = Array.isArray(body.subjectCategories)
+          ? body.subjectCategories : values.subjectCategories;
+        values.confidentialityAffected = body.confidentialityAffected !== false;
+        values.integrityAffected = Boolean(body.integrityAffected);
+        values.availabilityAffected = Boolean(body.availabilityAffected);
+        status = "ASSESSING";
+      } else if (action === "CONTAIN") {
+        values.containmentActions = String(body.containmentActions || "").trim();
+        if (values.containmentActions.length < 10) {
+          throw new Error("Describe las medidas de contención aplicadas.");
+        }
+        status = "CONTAINED";
+      } else if (action === "DECIDE_NOTIFICATION") {
+        if (!["CONTAINED", "NOTIFICATION_DECIDED"].includes(current.status)) {
+          throw new Error("Primero registra la contención del incidente.");
+        }
+        if (typeof body.notificationRequired !== "boolean") {
+          throw new Error("Indica si corresponde notificar.");
+        }
+        values.notificationReason = String(body.notificationReason || "").trim();
+        if (values.notificationReason.length < 10) {
+          throw new Error("Fundamenta la decisión de notificación.");
+        }
+        values.notificationRequired = body.notificationRequired;
+        values.authorityNotifiedAt = body.authorityNotifiedAt || null;
+        values.subjectsNotifiedAt = body.subjectsNotifiedAt || null;
+        status = "NOTIFICATION_DECIDED";
+      } else if (action === "CLOSE") {
+        if (current.notification_required == null) {
+          throw new Error("Registra la decisión de notificación antes de cerrar.");
+        }
+        values.rootCause = String(body.rootCause || "").trim();
+        values.correctiveActions = String(body.correctiveActions || "").trim();
+        if (values.rootCause.length < 10 || values.correctiveActions.length < 10) {
+          throw new Error("Registra causa raíz y acciones correctivas.");
+        }
+        status = "CLOSED";
+      } else {
+        throw new Error("Acción de incidente no permitida.");
+      }
+      const incident = (await client.query(`UPDATE logistics_privacy_incidents SET
+        data_categories=$1::jsonb,subject_categories=$2::jsonb,affected_count=$3,
+        confidentiality_affected=$4,integrity_affected=$5,availability_affected=$6,
+        risk_score=$7,severity=$8,status=$9,containment_actions=$10,
+        notification_required=$11,notification_reason=$12,authority_notified_at=$13,
+        subjects_notified_at=$14,root_cause=$15,corrective_actions=$16,
+        contained_at=CASE WHEN $9='CONTAINED' THEN NOW() ELSE contained_at END,
+        closed_at=CASE WHEN $9='CLOSED' THEN NOW() ELSE NULL END,
+        updated_by=$17,updated_at=NOW()
+        WHERE id=$18 AND organization_id=$19 RETURNING *`, [
+        asJson(values.dataCategories), asJson(values.subjectCategories),
+        values.affectedCount, values.confidentialityAffected, values.integrityAffected,
+        values.availabilityAffected, values.riskScore, values.severity, status,
+        values.containmentActions, values.notificationRequired, values.notificationReason,
+        values.authorityNotifiedAt, values.subjectsNotifiedAt, values.rootCause,
+        values.correctiveActions, apiProfile.id, current.id, logisticsOrganizationId
+      ])).rows[0];
+      await client.query(`INSERT INTO logistics_privacy_incident_events
+        (organization_id,incident_id,event_type,previous_status,new_status,
+         actor_profile_id,detail,payload)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [logisticsOrganizationId,
+        incident.id, `INCIDENT_${action}`, current.status, status, apiProfile.id,
+        String(body.detail || body.notificationReason || body.containmentActions || "").trim() || null,
+        asJson({ action, severity: incident.severity, riskScore: incident.risk_score })]);
+      if (status === "CLOSED") {
+        await client.query(`UPDATE inventory_tasks SET status='Resuelta',
+          resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+          WHERE id=$1`, [`privacy-incident-${incident.id}`]);
+      }
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,before_data,after_data)
+        VALUES ($1,'PRIVACY_INCIDENT_UPDATED','privacy_incident',$2,$3,$4,
+          'WEB',$5::jsonb,$6::jsonb)`, [logisticsOrganizationId, incident.id,
+        apiProfile.id, `privacy-incident:${incident.id}:${action}`,
+        asJson({ status: current.status, severity: current.severity }),
+        asJson({ status: incident.status, severity: incident.severity })]);
+      await client.query("COMMIT");
+      return json(res, 200, { incident });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 400, { error: error.message || "No se pudo actualizar el incidente." });
+    } finally {
+      client.release();
     }
   }
 

@@ -255,3 +255,16 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   documentos sujetos a conservación legal o contractual.
 - Las tablas permanecen protegidas por RLS y sólo el servidor con perfil administrador
   puede tramitar solicitudes o consultar la trazabilidad completa.
+
+## Respuesta ante incidentes de privacidad
+
+- Cada incidente conserva número, detección, responsable, categorías de datos y personas,
+  cantidad potencialmente afectada e impacto en confidencialidad, integridad y disponibilidad.
+- El nivel de severidad se deriva de una evaluación de riesgo entre 0 y 100.
+- La secuencia obligatoria distingue evaluación, contención, decisión de notificación
+  y cierre con causa raíz y acciones correctivas.
+- Los incidentes crean una tarea prioritaria y no pueden cerrarse sin una decisión
+  documentada sobre la notificación.
+- Cada transición queda en un historial inalterable y en la auditoría logística.
+- La aplicación registra la decisión; los plazos y destinatarios legales deben validarse
+  con asesoría jurídica según el contrato y la normativa aplicable.
