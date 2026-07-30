@@ -212,3 +212,17 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   operaciones por el mismo disparo.
 - Las comprobaciones se registran en auditoría y en la cola transaccional; la
   confirmación de impresión exige validar físicamente legibilidad y lectura del QR.
+
+## Continuidad y gestión de incidentes
+
+- El servidor registra periódicamente la salud de base de datos, autenticación,
+  almacenamiento, agenda automática y cola de eventos.
+- Los incidentes se clasifican desde SEV1 crítico hasta SEV4 menor, conservando
+  impacto, responsable, tiempos de reconocimiento, mitigación y resolución.
+- Cada cambio de estado agrega un evento inalterable y una referencia en auditoría.
+- Los incidentes críticos crean tareas visibles y no se cierran sin resolución,
+  causa raíz y acción correctiva.
+- Administración puede ejecutar un diagnóstico manual y comparar el resultado
+  con los controles automáticos anteriores.
+- El historial permite demostrar continuidad, tiempos de respuesta y aprendizaje
+  frente a fallas sin depender únicamente de los registros temporales de Render.

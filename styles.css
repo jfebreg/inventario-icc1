@@ -27,3 +27,4 @@
 .device-check small{font-size:11px;color:#6c7c74}
 .device-pass{color:#08753f!important}.device-warn{color:#9a6700!important}.device-fail{color:#b42318!important}
 @media(max-width:700px){.device-grid{grid-template-columns:1fr}.device-actions{display:grid;grid-template-columns:1fr}.device-actions .button{width:100%}}
+.continuity-card{margin-top:20px}.continuity-healthy{color:#08753f}.continuity-degraded{color:#9a6700}.continuity-down{color:#b42318}.continuity-unknown{color:#66756d}.metric-date{font-size:15px!important;line-height:1.25}

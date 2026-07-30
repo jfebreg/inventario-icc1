@@ -870,6 +870,215 @@ async function recordDeviceCheck(profile, body) {
   }
 }
 
+let operationalHealthRunning = false;
+async function captureOperationalHealth(source = "SCHEDULER", actorProfileId = null) {
+  if (!pool || !logisticsReady || operationalHealthRunning) return { skipped: true };
+  operationalHealthRunning = true;
+  const started = Date.now();
+  try {
+    const checks = [];
+    const add = (component, status, detail) => checks.push({ component, status, detail });
+    const dbStarted = Date.now();
+    await pool.query("SELECT 1");
+    add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
+    const jobs = await pool.query(`SELECT COUNT(*)::int AS failed FROM logistics_scheduled_jobs
+      WHERE organization_id=$1 AND enabled=TRUE AND last_status='FAILED'`,
+    [logisticsOrganizationId]);
+    add("SCHEDULER", Number(jobs.rows[0]?.failed || 0) ? "FAIL" : "PASS",
+      `${Number(jobs.rows[0]?.failed || 0)} automatización(es) fallida(s).`);
+    const outbox = await pool.query(`SELECT
+      COUNT(*) FILTER (WHERE status='DEAD_LETTER')::int AS dead,
+      COUNT(*) FILTER (WHERE status IN ('PENDING','RETRY')
+        AND created_at<NOW()-INTERVAL '15 minutes')::int AS delayed
+      FROM logistics_outbox_events WHERE organization_id=$1`, [logisticsOrganizationId]);
+    add("OUTBOX", Number(outbox.rows[0]?.dead || 0) ? "FAIL"
+      : Number(outbox.rows[0]?.delayed || 0) ? "WARN" : "PASS",
+    `${Number(outbox.rows[0]?.dead || 0)} descartado(s), ${Number(outbox.rows[0]?.delayed || 0)} atrasado(s).`);
+    add("AUTH", authConfigured() ? "PASS" : "FAIL",
+      authConfigured() ? "Supabase Auth configurado." : "Configuración de acceso incompleta.");
+    add("STORAGE", storageConfigured() ? "PASS" : "WARN",
+      storageConfigured() ? "Supabase Storage configurado." : "Almacenamiento documental incompleto.");
+    const overall = checks.some(check => check.status === "FAIL") ? "DOWN"
+      : checks.some(check => check.status === "WARN") ? "DEGRADED" : "HEALTHY";
+    const run = (await pool.query(`INSERT INTO logistics_health_runs
+      (organization_id,overall_status,source,checks,duration_ms,checked_by)
+      VALUES ($1,$2,$3,$4::jsonb,$5,$6) RETURNING *`,
+    [logisticsOrganizationId, overall, source, asJson(checks),
+      Date.now() - started, actorProfileId])).rows[0];
+    await pool.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+      VALUES ($1,'HEALTH_CHECK_COMPLETED','health_run',$2,$3,$4,$5::jsonb)`,
+    [logisticsOrganizationId, run.id, actorProfileId,
+      source === "SCHEDULER" ? "SYSTEM" : "WEB", asJson(run)]);
+    return run;
+  } finally {
+    operationalHealthRunning = false;
+  }
+}
+
+function startOperationalHealthScheduler() {
+  const run = () => captureOperationalHealth("SCHEDULER")
+    .catch(error => console.error("No se pudo registrar la salud operacional:", error.message));
+  setTimeout(() => captureOperationalHealth("STARTUP")
+    .catch(error => console.error("No se pudo registrar la salud inicial:", error.message)), 15_000).unref?.();
+  setInterval(run, 5 * 60 * 1000).unref?.();
+}
+
+async function operationalContinuityOverview(profile) {
+  const params = [logisticsOrganizationId];
+  let scope = "";
+  if (!profile.admin) {
+    params.push(profile.cost_center);
+    scope = ` AND (incident.warehouse_id IS NULL OR EXISTS (
+      SELECT 1 FROM logistics_warehouses warehouse
+      JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+      WHERE warehouse.id=incident.warehouse_id AND center.name=$2
+    ))`;
+  }
+  const health = await pool.query(`SELECT * FROM logistics_health_runs
+    WHERE organization_id=$1 ORDER BY checked_at DESC LIMIT 30`, [logisticsOrganizationId]);
+  const incidents = await pool.query(`SELECT incident.*,warehouse.name AS warehouse_name,
+      owner.name AS owner_name,opener.name AS opened_by_name
+    FROM logistics_operational_incidents incident
+    LEFT JOIN logistics_warehouses warehouse ON warehouse.id=incident.warehouse_id
+    LEFT JOIN inventory_user_profiles owner ON owner.id=incident.owner_profile_id
+    LEFT JOIN inventory_user_profiles opener ON opener.id=incident.opened_by
+    WHERE incident.organization_id=$1 ${scope}
+    ORDER BY CASE incident.status WHEN 'OPEN' THEN 1 WHEN 'INVESTIGATING' THEN 2
+      WHEN 'MITIGATED' THEN 3 ELSE 4 END,
+      CASE incident.severity WHEN 'SEV1' THEN 1 WHEN 'SEV2' THEN 2
+        WHEN 'SEV3' THEN 3 ELSE 4 END,incident.opened_at DESC`, params);
+  return {
+    healthRuns: health.rows,
+    incidents: incidents.rows,
+    summary: {
+      status: health.rows[0]?.overall_status || "UNKNOWN",
+      lastCheckedAt: health.rows[0]?.checked_at || null,
+      open: incidents.rows.filter(row => row.status !== "RESOLVED").length,
+      critical: incidents.rows.filter(row => row.status !== "RESOLVED" &&
+        ["SEV1", "SEV2"].includes(row.severity)).length
+    }
+  };
+}
+
+async function openOperationalIncident(profile, body) {
+  if (body.warehouseId && !profile.admin &&
+      !(await profileMayAccessWarehouse(profile, body.warehouseId))) {
+    throw new Error("El incidente pertenece a otro centro.");
+  }
+  const severity = String(body.severity || "").toUpperCase();
+  const category = String(body.category || "").toUpperCase();
+  if (!["SEV1", "SEV2", "SEV3", "SEV4"].includes(severity)) throw new Error("Severidad inválida.");
+  if (!["APPLICATION", "DATABASE", "AUTH", "STORAGE", "INTEGRATION",
+    "DEVICE", "PROCESS", "SECURITY"].includes(category)) throw new Error("Categoría inválida.");
+  if (!String(body.title || "").trim() || !String(body.description || "").trim()) {
+    throw new Error("Título y descripción son obligatorios.");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))",
+      [`incident:${logisticsOrganizationId}`]);
+    const year = new Date().getFullYear();
+    const count = await client.query(`SELECT COUNT(*)::int AS total
+      FROM logistics_operational_incidents WHERE organization_id=$1
+        AND incident_number LIKE $2`, [logisticsOrganizationId, `INC-${year}-%`]);
+    const number = `INC-${year}-${String(Number(count.rows[0]?.total || 0) + 1).padStart(5, "0")}`;
+    const incident = (await client.query(`INSERT INTO logistics_operational_incidents
+      (organization_id,incident_number,warehouse_id,category,severity,title,
+       description,impact,owner_profile_id,opened_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [logisticsOrganizationId, number, body.warehouseId || null, category, severity,
+      String(body.title).trim(), String(body.description).trim(),
+      String(body.impact || ""), body.ownerProfileId || profile.id, profile.id])).rows[0];
+    await client.query(`INSERT INTO logistics_incident_events
+      (organization_id,incident_id,event_type,actor_profile_id,notes,after_data)
+      VALUES ($1,$2,'OPERATIONAL_INCIDENT_OPENED',$3,$4,$5::jsonb)`,
+    [logisticsOrganizationId, incident.id, profile.id, incident.description, asJson(incident)]);
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+      VALUES ($1,'OPERATIONAL_INCIDENT_OPENED','operational_incident',$2,$3,'WEB',$4::jsonb)`,
+    [logisticsOrganizationId, incident.id, profile.id, asJson(incident)]);
+    if (["SEV1", "SEV2"].includes(severity)) {
+      await client.query(`INSERT INTO inventory_tasks
+        (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,payload,updated_at)
+        VALUES ($1,'Incidente operacional',$2,$3,'Crítica','Pendiente',$4,
+          'operational_incident',$5,$6::jsonb,NOW())
+        ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,
+          status='Pendiente',resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
+      [`incident-${incident.id}`, `${number}: ${incident.title}`, incident.impact || incident.description,
+        activeUserCenterFallback(body.centerName), incident.id, asJson(incident)]);
+    }
+    await client.query("COMMIT");
+    return incident;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function activeUserCenterFallback(value) {
+  return String(value || "Bodega Central").trim() || "Bodega Central";
+}
+
+async function updateOperationalIncident(profile, incidentId, body) {
+  const current = (await pool.query(`SELECT * FROM logistics_operational_incidents
+    WHERE id=$1 AND organization_id=$2`, [incidentId, logisticsOrganizationId])).rows[0];
+  if (!current) throw new Error("Incidente inexistente.");
+  if (!profile.admin && current.warehouse_id &&
+      !(await profileMayAccessWarehouse(profile, current.warehouse_id))) {
+    throw new Error("El incidente pertenece a otro centro.");
+  }
+  const action = String(body.action || "").toUpperCase();
+  const statusMap = { ACKNOWLEDGE: "INVESTIGATING", MITIGATE: "MITIGATED", RESOLVE: "RESOLVED" };
+  const nextStatus = statusMap[action];
+  if (!nextStatus) throw new Error("Acción de incidente inválida.");
+  if (action === "RESOLVE" && (!String(body.resolution || "").trim() ||
+      !String(body.rootCause || "").trim() || !String(body.correctiveAction || "").trim())) {
+    throw new Error("Para cerrar debes registrar resolución, causa raíz y acción correctiva.");
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const updated = (await client.query(`UPDATE logistics_operational_incidents SET
+      status=$1,owner_profile_id=COALESCE($2,owner_profile_id),
+      acknowledged_at=CASE WHEN $1='INVESTIGATING' THEN COALESCE(acknowledged_at,NOW()) ELSE acknowledged_at END,
+      mitigated_at=CASE WHEN $1='MITIGATED' THEN COALESCE(mitigated_at,NOW()) ELSE mitigated_at END,
+      resolved_at=CASE WHEN $1='RESOLVED' THEN NOW() ELSE resolved_at END,
+      resolution=COALESCE(NULLIF($3,''),resolution),
+      root_cause=COALESCE(NULLIF($4,''),root_cause),
+      corrective_action=COALESCE(NULLIF($5,''),corrective_action),updated_at=NOW()
+      WHERE id=$6 RETURNING *`,
+    [nextStatus, body.ownerProfileId || null, String(body.resolution || ""),
+      String(body.rootCause || ""), String(body.correctiveAction || ""), incidentId])).rows[0];
+    const eventType = action === "RESOLVE" ? "OPERATIONAL_INCIDENT_RESOLVED"
+      : `OPERATIONAL_INCIDENT_${action}`;
+    await client.query(`INSERT INTO logistics_incident_events
+      (organization_id,incident_id,event_type,actor_profile_id,notes,before_data,after_data)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)`,
+    [logisticsOrganizationId, incidentId, eventType, profile.id,
+      String(body.notes || body.resolution || ""), asJson(current), asJson(updated)]);
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,before_data,after_data)
+      VALUES ($1,$2,'operational_incident',$3,$4,'WEB',$5::jsonb,$6::jsonb)`,
+    [logisticsOrganizationId, eventType, incidentId, profile.id, asJson(current), asJson(updated)]);
+    if (nextStatus === "RESOLVED") {
+      await client.query(`UPDATE inventory_tasks SET status='Resuelta',
+        resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+        WHERE id=$1`, [`incident-${incidentId}`]);
+    }
+    await client.query("COMMIT");
+    return updated;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function profileMayAccessLocation(profile, locationId) {
   if (!profile || !locationId) return false;
   if (profile.admin) return true;
@@ -1325,9 +1534,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("041_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("042_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("041_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("042_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -1451,6 +1660,25 @@ async function productionReadiness() {
         : "Cámara, lector USB e impresora verificados físicamente.",
     failedDevices.length || staleDevices.length
       ? "Abrir Configuración y ejecutar las pruebas de celular, lector e impresora." : "");
+
+  const continuity = await pool.query(`SELECT
+      COUNT(*) FILTER (WHERE status<>'RESOLVED' AND severity IN ('SEV1','SEV2'))::int AS critical,
+      COUNT(*) FILTER (WHERE status<>'RESOLVED')::int AS open
+    FROM logistics_operational_incidents WHERE organization_id=$1`, [logisticsOrganizationId]);
+  const lastHealth = (await pool.query(`SELECT overall_status,checked_at
+    FROM logistics_health_runs WHERE organization_id=$1
+    ORDER BY checked_at DESC LIMIT 1`, [logisticsOrganizationId])).rows[0];
+  const healthAge = lastHealth
+    ? (Date.now() - new Date(lastHealth.checked_at).getTime()) / 60_000 : Infinity;
+  const continuityFailed = Number(continuity.rows[0]?.critical || 0) > 0 ||
+    lastHealth?.overall_status === "DOWN";
+  add("continuity", "Continuidad operacional", continuityFailed ? "FAIL"
+    : healthAge > 15 || !lastHealth ? "WARN" : "PASS",
+  continuityFailed ? `${Number(continuity.rows[0]?.critical || 0)} incidente(s) crítico(s) abierto(s).`
+    : !lastHealth ? "Sin diagnóstico persistente."
+      : `${Number(continuity.rows[0]?.open || 0)} incidente(s) abierto(s); último control hace ${Math.floor(healthAge)} minuto(s).`,
+  continuityFailed || healthAge > 15 || !lastHealth
+    ? "Abrir Configuración y revisar Continuidad operacional." : "");
 
   const cutover = await getCutoverStatus(pool, logisticsOrganizationId);
   const canonicalPrimary = cutover.control?.mode === "CANONICAL_PRIMARY";
@@ -2830,6 +3058,55 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (url.pathname === "/api/v1/operations/continuity" && req.method === "GET") {
+    if (!profileCan(apiProfile, "audit")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar continuidad operacional." });
+    }
+    try {
+      return json(res, 200, await operationalContinuityOverview(apiProfile));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar continuidad." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/operations/health-check" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo administración puede ejecutar el diagnóstico." });
+    }
+    try {
+      return json(res, 200, { healthRun: await captureOperationalHealth("MANUAL", apiProfile.id) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar el diagnóstico." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/operations/incidents" && req.method === "POST") {
+    if (!profileCan(apiProfile, "audit")) {
+      return json(res, 403, { error: "Tu perfil no puede reportar incidentes." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, { incident: await openOperationalIncident(apiProfile, body) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo reportar el incidente." });
+    }
+  }
+
+  const operationalIncidentRoute = url.pathname.match(/^\/api\/v1\/operations\/incidents\/([^/]+)$/);
+  if (operationalIncidentRoute && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "audit")) {
+      return json(res, 403, { error: "Tu perfil no puede gestionar incidentes." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, {
+        incident: await updateOperationalIncident(apiProfile, operationalIncidentRoute[1], body)
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el incidente." });
+    }
+  }
+
   if (url.pathname === "/api/v1/reconciliation" && req.method === "GET") {
     if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede revisar la conciliación." });
     try {
@@ -4123,6 +4400,7 @@ setupDatabase()
     startComplianceScheduler();
     startLogisticsJobScheduler();
     startLogisticsOutboxScheduler();
+    startOperationalHealthScheduler();
     server.listen(port, "0.0.0.0", () => console.log(`Inventario ICC escuchando en puerto ${port}`));
   })
   .catch((error) => {
