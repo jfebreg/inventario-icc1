@@ -941,8 +941,8 @@ async function operationalContinuityOverview(profile) {
       owner.name AS owner_name,opener.name AS opened_by_name
     FROM logistics_operational_incidents incident
     LEFT JOIN logistics_warehouses warehouse ON warehouse.id=incident.warehouse_id
-    LEFT JOIN inventory_user_profiles owner ON owner.id=incident.owner_profile_id
-    LEFT JOIN inventory_user_profiles opener ON opener.id=incident.opened_by
+    LEFT JOIN inventory_user_profiles owner ON owner.id::text=incident.owner_profile_id::text
+    LEFT JOIN inventory_user_profiles opener ON opener.id::text=incident.opened_by::text
     WHERE incident.organization_id=$1 ${scope}
     ORDER BY CASE incident.status WHEN 'OPEN' THEN 1 WHEN 'INVESTIGATING' THEN 2
       WHEN 'MITIGATED' THEN 3 ELSE 4 END,
@@ -1126,7 +1126,7 @@ async function releasesOverview() {
       COALESCE(checks.total,0)::int AS check_count,
       COALESCE(checks.failures,0)::int AS failed_checks
     FROM logistics_release_records release
-    LEFT JOIN inventory_user_profiles approver ON approver.id=release.approved_by
+    LEFT JOIN inventory_user_profiles approver ON approver.id::text=release.approved_by::text
     LEFT JOIN LATERAL (
       SELECT COUNT(*) AS total,
         COUNT(*) FILTER (WHERE mandatory=TRUE AND status<>'PASS') AS failures
