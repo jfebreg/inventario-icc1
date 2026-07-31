@@ -101,7 +101,17 @@
       const legacyUserId = localStorage.getItem("control-activos-session") || localStorage.getItem("control-activos-user") || "";
       if (legacyUserId) headers.set("X-Legacy-User-Id", legacyUserId);
     }
-    return nativeFetch(input, { ...init, headers });
+    const response = await nativeFetch(input, { ...init, headers });
+    if (response.status === 403) {
+      const payload = await response.clone().json().catch(() => ({}));
+      if (payload.code === "REAUTH_REQUIRED") {
+        await logout();
+        window.dispatchEvent(new CustomEvent("icc-reauth-required", {
+          detail: payload.error || "Vuelve a ingresar para completar esta acción sensible."
+        }));
+      }
+    }
+    return response;
   }
 
   window.fetch = apiFetch;

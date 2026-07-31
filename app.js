@@ -2212,6 +2212,7 @@ function applyAuthenticatedUser(user){deviceReadiness=null;continuityData=null;r
 window.addEventListener('icc-auth-error',e=>toast(e.detail));
 window.addEventListener('icc-session-warning',e=>toast(e.detail));
 window.addEventListener('icc-session-expired',e=>toast(e.detail));
+window.addEventListener('icc-reauth-required',e=>toast(e.detail));
 window.addEventListener('icc-state-conflict',e=>toast(e.detail||'Los datos cambiaron en otra sesión. Actualiza la pantalla.'));
 window.addEventListener('icc-realtime',()=>{renderRealtimeCounter();if(route==='tasks')render()});
 window.addEventListener('icc-public-accepted',e=>{$('#view').innerHTML=`<div class="card auth-card"><h1 class="page-title">Entrega aceptada</h1><p class="page-subtitle">${htmlSafe(e.detail||'El registro fue guardado correctamente.')}</p></div>`;toast(e.detail||'Cargo aceptado.')});

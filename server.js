@@ -147,6 +147,24 @@ function authConfigured() {
   return Boolean(supabaseBaseUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY && (process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY));
 }
 
+function criticalReauthMinutes() {
+  const configured = Number(process.env.AUTH_CRITICAL_REAUTH_MINUTES || 60);
+  return Math.min(480, Math.max(10, Number.isFinite(configured) ? configured : 60));
+}
+
+function requiresRecentAuthentication(pathname, method) {
+  if (String(method || "GET").toUpperCase() === "GET") return false;
+  return pathname.startsWith("/api/admin/")
+    || (pathname.startsWith("/api/v1/releases/") && method === "PATCH")
+    || (pathname === "/api/v1/cutover" && method === "PATCH");
+}
+
+function hasRecentAuthentication(profile) {
+  const signedInAt = new Date(profile?.authUser?.last_sign_in_at || 0).getTime();
+  if (!Number.isFinite(signedInAt) || signedInAt <= 0) return false;
+  return Date.now() - signedInAt <= criticalReauthMinutes() * 60 * 1000;
+}
+
 const supabaseAdmin = supabaseBaseUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY
   ? createClient(supabaseBaseUrl(), process.env.SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false }
@@ -2345,6 +2363,7 @@ const server = http.createServer(async (req, res) => {
       bootstrapTokenConfigured: Boolean(process.env.AUTH_BOOTSTRAP_TOKEN),
       appBaseUrlConfigured: Boolean(process.env.APP_BASE_URL),
       authIdleMinutes: Math.min(480, Math.max(10, Number(process.env.AUTH_IDLE_MINUTES || 30) || 30)),
+      criticalReauthMinutes: criticalReauthMinutes(),
       migrationComplete: Boolean(settings.migration_complete),
       bootstrapUsed: Boolean(settings.bootstrap_used),
       appBaseUrl: process.env.APP_BASE_URL || "https://inventario-icc1.onrender.com",
@@ -2454,6 +2473,13 @@ const server = http.createServer(async (req, res) => {
       if (!apiProfile) apiProfile = await requestLegacyProfile(req);
       if (!apiProfile) return json(res, 401, { error: "Debes identificarte para usar la API durante la migracion." });
     }
+  }
+
+  if (apiProfile && requiresRecentAuthentication(url.pathname, req.method) && !hasRecentAuthentication(apiProfile)) {
+    return json(res, 403, {
+      code: "REAUTH_REQUIRED",
+      error: "Esta acción sensible requiere volver a ingresar con tu correo y contraseña."
+    });
   }
 
   if (url.pathname === "/api/admin/security" && req.method === "GET") {
