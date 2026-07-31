@@ -6,7 +6,7 @@ import pg from "pg";
 import QRCode from "qrcode";
 import PDFDocument from "pdfkit";
 import { createClient } from "@supabase/supabase-js";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
   calculateInventoryClassifications,
@@ -134,6 +134,7 @@ const ROLE_PERMISSIONS = Object.freeze({
 });
 const KNOWN_PERMISSIONS = new Set(Object.values(ROLE_PERMISSIONS).flat());
 const bootstrapAttemptWindows = new Map();
+const requestRateWindows = new Map();
 
 function supabaseBaseUrl() {
   return String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "").replace(/\/rest\/v1$/i, "");
@@ -181,6 +182,52 @@ function requestFingerprint(req) {
   const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
   const address = forwarded || req.socket?.remoteAddress || "unknown";
   return createHash("sha256").update(address).digest("hex").slice(0, 20);
+}
+
+function consumeRequestRate(req, bucket, limit, windowMs) {
+  const now = Date.now();
+  const key = `${bucket}:${requestFingerprint(req)}`;
+  let entry = requestRateWindows.get(key);
+  if (!entry || now - entry.startedAt >= windowMs) entry = { startedAt: now, count: 0 };
+  const retryAfterSeconds = Math.max(1, Math.ceil((windowMs - (now - entry.startedAt)) / 1000));
+  if (entry.count >= limit) return { allowed: false, limit, remaining: 0, retryAfterSeconds };
+  entry.count += 1;
+  requestRateWindows.set(key, entry);
+  if (requestRateWindows.size > 5000) {
+    for (const [candidate, value] of requestRateWindows) {
+      if (now - value.startedAt >= windowMs) requestRateWindows.delete(candidate);
+    }
+  }
+  return { allowed: true, limit, remaining: Math.max(0, limit - entry.count), retryAfterSeconds };
+}
+
+function setRateLimitHeaders(res, result) {
+  res.setHeader("RateLimit-Limit", String(result.limit));
+  res.setHeader("RateLimit-Remaining", String(result.remaining));
+  res.setHeader("RateLimit-Reset", String(result.retryAfterSeconds));
+  if (!result.allowed) res.setHeader("Retry-After", String(result.retryAfterSeconds));
+}
+
+function isMutationMethod(method) {
+  return ["POST", "PUT", "PATCH", "DELETE"].includes(String(method || "GET").toUpperCase());
+}
+
+function requestOriginAllowed(req) {
+  if (!isMutationMethod(req.method)) return true;
+  const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  if (fetchSite === "cross-site") return false;
+  const origin = String(req.headers.origin || "").trim();
+  if (!origin) return true; // lectores, integraciones y pruebas sin contexto de navegador
+  try {
+    const supplied = new URL(origin).origin;
+    const configured = process.env.APP_BASE_URL ? new URL(process.env.APP_BASE_URL).origin : "";
+    const forwardedProto = String(req.headers["x-forwarded-proto"] || (req.socket?.encrypted ? "https" : "http")).split(",")[0].trim();
+    const requestHost = String(req.headers.host || "").trim();
+    const current = requestHost ? `${forwardedProto}://${requestHost}` : "";
+    return supplied === configured || supplied === current;
+  } catch {
+    return false;
+  }
 }
 
 function consumeBootstrapAttempt(req) {
@@ -2367,7 +2414,33 @@ async function setupDatabase() {
 
 const server = http.createServer(async (req, res) => {
   applyBrowserSecurityHeaders(res);
+  const requestId = randomUUID();
+  res.setHeader("X-Request-Id", requestId);
   const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (url.pathname.startsWith("/api/") && !requestOriginAllowed(req)) {
+    return json(res, 403, {
+      code: "SOLICITUD_ORIGEN_INVALIDO",
+      error: "La solicitud fue bloqueada porque no proviene de la aplicación oficial.",
+      requestId
+    });
+  }
+
+  if (url.pathname === "/api/public/acceptance") {
+    const rate = consumeRequestRate(req, "public-acceptance", 10, 15 * 60 * 1000);
+    setRateLimitHeaders(res, rate);
+    if (!rate.allowed) return json(res, 429, {
+      error: "Demasiados intentos de consulta o aceptación. Espera unos minutos y vuelve a intentar.",
+      requestId
+    });
+  } else if (url.pathname.startsWith("/api/") && isMutationMethod(req.method) && url.pathname !== "/api/auth/bootstrap") {
+    const rate = consumeRequestRate(req, "api-mutation", 180, 60 * 1000);
+    setRateLimitHeaders(res, rate);
+    if (!rate.allowed) return json(res, 429, {
+      error: "Se realizaron demasiadas operaciones en poco tiempo. Espera un minuto y vuelve a intentar.",
+      requestId
+    });
+  }
 
   if (url.pathname === "/api/health") {
     let logistics = null;
