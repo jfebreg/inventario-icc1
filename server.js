@@ -222,6 +222,31 @@ function json(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+function applyBrowserSecurityHeaders(res) {
+  res.setHeader("Content-Security-Policy", [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+    "media-src 'self' blob:",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'"
+  ].join("; "));
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(self), microphone=(), geolocation=(), payment=(), usb=()");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
+  res.setHeader("Origin-Agent-Cluster", "?1");
+}
+
 async function readJson(req) {
   const chunks = [];
   let size = 0;
@@ -2341,6 +2366,7 @@ async function setupDatabase() {
 }
 
 const server = http.createServer(async (req, res) => {
+  applyBrowserSecurityHeaders(res);
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/api/health") {
@@ -5372,12 +5398,15 @@ const server = http.createServer(async (req, res) => {
     const info = await stat(file);
     if (!info.isFile()) throw new Error("No file");
     const body = await readFile(file);
-    res.writeHead(200, { "Content-Type": mime[extname(file).toLowerCase()] || "application/octet-stream" });
+    const extension = extname(file).toLowerCase();
+    const headers = { "Content-Type": mime[extension] || "application/octet-stream" };
+    if ([".html", ".js", ".css"].includes(extension)) headers["Cache-Control"] = "no-cache";
+    res.writeHead(200, headers);
     res.end(body);
   } catch {
     try {
       const body = await readFile(join(root, "index.html"));
-      res.writeHead(200, { "Content-Type": mime[".html"] });
+      res.writeHead(200, { "Content-Type": mime[".html"], "Cache-Control": "no-store" });
       res.end(body);
     } catch {
       json(res, 500, { error: "No se pudo cargar la aplicación" });
