@@ -2412,6 +2412,25 @@ async function setupDatabase() {
   }
 }
 
+async function readinessSnapshot() {
+  const checks = {
+    database: { ok: false, detail: pool ? "Comprobando" : "DATABASE_URL no configurada" },
+    logistics: { ok: Boolean(logisticsReady), detail: logisticsReady ? "Migraciones y modelo preparados" : "Modelo logístico no preparado" },
+    authentication: { ok: authConfigured(), detail: authConfigured() ? "Supabase Auth configurado" : "Configuración de Auth incompleta" },
+    fileStorage: { ok: storageConfigured(), detail: storageConfigured() ? "Storage configurado" : "Configuración de Storage incompleta" }
+  };
+  if (pool) {
+    try {
+      await pool.query({ text: "SELECT 1 AS ready", query_timeout: 3000 });
+      checks.database = { ok: true, detail: "PostgreSQL responde" };
+    } catch {
+      checks.database = { ok: false, detail: "PostgreSQL no responde dentro del plazo" };
+    }
+  }
+  const ready = checks.database.ok && checks.logistics.ok;
+  return { ready, checks };
+}
+
 async function handleHttpRequest(req, res, requestId) {
   applyBrowserSecurityHeaders(res);
   res.setHeader("X-Request-Id", requestId);
@@ -2438,6 +2457,25 @@ async function handleHttpRequest(req, res, requestId) {
     if (!rate.allowed) return json(res, 429, {
       error: "Se realizaron demasiadas operaciones en poco tiempo. Espera un minuto y vuelve a intentar.",
       requestId
+    });
+  }
+
+  if (url.pathname === "/api/health/live") {
+    return json(res, 200, {
+      ok: true,
+      service: "inventario-icc",
+      status: "alive",
+      uptimeSeconds: Math.floor(process.uptime())
+    });
+  }
+
+  if (url.pathname === "/api/health/ready") {
+    const readiness = await readinessSnapshot();
+    return json(res, readiness.ready ? 200 : 503, {
+      ok: readiness.ready,
+      service: "inventario-icc",
+      status: readiness.ready ? "ready" : "not_ready",
+      ...readiness
     });
   }
 
