@@ -2412,9 +2412,8 @@ async function setupDatabase() {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleHttpRequest(req, res, requestId) {
   applyBrowserSecurityHeaders(res);
-  const requestId = randomUUID();
   res.setHeader("X-Request-Id", requestId);
   const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -5485,7 +5484,69 @@ const server = http.createServer(async (req, res) => {
       json(res, 500, { error: "No se pudo cargar la aplicación" });
     }
   }
+}
+
+const server = http.createServer((req, res) => {
+  const requestId = randomUUID();
+  const startedAt = process.hrtime.bigint();
+  const pathname = (() => {
+    try { return new URL(req.url, `http://${req.headers.host || "localhost"}`).pathname; }
+    catch { return "/ruta-invalida"; }
+  })();
+  res.once("finish", () => {
+    if (pathname === "/api/health" && res.statusCode < 400) return;
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+    console.info(JSON.stringify({
+      type: "http_request",
+      requestId,
+      method: req.method,
+      path: pathname,
+      status: res.statusCode,
+      durationMs: Number(durationMs.toFixed(1))
+    }));
+  });
+  handleHttpRequest(req, res, requestId).catch((error) => {
+    console.error(JSON.stringify({
+      type: "http_unhandled_error",
+      requestId,
+      method: req.method,
+      path: pathname,
+      error: error?.message || "Error inesperado"
+    }));
+    if (!res.headersSent) {
+      applyBrowserSecurityHeaders(res);
+      res.setHeader("X-Request-Id", requestId);
+      return json(res, 500, {
+        error: "Ocurrió un error inesperado. Informa el código de seguimiento al administrador.",
+        requestId
+      });
+    }
+    if (!res.writableEnded) res.destroy();
+  });
 });
+
+server.on("clientError", (error, socket) => {
+  console.warn(JSON.stringify({ type: "http_client_error", error: error?.message || "Solicitud inválida" }));
+  if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+});
+
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.info(JSON.stringify({ type: "service_shutdown", signal }));
+  const forceExit = setTimeout(() => process.exit(1), 10_000);
+  forceExit.unref();
+  server.close(async () => {
+    try { if (pool) await pool.end(); }
+    catch (error) { console.error("No se pudo cerrar PostgreSQL correctamente:", error.message); }
+    clearTimeout(forceExit);
+    process.exit(0);
+  });
+}
+
+process.once("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.once("SIGINT", () => gracefulShutdown("SIGINT"));
 
 setupDatabase()
   .then(() => {
