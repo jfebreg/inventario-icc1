@@ -227,6 +227,15 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - El historial permite demostrar continuidad, tiempos de respuesta y aprendizaje
   frente a fallas sin depender únicamente de los registros temporales de Render.
 
+## Prevención de operaciones duplicadas
+
+- Movimientos de stock, entregas y devoluciones de custodia, despachos y recepciones
+  exigen una clave estable antes de modificar existencias.
+- La creación de traslados y entregas utiliza un número o referencia externa única.
+- Reintentar desde un celular con mala señal devuelve el resultado previo y no genera
+  una segunda salida, recepción o cargo.
+- Las claves se validan en el servidor y no dependen solamente del bloqueo visual del botón.
+
 ## Gobierno de versiones y despliegues
 
 - Cada publicación registra el commit de GitHub, servicio Render, migración más reciente,

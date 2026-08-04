@@ -360,6 +360,15 @@ function validateJsonComplexity(value) {
   }
 }
 
+function requireStableOperationKey(value, field = "idempotencyKey") {
+  const key = String(value || "").trim();
+  if (!key) throw new HttpRequestError(422, "IDEMPOTENCY_KEY_REQUIRED", `Falta ${field} para proteger la operación contra duplicados.`);
+  if (key.length < 6 || key.length > 200 || !/^[A-Za-z0-9._:-]+$/.test(key)) {
+    throw new HttpRequestError(422, "INVALID_IDEMPOTENCY_KEY", `${field} no tiene un formato válido.`);
+  }
+  return key;
+}
+
 async function readJson(req) {
   const declaredLength = Number(req.headers["content-length"] || 0);
   if (Number.isFinite(declaredLength) && declaredLength > 15_000_000) {
@@ -4509,6 +4518,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede mover inventario." });
     try {
       const body = await readJson(req);
+      body.idempotencyKey = requireStableOperationKey(body.idempotencyKey);
       if (String(body.movementType || "").toUpperCase() === "ADJUSTMENT") {
         return json(res, 409, { error: "Los ajustes deben solicitarse y aprobarse antes de contabilizarse." });
       }
@@ -4529,7 +4539,7 @@ async function handleHttpRequest(req, res, requestId) {
       }, apiProfile.id);
       return json(res, result.replayed ? 200 : 201, result);
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo registrar el movimiento." });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo registrar el movimiento." });
     }
   }
 
@@ -4550,6 +4560,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "terrain")) return json(res, 403, { error: "Tu perfil no puede entregar productos a terreno." });
     try {
       const body = await readJson(req);
+      body.externalReference = requireStableOperationKey(body.externalReference, "externalReference");
       if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
         return json(res, 403, { error: "Sólo puedes entregar desde una bodega de tu centro." });
       }
@@ -4561,7 +4572,7 @@ async function handleHttpRequest(req, res, requestId) {
       }, apiProfile.id);
       return json(res, result.replayed ? 200 : 201, result);
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo registrar la entrega a terreno." });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo registrar la entrega a terreno." });
     }
   }
 
@@ -4575,10 +4586,12 @@ async function handleHttpRequest(req, res, requestId) {
       if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, current.rows[0].warehouse_id))) {
         return json(res, 403, { error: "La entrega pertenece a otra bodega." });
       }
-      const result = await returnCustodyAssignment(pool, assignmentId, await readJson(req), apiProfile.id);
+      const body = await readJson(req);
+      body.idempotencyKey = requireStableOperationKey(body.idempotencyKey);
+      const result = await returnCustodyAssignment(pool, assignmentId, body, apiProfile.id);
       return json(res, 200, result);
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo registrar la devolución." });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo registrar la devolución." });
     }
   }
 
@@ -4595,6 +4608,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede crear traslados." });
     try {
       const body = await readJson(req);
+      body.transferNumber = requireStableOperationKey(body.transferNumber, "transferNumber");
       if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.sourceWarehouseId))) {
         return json(res, 403, { error: "Sólo puedes despachar desde una bodega de tu centro." });
       }
@@ -4604,7 +4618,7 @@ async function handleHttpRequest(req, res, requestId) {
       }, apiProfile.id);
       return json(res, 201, { transfer });
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo crear el traslado." });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo crear el traslado." });
     }
   }
 
@@ -4615,6 +4629,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, permission)) return json(res, 403, { error: "Tu perfil no puede completar esta operación." });
     try {
       const body = await readJson(req);
+      body.idempotencyKey = requireStableOperationKey(body.idempotencyKey);
       const transferResult = await pool.query("SELECT * FROM logistics_transfer_orders WHERE id=$1", [transferId]);
       const transfer = transferResult.rows[0];
       if (!transfer) return json(res, 404, { error: "Traslado no encontrado." });
@@ -4631,7 +4646,7 @@ async function handleHttpRequest(req, res, requestId) {
         }, apiProfile.id);
       return json(res, 200, { transfer: updated });
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo actualizar el traslado." });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo actualizar el traslado." });
     }
   }
 
