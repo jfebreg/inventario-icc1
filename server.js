@@ -329,6 +329,24 @@ class HttpRequestError extends Error {
   }
 }
 
+async function fetchWithTimeout(url, options = {}, settings = {}) {
+  const service = settings.service || "El servicio externo";
+  const timeoutMs = boundedNumber(settings.timeoutMs, 30_000, 1_000, 180_000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new HttpRequestError(504, "UPSTREAM_TIMEOUT", `${service} no respondió dentro del plazo permitido.`);
+    }
+    throw new HttpRequestError(502, "UPSTREAM_UNAVAILABLE", `${service} no está disponible temporalmente.`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function validateJsonComplexity(value) {
   const stack = [{ value, depth: 0 }];
   let nodes = 0;
@@ -534,7 +552,7 @@ async function uploadFileObject(body) {
     provider = "supabase";
     storagePath = `${category}/${new Date().toISOString().slice(0, 10)}/${id}-${filename}`;
     const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
-    const response = await fetch(endpoint, {
+    const response = await fetchWithTimeout(endpoint, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -543,7 +561,7 @@ async function uploadFileObject(body) {
         "x-upsert": "true"
       },
       body: data
-    });
+    }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
     if (!response.ok) throw new Error(`No se pudo subir a Supabase Storage: ${await response.text()}`);
     publicUrl = `${supabaseBaseUrl()}/storage/v1/object/${process.env.SUPABASE_BUCKET}/${storagePath}`;
   }
@@ -1971,10 +1989,10 @@ async function productionReadiness() {
   if (storageConfigured()) {
     try {
       const endpoint = `${supabaseBaseUrl()}/storage/v1/bucket/${encodeURIComponent(process.env.SUPABASE_BUCKET)}`;
-      const response = await fetch(endpoint, { headers: {
+      const response = await fetchWithTimeout(endpoint, { headers: {
         "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
         "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY
-      } });
+      } }, { service: "Supabase Storage", timeoutMs: 8_000 });
       storageStatus = response.ok ? "PASS" : "FAIL";
       storageDetail = response.ok ? `Bucket ${process.env.SUPABASE_BUCKET} accesible.` : `Storage respondió HTTP ${response.status}.`;
     } catch (error) {
@@ -2437,14 +2455,14 @@ ${catalog}`;
   if (body.mime?.startsWith("image/")) content.push({ type: "input_image", image_url: body.dataUrl });
   else content.push({ type: "input_file", filename: body.filename || "documento.pdf", file_data: body.dataUrl });
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const response = await fetchWithTimeout("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: process.env.OPENAI_MODEL || "gpt-5",
       input: [{ role: "user", content }]
     })
-  });
+  }, { service: "OpenAI", timeoutMs: process.env.OPENAI_TIMEOUT_MS || 90_000 });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error?.message || "No se pudo analizar con OpenAI");
   return { configured: true, result: extractJson(payload.output_text), rawModel: payload.model };
@@ -4644,7 +4662,7 @@ async function handleHttpRequest(req, res, requestId) {
       status.recentFiles = recent.rows;
       if (storageConfigured()) {
         const endpoint = `${supabaseBaseUrl()}/storage/v1/bucket/${encodeURIComponent(process.env.SUPABASE_BUCKET)}`;
-        const response = await fetch(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } });
+        const response = await fetchWithTimeout(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } }, { service: "Supabase Storage", timeoutMs: 8_000 });
         status.supabaseReachable = response.ok;
         if (!response.ok) status.supabaseError = await response.text();
       }
@@ -5531,7 +5549,7 @@ async function handleHttpRequest(req, res, requestId) {
       }
       if (row.provider === "supabase" && row.storage_path && storageConfigured()) {
         const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${String(row.storage_path).split("/").map(encodeURIComponent).join("/")}`;
-        const response = await fetch(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } });
+        const response = await fetchWithTimeout(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
         if (!response.ok) throw new Error("No se pudo leer archivo desde Supabase");
         const body = Buffer.from(await response.arrayBuffer());
         res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"` });
