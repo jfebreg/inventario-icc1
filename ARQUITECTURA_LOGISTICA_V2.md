@@ -236,6 +236,14 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   una segunda salida, recepción o cargo.
 - Las claves se validan en el servidor y no dependen solamente del bloqueo visual del botón.
 
+## Integridad de archivos
+
+- Cada archivo conserva tamaño y huella SHA-256 desde su carga inicial.
+- Antes de descargar desde PostgreSQL o Supabase Storage el servidor vuelve a calcular
+  ambos valores y bloquea cualquier diferencia.
+- Una falla de integridad queda registrada en auditoría con archivo, proveedor y responsable.
+- Las descargas válidas informan su huella mediante encabezados verificables sin volver público el bucket.
+
 ## Gobierno de versiones y despliegues
 
 - Cada publicación registra el commit de GitHub, servicio Render, migración más reciente,

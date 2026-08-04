@@ -583,6 +583,40 @@ async function uploadFileObject(body) {
   return { id, filename, mimeType, size: data.length, provider, path: storagePath, publicUrl, sha256, downloadUrl: `/api/files/${encodeURIComponent(id)}` };
 }
 
+async function verifyFileIntegrity(row, body, profile) {
+  const actualSha256 = createHash("sha256").update(body).digest("hex");
+  const expectedSha256 = String(row?.payload?.sha256 || "").trim().toLowerCase();
+  const expectedSize = Number(row?.size_bytes);
+  const sizeMismatch = Number.isFinite(expectedSize) && expectedSize >= 0 && expectedSize !== body.length;
+  const hashMismatch = /^[0-9a-f]{64}$/.test(expectedSha256) && !safeTokenEqual(actualSha256, expectedSha256);
+  if (sizeMismatch || hashMismatch) {
+    const reason = sizeMismatch ? "FILE_SIZE_MISMATCH" : "FILE_INTEGRITY_MISMATCH";
+    console.error(JSON.stringify({ type: "file_integrity_failure", fileId: row.id, reason }));
+    try {
+      await pool.query(`INSERT INTO inventory_audit_log
+        (id,event_date,user_name,action,detail,payload)
+        VALUES ($1,NOW(),$2,'Integridad de archivo fallida',$3,$4::jsonb)`,
+      [`file-integrity-${randomUUID()}`, profile?.name || profile?.id || "Sistema",
+        `Se bloqueó la descarga de ${row.filename || row.id}.`,
+        asJson({ fileId: row.id, provider: row.provider, reason, expectedSha256, actualSha256, expectedSize, actualSize: body.length })]);
+    } catch (error) {
+      console.error("No se pudo auditar la falla de integridad:", error.message);
+    }
+    throw new HttpRequestError(409, reason, "El archivo no superó la verificación de integridad y su descarga fue bloqueada.");
+  }
+  return { sha256: actualSha256, status: expectedSha256 ? "verified" : "unregistered" };
+}
+
+function fileIntegrityHeaders(integrity, size) {
+  const digestBase64 = Buffer.from(integrity.sha256, "hex").toString("base64");
+  return {
+    "Content-Length": String(size),
+    "X-Content-SHA256": integrity.sha256,
+    "X-Integrity-Status": integrity.status,
+    "Content-Digest": `sha-256=:${digestBase64}:`
+  };
+}
+
 function parseWorkerLine(raw, center) {
   const [name, email, phone] = String(raw || "").split(/[|;]/).map(x => x.trim());
   return { id: `${center.id || center.name}:${name || raw}`.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: name || raw || "Sin nombre", email: email || "", phone: phone || "" };
@@ -5567,14 +5601,16 @@ async function handleHttpRequest(req, res, requestId) {
         const response = await fetchWithTimeout(endpoint, { headers: { "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY } }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
         if (!response.ok) throw new Error("No se pudo leer archivo desde Supabase");
         const body = Buffer.from(await response.arrayBuffer());
-        res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"` });
+        const integrity = await verifyFileIntegrity(row, body, apiProfile);
+        res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"`, ...fileIntegrityHeaders(integrity, body.length) });
         return res.end(body);
       }
       const body = Buffer.from(row.data_base64 || "", "base64");
-      res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"` });
+      const integrity = await verifyFileIntegrity(row, body, apiProfile);
+      res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"`, ...fileIntegrityHeaders(integrity, body.length) });
       return res.end(body);
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo descargar el archivo" });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo descargar el archivo" });
     }
   }
 
