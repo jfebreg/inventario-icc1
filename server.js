@@ -294,15 +294,56 @@ function applyBrowserSecurityHeaders(res) {
   res.setHeader("Origin-Agent-Cluster", "?1");
 }
 
+class HttpRequestError extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.name = "HttpRequestError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function validateJsonComplexity(value) {
+  const stack = [{ value, depth: 0 }];
+  let nodes = 0;
+  while (stack.length) {
+    const current = stack.pop();
+    nodes += 1;
+    if (nodes > 20_000) throw new HttpRequestError(422, "JSON_TOO_COMPLEX", "La solicitud contiene demasiados campos.");
+    if (current.depth > 50) throw new HttpRequestError(422, "JSON_TOO_DEEP", "La solicitud contiene demasiados niveles anidados.");
+    if (!current.value || typeof current.value !== "object") continue;
+    for (const child of Object.values(current.value)) stack.push({ value: child, depth: current.depth + 1 });
+  }
+}
+
 async function readJson(req) {
+  const declaredLength = Number(req.headers["content-length"] || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > 15_000_000) {
+    throw new HttpRequestError(413, "PAYLOAD_TOO_LARGE", "Solicitud demasiado grande. Máximo permitido: 15 MB.");
+  }
+  const hasBody = declaredLength > 0 || Boolean(req.headers["transfer-encoding"]);
+  const contentType = String(req.headers["content-type"] || "").trim();
+  if (hasBody && !/^application\/(?:[\w.+-]*\+)?json(?:\s*;|$)/i.test(contentType)) {
+    throw new HttpRequestError(415, "JSON_CONTENT_TYPE_REQUIRED", "El contenido debe enviarse en formato JSON.");
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 15_000_000) throw new Error("Solicitud demasiado grande");
+    if (size > 15_000_000) throw new HttpRequestError(413, "PAYLOAD_TOO_LARGE", "Solicitud demasiado grande. Máximo permitido: 15 MB.");
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    throw new HttpRequestError(400, "INVALID_JSON", "El contenido JSON no es válido.");
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new HttpRequestError(400, "JSON_OBJECT_REQUIRED", "La solicitud debe contener un objeto o una lista JSON.");
+  }
+  validateJsonComplexity(parsed);
+  return parsed;
 }
 
 function extractJson(text) {
@@ -5554,8 +5595,10 @@ const server = http.createServer((req, res) => {
     if (!res.headersSent) {
       applyBrowserSecurityHeaders(res);
       res.setHeader("X-Request-Id", requestId);
-      return json(res, 500, {
-        error: "Ocurrió un error inesperado. Informa el código de seguimiento al administrador.",
+      const safeStatus = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500 ? error.status : 500;
+      return json(res, safeStatus, {
+        code: safeStatus < 500 ? error.code : "INTERNAL_ERROR",
+        error: safeStatus < 500 ? error.message : "Ocurrió un error inesperado. Informa el código de seguimiento al administrador.",
         requestId
       });
     }
