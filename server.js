@@ -110,7 +110,33 @@ import {
 const root = fileURLToPath(new URL(".", import.meta.url));
 const port = Number(process.env.PORT || 3000);
 const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".jpg": "image/jpeg", ".png": "image/png", ".md": "text/markdown; charset=utf-8" };
-const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined }) : null;
+function boundedNumber(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Math.min(maximum, Math.max(minimum, Number.isFinite(parsed) ? parsed : fallback));
+}
+const databasePoolMax = boundedNumber(process.env.DB_POOL_MAX, 10, 2, 30);
+const databaseStatementTimeoutMs = boundedNumber(process.env.DB_STATEMENT_TIMEOUT_MS, 15_000, 3_000, 120_000);
+const databaseConnectionTimeoutMs = boundedNumber(process.env.DB_CONNECTION_TIMEOUT_MS, 5_000, 1_000, 30_000);
+const pool = process.env.DATABASE_URL ? new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined,
+  max: databasePoolMax,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: databaseConnectionTimeoutMs,
+  statement_timeout: databaseStatementTimeoutMs,
+  query_timeout: databaseStatementTimeoutMs + 2_000,
+  keepAlive: true,
+  application_name: "inventario-icc1",
+  maxUses: 7_500
+}) : null;
+if (pool) {
+  pool.on("error", error => {
+    console.error(JSON.stringify({
+      type: "database_pool_error",
+      error: error?.message || "Conexión PostgreSQL interrumpida"
+    }));
+  });
+}
 const maxFileBytes = Number(process.env.MAX_FILE_BYTES || 8_000_000);
 let logisticsReady = false;
 let logisticsOrganizationId = "";
@@ -2463,7 +2489,11 @@ async function readinessSnapshot() {
   if (pool) {
     try {
       await pool.query({ text: "SELECT 1 AS ready", query_timeout: 3000 });
-      checks.database = { ok: true, detail: "PostgreSQL responde" };
+      checks.database = {
+        ok: true,
+        detail: "PostgreSQL responde",
+        connections: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount, maximum: databasePoolMax }
+      };
     } catch {
       checks.database = { ok: false, detail: "PostgreSQL no responde dentro del plazo" };
     }
