@@ -249,6 +249,9 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - El servidor genera un identificador nuevo para cada carga y nunca acepta uno elegido por el navegador.
 - PostgreSQL impide sustituir contenido, tamaño, proveedor o huella después del registro.
 - La eliminación sólo puede habilitarse dentro del proceso formal de disposición documental.
+- Cada descarga registra usuario, propósito, categoría, centro y documento asociado.
+- El registro de acceso no conserva direcciones IP, tokens ni credenciales del usuario.
+- Firmas, EPP, inspecciones y antecedentes de trabajadores se distinguen para facilitar auditorías.
 
 ## Gobierno de versiones y despliegues
 

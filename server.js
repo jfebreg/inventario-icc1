@@ -661,6 +661,33 @@ function fileIntegrityHeaders(integrity, size) {
   };
 }
 
+function personalDataCategoryForFile(row) {
+  const value = `${row?.category || ""} ${row?.filename || ""}`.toLowerCase();
+  if (value.includes("firma") || value.includes("signature")) return "SIGNATURE";
+  if (value.includes("epp") || value.includes("ppe")) return "PPE_EVIDENCE";
+  if (value.includes("inspe") || value.includes("inspection")) return "INSPECTION_EVIDENCE";
+  if (value.includes("trabajador") || value.includes("worker")) return "WORKER_RECORD";
+  return "DOCUMENT";
+}
+
+async function recordFileAccess(profile, row, requestId) {
+  const linked = await pool.query(`SELECT link.entity_type,link.entity_id
+    FROM logistics_documents document
+    LEFT JOIN logistics_document_links link ON link.document_id=document.id
+    WHERE document.file_object_id=$1
+    ORDER BY link.created_at LIMIT 1`, [row.id]);
+  const entity = linked.rows[0] || {};
+  await pool.query(`INSERT INTO logistics_personal_data_access_log
+    (organization_id,actor_profile_id,purpose,data_category,subject_reference,
+     entity_type,entity_id,metadata)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+  [logisticsOrganizationId, profile.id,
+    profile.admin ? "Descarga administrativa de evidencia" : "Consulta operativa autorizada",
+    personalDataCategoryForFile(row), String(row.ref || "") || null,
+    entity.entity_type || "file", entity.entity_id || row.id,
+    asJson({ requestId, center: row.payload?.center || "", category: row.category || "", provider: row.provider || "" })]);
+}
+
 function parseWorkerLine(raw, center) {
   const [name, email, phone] = String(raw || "").split(/[|;]/).map(x => x.trim());
   return { id: `${center.id || center.name}:${name || raw}`.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: name || raw || "Sin nombre", email: email || "", phone: phone || "" };
@@ -5649,11 +5676,13 @@ async function handleHttpRequest(req, res, requestId) {
         if (!response.ok) throw new Error("No se pudo leer archivo desde Supabase");
         const body = Buffer.from(await response.arrayBuffer());
         const integrity = await verifyFileIntegrity(row, body, apiProfile);
+        await recordFileAccess(apiProfile, row, requestId);
         res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"`, ...fileIntegrityHeaders(integrity, body.length) });
         return res.end(body);
       }
       const body = Buffer.from(row.data_base64 || "", "base64");
       const integrity = await verifyFileIntegrity(row, body, apiProfile);
+      await recordFileAccess(apiProfile, row, requestId);
       res.writeHead(200, { "Content-Type": row.mime_type || "application/octet-stream", "Content-Disposition": `attachment; filename="${safeName(row.filename)}"`, ...fileIntegrityHeaders(integrity, body.length) });
       return res.end(body);
     } catch (error) {
