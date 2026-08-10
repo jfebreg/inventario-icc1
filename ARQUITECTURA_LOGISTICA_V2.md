@@ -246,6 +246,9 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - La carga acepta solamente PDF, imágenes, Word, Excel y texto operativo autorizado.
 - El servidor revisa la firma binaria real; cambiar la extensión de un ejecutable no permite archivarlo.
 - Los formatos activos como HTML y SVG no se almacenan como documentos de evidencia.
+- El servidor genera un identificador nuevo para cada carga y nunca acepta uno elegido por el navegador.
+- PostgreSQL impide sustituir contenido, tamaño, proveedor o huella después del registro.
+- La eliminación sólo puede habilitarse dentro del proceso formal de disposición documental.
 
 ## Gobierno de versiones y despliegues
 

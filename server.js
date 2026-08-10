@@ -592,7 +592,7 @@ async function createInspectionPdf(body) {
 
 async function uploadFileObject(body) {
   if (!pool) throw new Error("DATABASE_URL no configurada");
-  const id = body.id || `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = `file-${randomUUID()}`;
   const filename = safeName(body.filename);
   const category = safeName(body.category || "documentos");
   const ref = String(body.ref || "");
@@ -612,7 +612,7 @@ async function uploadFileObject(body) {
         "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
         "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY,
         "Content-Type": mimeType,
-        "x-upsert": "true"
+        "x-upsert": "false"
       },
       body: data
     }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
@@ -621,8 +621,7 @@ async function uploadFileObject(body) {
   }
 
   await pool.query(`INSERT INTO inventory_file_objects (id, filename, mime_type, category, ref, size_bytes, provider, storage_path, public_url, data_base64, payload)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
-    ON CONFLICT (id) DO UPDATE SET filename=EXCLUDED.filename, mime_type=EXCLUDED.mime_type, category=EXCLUDED.category, ref=EXCLUDED.ref, size_bytes=EXCLUDED.size_bytes, provider=EXCLUDED.provider, storage_path=EXCLUDED.storage_path, public_url=EXCLUDED.public_url, data_base64=EXCLUDED.data_base64, payload=EXCLUDED.payload`,
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)`,
     [id, filename, mimeType, category, ref, data.length, provider, storagePath, publicUrl, provider === "postgres" ? base64 : "", asJson({ originalName: body.filename, uploadedBy: body.uploadedBy || "", code: body.code || "", center: body.center || "", sha256 })]);
 
   return { id, filename, mimeType, size: data.length, provider, path: storagePath, publicUrl, sha256, downloadUrl: `/api/files/${encodeURIComponent(id)}` };
