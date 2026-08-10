@@ -417,11 +417,56 @@ function safeName(value) {
 
 function decodeDataUrl(dataUrl) {
   const match = String(dataUrl || "").match(/^data:([^;,]+)?(;base64)?,(.*)$/);
-  if (!match) throw new Error("Archivo inválido");
-  const mimeType = match[1] || "application/octet-stream";
+  if (!match) throw new HttpRequestError(422, "INVALID_FILE_DATA", "El archivo no tiene un formato de datos válido.");
+  if (match[2] && (!/^[A-Za-z0-9+/]*={0,2}$/.test(match[3]) || match[3].length % 4 === 1)) {
+    throw new HttpRequestError(422, "INVALID_BASE64", "El contenido codificado del archivo no es válido.");
+  }
+  const mimeType = String(match[1] || "application/octet-stream").toLowerCase();
   const data = match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3] || ""), "utf8");
-  if (data.length > maxFileBytes) throw new Error(`Archivo demasiado grande. Máximo permitido: ${Math.round(maxFileBytes / 1_000_000)} MB`);
+  if (data.length > maxFileBytes) throw new HttpRequestError(413, "FILE_TOO_LARGE", `Archivo demasiado grande. Máximo permitido: ${Math.round(maxFileBytes / 1_000_000)} MB`);
   return { mimeType, data, base64: data.toString("base64") };
+}
+
+function fileSignatureMatches(kind, data) {
+  if (!data?.length) return false;
+  if (kind === "pdf") return data.subarray(0, 5).toString("ascii") === "%PDF-";
+  if (kind === "jpeg") return data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+  if (kind === "png") return data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  if (kind === "webp") return data.length >= 12 && data.subarray(0, 4).toString("ascii") === "RIFF" && data.subarray(8, 12).toString("ascii") === "WEBP";
+  if (kind === "ole") return data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+  if (kind === "docx" || kind === "xlsx") {
+    if (data.length < 4 || data[0] !== 0x50 || data[1] !== 0x4b) return false;
+    const indexText = data.toString("latin1");
+    return indexText.includes("[Content_Types].xml") && indexText.includes(kind === "docx" ? "word/" : "xl/");
+  }
+  if (kind === "text") return !data.includes(0) && !data.subarray(0, 512).toString("utf8").includes("\uFFFD");
+  return false;
+}
+
+function decodeValidatedFile(dataUrl, filename) {
+  const decoded = decodeDataUrl(dataUrl);
+  const extension = String(filename || "").toLowerCase().match(/\.[a-z0-9]+$/)?.[0] || "";
+  const rules = {
+    ".pdf": { kind: "pdf", mime: ["application/pdf"] },
+    ".jpg": { kind: "jpeg", mime: ["image/jpeg"] },
+    ".jpeg": { kind: "jpeg", mime: ["image/jpeg"] },
+    ".png": { kind: "png", mime: ["image/png"] },
+    ".webp": { kind: "webp", mime: ["image/webp"] },
+    ".docx": { kind: "docx", mime: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"] },
+    ".xlsx": { kind: "xlsx", mime: ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] },
+    ".xlsm": { kind: "xlsx", mime: ["application/vnd.ms-excel.sheet.macroenabled.12"] },
+    ".doc": { kind: "ole", mime: ["application/msword"] },
+    ".xls": { kind: "ole", mime: ["application/vnd.ms-excel"] },
+    ".csv": { kind: "text", mime: ["text/csv", "application/csv", "text/plain"] },
+    ".txt": { kind: "text", mime: ["text/plain"] }
+  };
+  const rule = rules[extension];
+  const mimeAllowed = rule && (rule.mime.includes(decoded.mimeType) || decoded.mimeType === "application/octet-stream");
+  if (!mimeAllowed) throw new HttpRequestError(415, "FILE_TYPE_NOT_ALLOWED", "Tipo de archivo no permitido. Usa PDF, imagen, Word, Excel, CSV o TXT.");
+  if (!fileSignatureMatches(rule.kind, decoded.data)) {
+    throw new HttpRequestError(422, "FILE_SIGNATURE_MISMATCH", "El contenido real del archivo no coincide con su nombre o formato declarado.");
+  }
+  return { ...decoded, extension };
 }
 
 function dataUrlBuffer(value) {
@@ -551,7 +596,7 @@ async function uploadFileObject(body) {
   const filename = safeName(body.filename);
   const category = safeName(body.category || "documentos");
   const ref = String(body.ref || "");
-  const { mimeType, data, base64 } = decodeDataUrl(body.dataUrl);
+  const { mimeType, data, base64 } = decodeValidatedFile(body.dataUrl, body.filename);
   const sha256 = createHash("sha256").update(data).digest("hex");
   let provider = "postgres";
   let storagePath = "";
@@ -5509,13 +5554,16 @@ async function handleHttpRequest(req, res, requestId) {
   }
 
   if (url.pathname === "/api/ai/analyze" && req.method === "POST") {
+    if (!profileCan(apiProfile, "ai")) return json(res, 403, { error: "Tu perfil no puede digitalizar documentos con IA." });
     try {
       const body = await readJson(req);
       if (!body.kind || !body.filename || !body.dataUrl) return json(res, 400, { error: "Faltan datos del documento" });
+      const validatedFile = decodeValidatedFile(body.dataUrl, body.filename);
+      body.mime = validatedFile.mimeType;
       const result = await analyzeWithOpenAI(body);
       return json(res, 200, result);
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo analizar el documento" });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo analizar el documento" });
     }
   }
 
@@ -5556,7 +5604,7 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, { ...result, canonicalDocumentId: canonical?.document?.id || "" });
     } catch (error) {
       console.error("Error subiendo archivo:", error.message);
-      return json(res, 400, { error: error.message || "No se pudo guardar el archivo" });
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo guardar el archivo" });
     }
   }
 

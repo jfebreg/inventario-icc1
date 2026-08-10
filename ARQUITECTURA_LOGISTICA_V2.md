@@ -243,6 +243,9 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   ambos valores y bloquea cualquier diferencia.
 - Una falla de integridad queda registrada en auditoría con archivo, proveedor y responsable.
 - Las descargas válidas informan su huella mediante encabezados verificables sin volver público el bucket.
+- La carga acepta solamente PDF, imágenes, Word, Excel y texto operativo autorizado.
+- El servidor revisa la firma binaria real; cambiar la extensión de un ejecutable no permite archivarlo.
+- Los formatos activos como HTML y SVG no se almacenan como documentos de evidencia.
 
 ## Gobierno de versiones y despliegues
 
