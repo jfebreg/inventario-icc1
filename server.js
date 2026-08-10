@@ -670,6 +670,82 @@ function personalDataCategoryForFile(row) {
   return "DOCUMENT";
 }
 
+async function monitorFileAccess(profile, accessId) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))",
+      [`file-access:${logisticsOrganizationId}:${profile.id}`]);
+    const activity = (await client.query(`SELECT
+        COUNT(*)::int AS access_count,
+        COUNT(*) FILTER (WHERE data_category IN
+          ('SIGNATURE','PPE_EVIDENCE','WORKER_RECORD'))::int AS sensitive_access_count,
+        COUNT(DISTINCT COALESCE(entity_id,subject_reference))::int AS distinct_file_count,
+        MIN(accessed_at) AS window_started_at,MAX(accessed_at) AS window_ended_at
+      FROM logistics_personal_data_access_log
+      WHERE organization_id=$1 AND actor_profile_id::text=$2::text
+        AND accessed_at>=NOW()-INTERVAL '15 minutes'
+        AND metadata ? 'requestId'`, [logisticsOrganizationId, profile.id])).rows[0];
+    const accessCount = Number(activity?.access_count || 0);
+    const sensitiveCount = Number(activity?.sensitive_access_count || 0);
+    const distinctCount = Number(activity?.distinct_file_count || 0);
+    if (sensitiveCount < 10 && accessCount < 25 && distinctCount < 15) {
+      await client.query("COMMIT");
+      return null;
+    }
+    const existing = (await client.query(`SELECT id FROM logistics_file_access_alerts
+      WHERE organization_id=$1 AND actor_profile_id::text=$2::text
+        AND status IN ('OPEN','REVIEWING') AND created_at>=NOW()-INTERVAL '15 minutes'
+      ORDER BY created_at DESC LIMIT 1`, [logisticsOrganizationId, profile.id])).rows[0];
+    if (existing) {
+      await client.query(`UPDATE logistics_file_access_alerts SET
+        window_ended_at=$1,access_count=$2,sensitive_access_count=$3,
+        distinct_file_count=$4,evidence=$5::jsonb,updated_at=NOW() WHERE id=$6`,
+      [activity.window_ended_at, accessCount, sensitiveCount, distinctCount,
+        asJson({ latestAccessId: accessId, windowMinutes: 15 }), existing.id]);
+      await client.query("COMMIT");
+      return existing;
+    }
+    const riskLevel = sensitiveCount >= 20 || accessCount >= 50 ? "CRITICAL"
+      : sensitiveCount >= 10 || distinctCount >= 15 ? "HIGH" : "MEDIUM";
+    const reason = `${accessCount} descargas, ${sensitiveCount} sensibles y ${distinctCount} archivos distintos en 15 minutos.`;
+    const alert = (await client.query(`INSERT INTO logistics_file_access_alerts
+      (organization_id,actor_profile_id,window_started_at,window_ended_at,access_count,
+       sensitive_access_count,distinct_file_count,risk_level,reason,evidence)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING *`,
+    [logisticsOrganizationId, profile.id, activity.window_started_at,
+      activity.window_ended_at, accessCount, sensitiveCount, distinctCount,
+      riskLevel, reason, asJson({ latestAccessId: accessId, windowMinutes: 15 })])).rows[0];
+    await client.query(`INSERT INTO logistics_file_access_alert_events
+      (organization_id,alert_id,event_type,new_status,actor_profile_id,detail,payload)
+      VALUES ($1,$2,'ANOMALY_DETECTED','OPEN',$3,$4,$5::jsonb)`,
+    [logisticsOrganizationId, alert.id, profile.id, reason, asJson({ riskLevel })]);
+    await client.query(`INSERT INTO inventory_tasks
+      (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,payload,updated_at)
+      VALUES ($1,'Acceso documental anómalo',$2,$3,$4,'Pendiente','Bodega Central',
+        'file_access_alert',$5,$6::jsonb,NOW()) ON CONFLICT (id) DO NOTHING`,
+    [`file-access-alert-${alert.id}`, `Revisar descargas de ${profile.name || profile.id}`,
+      reason, riskLevel === "CRITICAL" ? "Crítica" : "Alta", alert.id, asJson(alert)]);
+    await client.query(`INSERT INTO inventory_notifications
+      (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,
+       entity_type,entity_id,payload)
+      SELECT $1||'-'||profile.id,profile.auth_user_id,'Bodega Central',
+        'FILE_ACCESS_ANOMALY',$2,$3,$4,'file_access_alert',$5,$6::jsonb
+      FROM inventory_user_profiles profile
+      WHERE profile.admin=TRUE AND profile.active=TRUE AND profile.auth_user_id IS NOT NULL
+      ON CONFLICT (id) DO NOTHING`, [`file-access-alert-${alert.id}`,
+      `Alerta de acceso documental: ${profile.name || profile.id}`, reason,
+      riskLevel === "CRITICAL" ? "critical" : "warning", alert.id, asJson(alert)]);
+    await client.query("COMMIT");
+    return alert;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function recordFileAccess(profile, row, requestId) {
   const linked = await pool.query(`SELECT link.entity_type,link.entity_id
     FROM logistics_documents document
@@ -677,15 +753,21 @@ async function recordFileAccess(profile, row, requestId) {
     WHERE document.file_object_id=$1
     ORDER BY link.created_at LIMIT 1`, [row.id]);
   const entity = linked.rows[0] || {};
-  await pool.query(`INSERT INTO logistics_personal_data_access_log
+  const access = (await pool.query(`INSERT INTO logistics_personal_data_access_log
     (organization_id,actor_profile_id,purpose,data_category,subject_reference,
      entity_type,entity_id,metadata)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id`,
   [logisticsOrganizationId, profile.id,
     profile.admin ? "Descarga administrativa de evidencia" : "Consulta operativa autorizada",
     personalDataCategoryForFile(row), String(row.ref || "") || null,
     entity.entity_type || "file", entity.entity_id || row.id,
-    asJson({ requestId, center: row.payload?.center || "", category: row.category || "", provider: row.provider || "" })]);
+    asJson({ requestId, center: row.payload?.center || "", category: row.category || "", provider: row.provider || "" })])).rows[0];
+  try {
+    await monitorFileAccess(profile, access.id);
+  } catch (error) {
+    console.error(JSON.stringify({ type: "file_access_monitor_failure", requestId,
+      profileId: profile.id, error: error.message }));
+  }
 }
 
 function parseWorkerLine(raw, center) {
@@ -1517,7 +1599,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("047_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("049_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2078,9 +2160,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("047_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("049_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("047_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("049_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4999,7 +5081,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar datos personales." });
     }
-    const [activities, requests, accessLog, privacyIncidents] = await Promise.all([
+    const [activities, requests, accessLog, privacyIncidents, accessAlerts] = await Promise.all([
       pool.query(`SELECT * FROM logistics_privacy_activities
         WHERE organization_id=$1 ORDER BY activity_code`, [logisticsOrganizationId]),
       pool.query(`SELECT request.*,assignee.name AS assigned_to_name,
@@ -5028,7 +5110,15 @@ async function handleHttpRequest(req, res, requestId) {
         LEFT JOIN inventory_user_profiles detector
           ON detector.id::text=incident.detected_by::text
         WHERE incident.organization_id=$1
-        ORDER BY incident.detected_at DESC LIMIT 100`, [logisticsOrganizationId])
+        ORDER BY incident.detected_at DESC LIMIT 100`, [logisticsOrganizationId]),
+      pool.query(`SELECT alert.*,profile.name AS actor_name,reviewer.name AS reviewed_by_name
+        FROM logistics_file_access_alerts alert
+        LEFT JOIN inventory_user_profiles profile
+          ON profile.id::text=alert.actor_profile_id::text
+        LEFT JOIN inventory_user_profiles reviewer
+          ON reviewer.id::text=alert.reviewed_by::text
+        WHERE alert.organization_id=$1
+        ORDER BY alert.created_at DESC LIMIT 100`, [logisticsOrganizationId])
     ]);
     await pool.query(`INSERT INTO logistics_personal_data_access_log
       (organization_id,actor_profile_id,purpose,data_category,metadata)
@@ -5039,8 +5129,76 @@ async function handleHttpRequest(req, res, requestId) {
       activities: activities.rows,
       requests: requests.rows,
       accessLog: accessLog.rows,
-      incidents: privacyIncidents.rows
+      incidents: privacyIncidents.rows,
+      accessAlerts: accessAlerts.rows
     });
+  }
+
+  const fileAccessAlertRoute = url.pathname.match(
+    /^\/api\/admin\/file-access-alerts\/([0-9a-f-]+)$/i);
+  if (fileAccessAlertRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede revisar alertas de acceso." });
+    }
+    const client = await pool.connect();
+    try {
+      const body = await readJson(req);
+      const status = String(body.status || "").toUpperCase();
+      const notes = String(body.notes || "").trim();
+      if (!["REVIEWING", "DISMISSED", "CONFIRMED"].includes(status)) {
+        throw new Error("Estado de revisión no permitido.");
+      }
+      if (["DISMISSED", "CONFIRMED"].includes(status) && notes.length < 10) {
+        throw new Error("La conclusión debe explicar el resultado de la revisión.");
+      }
+      await client.query("BEGIN");
+      const current = (await client.query(`SELECT * FROM logistics_file_access_alerts
+        WHERE id=$1 AND organization_id=$2 FOR UPDATE`,
+      [fileAccessAlertRoute[1], logisticsOrganizationId])).rows[0];
+      if (!current) throw new Error("Alerta de acceso no encontrada.");
+      if (["DISMISSED", "CONFIRMED"].includes(current.status)) {
+        throw new Error("La alerta ya fue cerrada y su conclusión es inalterable.");
+      }
+      const alert = (await client.query(`UPDATE logistics_file_access_alerts SET
+        status=$1,reviewed_by=$2,reviewed_at=CASE WHEN $1 IN ('DISMISSED','CONFIRMED')
+          THEN NOW() ELSE reviewed_at END,review_notes=$3,updated_at=NOW()
+        WHERE id=$4 RETURNING *`,
+      [status, apiProfile.id, notes || null, current.id])).rows[0];
+      await client.query(`INSERT INTO logistics_file_access_alert_events
+        (organization_id,alert_id,event_type,previous_status,new_status,
+         actor_profile_id,detail,payload)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+      [logisticsOrganizationId, alert.id,
+        status === "REVIEWING" ? "REVIEW_STARTED" : "REVIEW_COMPLETED",
+        current.status, status, apiProfile.id, notes || "Revisión administrativa iniciada.",
+        asJson({ riskLevel: alert.risk_level, accessCount: alert.access_count })]);
+      await client.query(`UPDATE inventory_tasks SET status=$1,
+        resolved_at=CASE WHEN $1='Resuelta' THEN NOW() ELSE NULL END,updated_at=NOW()
+        WHERE id=$2`, [status === "REVIEWING" ? "En proceso" : "Resuelta",
+        `file-access-alert-${alert.id}`]);
+      if (status === "CONFIRMED") {
+        await client.query(`INSERT INTO inventory_tasks
+          (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,payload,updated_at)
+          VALUES ($1,'Incidente de privacidad',$2,$3,'Crítica','Pendiente','Bodega Central',
+            'file_access_alert',$4,$5::jsonb,NOW()) ON CONFLICT (id) DO NOTHING`,
+        [`privacy-followup-${alert.id}`, "Formalizar incidente por acceso documental confirmado",
+          notes, alert.id, asJson(alert)]);
+      }
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,before_data,after_data)
+        VALUES ($1,'FILE_ACCESS_ALERT_REVIEWED','file_access_alert',$2,$3,$4,
+          'WEB',$5::jsonb,$6::jsonb)`, [logisticsOrganizationId, alert.id,
+        apiProfile.id, `file-access-alert:${alert.id}:${status}`,
+        asJson({ status: current.status }), asJson({ status, notes })]);
+      await client.query("COMMIT");
+      return json(res, 200, { alert });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 400, { error: error.message || "No se pudo revisar la alerta de acceso." });
+    } finally {
+      client.release();
+    }
   }
 
   if (url.pathname === "/api/admin/data-subject-requests" && req.method === "POST") {

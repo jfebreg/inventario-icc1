@@ -294,3 +294,16 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Cada transición queda en un historial inalterable y en la auditoría logística.
 - La aplicación registra la decisión; los plazos y destinatarios legales deben validarse
   con asesoría jurídica según el contrato y la normativa aplicable.
+
+## Detección de accesos documentales anómalos
+
+- Las descargas de evidencias se analizan en ventanas de 15 minutos por usuario.
+- El sistema genera alertas por volumen elevado, cantidad de archivos distintos o acceso
+  reiterado a firmas, registros EPP y antecedentes de trabajadores.
+- Una alerta no interrumpe una descarga autorizada, pero crea una tarea prioritaria y una
+  notificación para administración.
+- Las alertas se revisan, descartan o confirman con fundamento obligatorio.
+- Confirmar un acceso no autorizado genera una tarea crítica para formalizar el incidente
+  de privacidad y aplicar el procedimiento de respuesta.
+- Cada detección y cambio de estado queda en un historial inalterable; no se almacenan
+  direcciones IP, tokens ni credenciales.
