@@ -867,6 +867,76 @@ async function runEvidenceVerification(profile, requestedLimit = 25) {
   return completed;
 }
 
+async function runDueEvidenceVerificationJobs() {
+  if (!pool || !logisticsReady) return { skipped: true, processed: 0 };
+  const lockClient = await pool.connect();
+  let locked = false;
+  try {
+    locked = Boolean((await lockClient.query(
+      "SELECT pg_try_advisory_lock(hashtext('icc:evidence-verification-scheduler')) AS acquired"
+    )).rows[0]?.acquired);
+    if (!locked) return { skipped: true, reason: "scheduler_locked", processed: 0 };
+    const jobs = (await pool.query(`SELECT * FROM logistics_scheduled_jobs
+      WHERE enabled=TRUE AND job_code='EVIDENCE_WEEKLY_VERIFICATION'
+        AND next_run_at<=NOW() ORDER BY next_run_at LIMIT 5`)).rows;
+    const results = [];
+    for (const job of jobs) {
+      await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='RUNNING',
+        last_started_at=NOW(),last_error=NULL,next_run_at=NOW()+INTERVAL '30 minutes',
+        updated_at=NOW() WHERE id=$1`, [job.id]);
+      try {
+        const profile = (await pool.query(`SELECT * FROM inventory_user_profiles
+          WHERE admin=TRUE AND active=TRUE ORDER BY activated_at NULLS LAST,created_at LIMIT 1`)).rows[0];
+        if (!profile) throw new Error("No existe un administrador activo para firmar la comprobación.");
+        const run = await runEvidenceVerification(profile, job.batch_limit || 25);
+        const summary = { runId: run.id, status: run.status,
+          verified: run.verified_count, missing: run.missing_count,
+          corrupt: run.corrupt_count, errors: run.error_count };
+        await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='SUCCESS',
+          last_completed_at=NOW(),last_error=NULL,last_result=$2::jsonb,
+          next_run_at=((((NOW() AT TIME ZONE timezone_name)::date+schedule_interval_days)
+            +make_interval(hours=>local_hour)) AT TIME ZONE timezone_name),updated_at=NOW()
+          WHERE id=$1`, [job.id, asJson(summary)]);
+        await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
+          resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+          WHERE id=$1 AND status<>'Resuelta'`, [`scheduler-${job.id}`]);
+        results.push({ jobId: job.id, ok: true, ...summary });
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 2000);
+        await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='FAILED',
+          last_completed_at=NOW(),last_error=$2,last_result='{}'::jsonb,
+          next_run_at=NOW()+INTERVAL '4 hours',updated_at=NOW() WHERE id=$1`,
+        [job.id, message]);
+        await pool.query(`INSERT INTO inventory_tasks
+          (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,
+           due_at,payload,updated_at)
+          VALUES ($1,'SCHEDULER_FAILURE','Falló la verificación automática de evidencias',$2,
+            'Crítica','Pendiente','Bodega Central','scheduled_job',$3,
+            NOW()+INTERVAL '4 hours',$4::jsonb,NOW())
+          ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,priority='Crítica',
+            status='Pendiente',resolved_at=NULL,due_at=EXCLUDED.due_at,
+            payload=EXCLUDED.payload,updated_at=NOW()`,
+        [`scheduler-${job.id}`, message, job.id,
+          asJson({ jobCode: job.job_code, failedAt: new Date().toISOString() })]);
+        await pool.query(`INSERT INTO inventory_notifications
+          (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+          VALUES ($1,'Bodega Central','SCHEDULER_FAILURE',$2,$3,'critical',
+            'scheduled_job',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
+        [`notification-scheduler-${job.id}-${new Date().toISOString().slice(0, 10)}`,
+          "Falló la verificación automática de evidencias", message, job.id,
+          asJson({ jobCode: job.job_code })]);
+        results.push({ jobId: job.id, ok: false, error: message });
+      }
+    }
+    return { skipped: false, processed: jobs.length, results };
+  } finally {
+    if (locked) await lockClient.query(
+      "SELECT pg_advisory_unlock(hashtext('icc:evidence-verification-scheduler'))"
+    ).catch(() => {});
+    lockClient.release();
+  }
+}
+
 function parseWorkerLine(raw, center) {
   const [name, email, phone] = String(raw || "").split(/[|;]/).map(x => x.trim());
   return { id: `${center.id || center.name}:${name || raw}`.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: name || raw || "Sin nombre", email: email || "", phone: phone || "" };
@@ -1696,7 +1766,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("050_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("051_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2084,7 +2154,9 @@ async function sweepScheduledLogisticsJobs() {
   }
   logisticsJobSweepRunning = true;
   try {
-    return await runDueLogisticsJobs(pool);
+    const evidence = await runDueEvidenceVerificationJobs();
+    const logistics = await runDueLogisticsJobs(pool);
+    return { ...logistics, evidence };
   } finally {
     logisticsJobSweepRunning = false;
   }
@@ -2257,9 +2329,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("050_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("051_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("050_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("051_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -2351,6 +2423,23 @@ async function productionReadiness() {
           : "La automatizacion esta detenida.";
   add("scheduler", "Cierre automatico de indicadores", schedulerStatus, schedulerDetail,
     schedulerStatus === "PASS" ? "" : "Abrir Reportes, entrar a Automatizacion y ejecutar la recuperacion.");
+
+  const evidenceSchedule = (await pool.query(`SELECT enabled,next_run_at,last_completed_at,
+      last_status,last_error FROM logistics_scheduled_jobs
+    WHERE organization_id=$1 AND job_code='EVIDENCE_WEEKLY_VERIFICATION' LIMIT 1`,
+  [logisticsOrganizationId])).rows[0];
+  const evidenceAgeDays = evidenceSchedule?.last_completed_at
+    ? (Date.now() - new Date(evidenceSchedule.last_completed_at).getTime()) / 86_400_000 : null;
+  const evidenceScheduleStatus = !evidenceSchedule || evidenceSchedule.last_status === "FAILED"
+    ? "FAIL" : !evidenceSchedule.enabled || evidenceAgeDays === null || evidenceAgeDays > 8
+      ? "WARN" : "PASS";
+  const evidenceScheduleDetail = !evidenceSchedule ? "No existe la agenda semanal."
+    : evidenceSchedule.last_status === "FAILED" ? `Última ejecución fallida: ${evidenceSchedule.last_error || "sin detalle"}.`
+      : evidenceAgeDays === null ? `Primera ejecución programada para ${new Date(evidenceSchedule.next_run_at).toLocaleString("es-CL")}.`
+        : `Última comprobación hace ${Math.floor(evidenceAgeDays)} día(s).`;
+  add("evidenceAutomation", "Verificación automática de evidencias",
+    evidenceScheduleStatus, evidenceScheduleDetail,
+    evidenceScheduleStatus === "PASS" ? "" : "Abrir Configuración y ejecutar una comprobación manual.");
 
   const outbox = await listOutboxHealth(pool, logisticsOrganizationId);
   const deadLetters = Number(outbox.summary?.dead_letter || 0);

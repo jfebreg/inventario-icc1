@@ -316,3 +316,7 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Los resultados distinguen archivo verificado, faltante, alterado y error de proveedor.
 - Una diferencia crea una tarea crítica sin sustituir ni eliminar el registro original.
 - Cada ejecución conserva responsable, fecha, cantidades y resultados inalterables.
+- Una agenda semanal revisa 25 evidencias, priorizando las nunca comprobadas y las más antiguas.
+- PostgreSQL aplica un bloqueo distribuido para impedir ejecuciones duplicadas entre instancias.
+- Si el proceso se interrumpe, vuelve a quedar disponible después de 30 minutos; una falla
+  controlada programa reintento en cuatro horas y genera una tarea crítica.
