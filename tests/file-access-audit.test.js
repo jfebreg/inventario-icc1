@@ -17,7 +17,7 @@ test("el registro relaciona la evidencia sin guardar IP ni credenciales", () => 
   assert.match(server, /logistics_document_links/);
   assert.match(server, /subject_reference/);
   assert.match(server, /asJson\(\{ requestId, center:/);
-  const helper = server.slice(server.indexOf("async function recordFileAccess"), server.indexOf("function parseWorkerLine"));
+  const helper = server.slice(server.indexOf("async function recordFileAccess"), server.indexOf("async function readEvidenceBody"));
   assert.doesNotMatch(helper, /remoteAddress|x-forwarded-for|authorization/i);
 });
 

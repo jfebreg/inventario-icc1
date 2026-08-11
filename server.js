@@ -770,6 +770,103 @@ async function recordFileAccess(profile, row, requestId) {
   }
 }
 
+async function readEvidenceBody(row) {
+  if (row.provider === "supabase") {
+    if (!row.storage_path || !storageConfigured()) {
+      const error = new Error("Storage de evidencia no configurado.");
+      error.evidenceStatus = "ERROR";
+      throw error;
+    }
+    const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${String(row.storage_path).split("/").map(encodeURIComponent).join("/")}`;
+    const response = await fetchWithTimeout(endpoint, { headers: {
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY
+    } }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
+    if (!response.ok) {
+      const error = new Error(response.status === 404
+        ? "El objeto no existe en Storage." : `Storage respondió ${response.status}.`);
+      error.evidenceStatus = response.status === 404 ? "MISSING" : "ERROR";
+      throw error;
+    }
+    return Buffer.from(await response.arrayBuffer());
+  }
+  if (!row.data_base64 && Number(row.size_bytes || 0) > 0) {
+    const error = new Error("El contenido PostgreSQL no está disponible.");
+    error.evidenceStatus = "MISSING";
+    throw error;
+  }
+  return Buffer.from(row.data_base64 || "", "base64");
+}
+
+async function runEvidenceVerification(profile, requestedLimit = 25) {
+  const limit = Math.min(100, Math.max(1, Number(requestedLimit) || 25));
+  const run = (await pool.query(`INSERT INTO logistics_evidence_verification_runs
+    (organization_id,requested_count,initiated_by) VALUES ($1,$2,$3) RETURNING *`,
+  [logisticsOrganizationId, limit, profile.id])).rows[0];
+  const files = (await pool.query(`SELECT file.*
+    FROM inventory_file_objects file
+    LEFT JOIN LATERAL (SELECT result.checked_at
+      FROM logistics_evidence_verification_results result
+      WHERE result.file_object_id=file.id ORDER BY result.checked_at DESC LIMIT 1) latest ON TRUE
+    WHERE EXISTS (SELECT 1 FROM logistics_documents document
+      WHERE document.file_object_id=file.id AND document.organization_id=$1)
+    ORDER BY latest.checked_at NULLS FIRST,file.created_at ASC LIMIT $2`,
+  [logisticsOrganizationId, limit])).rows;
+  const counts = { VERIFIED: 0, MISSING: 0, CORRUPT: 0, ERROR: 0 };
+  for (const row of files) {
+    const expectedSha256 = String(row.payload?.sha256 || "").trim().toLowerCase() || null;
+    const expectedSize = Number(row.size_bytes);
+    let status = "VERIFIED";
+    let body = null;
+    let actualSha256 = null;
+    let detail = "Contenido disponible y huella coincidente.";
+    try {
+      body = await readEvidenceBody(row);
+      actualSha256 = createHash("sha256").update(body).digest("hex");
+      const sizeMismatch = Number.isFinite(expectedSize) && expectedSize >= 0 && expectedSize !== body.length;
+      const hashMismatch = expectedSha256 && /^[0-9a-f]{64}$/.test(expectedSha256)
+        && !safeTokenEqual(expectedSha256, actualSha256);
+      if (sizeMismatch || hashMismatch) {
+        status = "CORRUPT";
+        detail = sizeMismatch ? "El tamaño no coincide con el registro original."
+          : "La huella SHA-256 no coincide con el registro original.";
+      }
+    } catch (error) {
+      status = error.evidenceStatus || "ERROR";
+      detail = error.message || "No fue posible verificar la evidencia.";
+    }
+    counts[status] += 1;
+    await pool.query(`INSERT INTO logistics_evidence_verification_results
+      (organization_id,run_id,file_object_id,status,expected_size,actual_size,
+       expected_sha256,actual_sha256,provider,detail)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [logisticsOrganizationId,
+      run.id, row.id, status, Number.isFinite(expectedSize) ? expectedSize : null,
+      body?.length ?? null, expectedSha256, actualSha256, row.provider, detail]);
+  }
+  const failureCount = counts.MISSING + counts.CORRUPT + counts.ERROR;
+  const completed = (await pool.query(`UPDATE logistics_evidence_verification_runs SET
+    status=$1,verified_count=$2,missing_count=$3,corrupt_count=$4,error_count=$5,
+    completed_at=NOW(),summary=$6::jsonb WHERE id=$7 RETURNING *`,
+  [failureCount ? "FAIL" : "PASS", counts.VERIFIED, counts.MISSING,
+    counts.CORRUPT, counts.ERROR, asJson({ checked: files.length, limit }), run.id])).rows[0];
+  if (failureCount) {
+    await pool.query(`INSERT INTO inventory_tasks
+      (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,payload,updated_at)
+      VALUES ($1,'Integridad documental',$2,$3,'Crítica','Pendiente','Bodega Central',
+        'evidence_verification',$4,$5::jsonb,NOW()) ON CONFLICT (id) DO NOTHING`,
+    [`evidence-verification-${run.id}`, "Revisar evidencias faltantes o alteradas",
+      `${counts.MISSING} faltante(s), ${counts.CORRUPT} alterada(s) y ${counts.ERROR} error(es).`,
+      run.id, asJson(completed)]);
+  }
+  await pool.query(`INSERT INTO logistics_audit_events
+    (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+     correlation_id,source,after_data)
+    VALUES ($1,'EVIDENCE_VERIFICATION_COMPLETED','evidence_verification',$2,$3,$4,
+      'SYSTEM',$5::jsonb)`, [logisticsOrganizationId, run.id, profile.id,
+    `evidence-verification:${run.id}`, asJson(completed)]);
+  return completed;
+}
+
 function parseWorkerLine(raw, center) {
   const [name, email, phone] = String(raw || "").split(/[|;]/).map(x => x.trim());
   return { id: `${center.id || center.name}:${name || raw}`.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: name || raw || "Sin nombre", email: email || "", phone: phone || "" };
@@ -1599,7 +1696,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("049_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("050_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2160,9 +2257,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("049_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("050_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("049_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("050_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4924,6 +5021,39 @@ async function handleHttpRequest(req, res, requestId) {
       return res.end(backup.body);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo exportar el libro mayor V2." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/evidence-verification-runs" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede consultar evidencias." });
+    }
+    const [runs, failures] = await Promise.all([
+      pool.query(`SELECT run.*,profile.name AS initiated_by_name
+        FROM logistics_evidence_verification_runs run
+        LEFT JOIN inventory_user_profiles profile
+          ON profile.id::text=run.initiated_by::text
+        WHERE run.organization_id=$1 ORDER BY run.started_at DESC LIMIT 30`,
+      [logisticsOrganizationId]),
+      pool.query(`SELECT result.*,file.filename,file.category
+        FROM logistics_evidence_verification_results result
+        JOIN inventory_file_objects file ON file.id=result.file_object_id
+        WHERE result.organization_id=$1 AND result.status<>'VERIFIED'
+        ORDER BY result.checked_at DESC LIMIT 100`, [logisticsOrganizationId])
+    ]);
+    return json(res, 200, { runs: runs.rows, failures: failures.rows });
+  }
+
+  if (url.pathname === "/api/admin/evidence-verification-runs" && req.method === "POST") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede verificar evidencias." });
+    }
+    try {
+      const body = await readJson(req);
+      const run = await runEvidenceVerification(apiProfile, body.limit);
+      return json(res, 201, { run });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo verificar la evidencia." });
     }
   }
 

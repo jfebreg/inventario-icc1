@@ -307,3 +307,12 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   de privacidad y aplicar el procedimiento de respuesta.
 - Cada detección y cambio de estado queda en un historial inalterable; no se almacenan
   direcciones IP, tokens ni credenciales.
+
+## Disponibilidad verificable de evidencias
+
+- Administración puede comprobar por lotes los archivos con mayor antigüedad de revisión.
+- Cada comprobación recupera el contenido real desde Supabase Storage o PostgreSQL,
+  recalcula tamaño y SHA-256 y lo compara con el registro de carga.
+- Los resultados distinguen archivo verificado, faltante, alterado y error de proveedor.
+- Una diferencia crea una tarea crítica sin sustituir ni eliminar el registro original.
+- Cada ejecución conserva responsable, fecha, cantidades y resultados inalterables.
