@@ -320,3 +320,12 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - PostgreSQL aplica un bloqueo distribuido para impedir ejecuciones duplicadas entre instancias.
 - Si el proceso se interrumpe, vuelve a quedar disponible después de 30 minutos; una falla
   controlada programa reintento en cuatro horas y genera una tarea crítica.
+
+## Disposición documental controlada
+
+- Cumplir el plazo de conservación crea un expediente candidato; nunca elimina el archivo.
+- Un bloqueo legal activo detiene automáticamente cualquier propuesta de archivo.
+- El revisor documenta el fundamento y una segunda persona administradora debe aprobarlo.
+- El sistema impide que el revisor apruebe o rechace su propia propuesta.
+- Archivar conserva el contenido, huella, relaciones, historial y capacidad de descarga.
+- Cada transición queda en eventos inalterables y en la auditoría logística.

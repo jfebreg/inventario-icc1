@@ -21,7 +21,7 @@ test("distingue bloqueos, advertencias y ambiente listo", () => {
 });
 
 test("verifica migración, RLS, auditoría y antigüedad del respaldo", () => {
-  assert.match(server, /latestMigration\.startsWith\("051_"\)/);
+  assert.match(server, /latestMigration\.startsWith\("052_"\)/);
   assert.match(server, /logistics_audit_chain_verification/);
   assert.match(server, /relation\.relrowsecurity/);
   assert.match(server, /backupAge > 7/);

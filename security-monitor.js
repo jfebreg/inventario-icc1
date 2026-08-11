@@ -1,7 +1,10 @@
 (function () {
   const statusLabel = value => ({
     OPEN: "Pendiente", REVIEWING: "En revisión",
-    DISMISSED: "Descartada", CONFIRMED: "Confirmada"
+    DISMISSED: "Descartada", CONFIRMED: "Confirmada",
+    CANDIDATE: "Candidato", UNDER_REVIEW: "En revisión",
+    AWAITING_APPROVAL: "Esperando aprobación", APPROVED: "Aprobado",
+    ARCHIVED: "Archivado", REJECTED: "Rechazado", BLOCKED: "Bloqueado"
   }[value] || value);
 
   function alertRows(alerts) {
@@ -70,16 +73,57 @@
     await openEvidenceVerification();
   }
 
+  function dispositionActions(item) {
+    if (["CANDIDATE", "BLOCKED"].includes(item.status)) return `<button class="link-button" data-disposition-action="START_REVIEW" data-disposition-id="${item.id}">Iniciar revisión</button>`;
+    if (item.status === "UNDER_REVIEW") return `<button class="link-button" data-disposition-action="SUBMIT" data-disposition-id="${item.id}">Enviar a aprobación</button>`;
+    if (item.status === "AWAITING_APPROVAL") return `<div class="actions"><button class="link-button" data-disposition-action="APPROVE" data-disposition-id="${item.id}">Aprobar</button><button class="link-button" data-disposition-action="REJECT" data-disposition-id="${item.id}">Rechazar</button></div>`;
+    if (item.status === "APPROVED") return `<button class="link-button" data-disposition-action="ARCHIVE" data-disposition-id="${item.id}">Archivar</button>`;
+    return `<small>${htmlSafe(item.reason || "Expediente cerrado")}</small>`;
+  }
+
+  async function openDispositionWorkflow() {
+    modal("Disposición documental", '<p class="empty">Consultando expedientes…</p>');
+    const data = await logisticsFetch("/api/admin/document-governance");
+    const items = data.dispositions || [];
+    const pending = items.filter(item => !["ARCHIVED", "REJECTED"].includes(item.status));
+    modal("Disposición documental", `<div class="grid metrics">
+      <div class="card"><div class="metric-label">Pendientes</div><div class="metric-value">${pending.length}</div></div>
+      <div class="card"><div class="metric-label">Esperando aprobación</div><div class="metric-value">${items.filter(item => item.status === "AWAITING_APPROVAL").length}</div></div>
+      <div class="card"><div class="metric-label">Bloqueados legalmente</div><div class="metric-value">${items.filter(item => item.status === "BLOCKED").length}</div></div>
+      <div class="card"><div class="metric-label">Archivados</div><div class="metric-value">${items.filter(item => item.status === "ARCHIVED").length}</div></div>
+    </div><div class="access-box"><strong>Separación de funciones</strong><div>El revisor propone y otra persona administradora aprueba. Archivar conserva el archivo, su huella y toda su trazabilidad; nunca lo elimina.</div></div>
+    ${items.length ? `<div class="table-wrap"><table><thead><tr><th>Documento</th><th>Tipo</th><th>Estado</th><th>Responsables</th><th>Acción</th></tr></thead><tbody>${items.map(item => `<tr><td><strong>${htmlSafe(item.title)}</strong><br><small>${htmlSafe(item.document_number || item.document_id)}</small></td><td>${htmlSafe(item.document_type)}</td><td>${tag(statusLabel(item.status))}${item.hold_number ? `<br><small>${htmlSafe(item.hold_number)}</small>` : ""}</td><td><small>Revisor: ${htmlSafe(item.reviewer_name || "—")}<br>Aprobador: ${htmlSafe(item.approver_name || "—")}</small></td><td>${dispositionActions(item)}</td></tr>`).join("")}</tbody></table></div>` : '<p class="empty">No existen candidatos. Ejecuta una revisión de conservación para detectar documentos que cumplieron su plazo.</p>'}`);
+  }
+
+  async function updateDisposition(id, action) {
+    let notes = "";
+    if (["SUBMIT", "APPROVE", "REJECT"].includes(action)) {
+      notes = prompt(action === "SUBMIT" ? "Fundamento para proponer el archivo:"
+        : action === "APPROVE" ? "Fundamento de la aprobación:"
+          : "Fundamento del rechazo:") || "";
+      if (!notes) return;
+    }
+    if (action === "ARCHIVE" && !confirm("El documento quedará archivado y conservará su archivo y trazabilidad. ¿Continuar?")) return;
+    await logisticsFetch(`/api/admin/document-dispositions/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, notes })
+    });
+    toast(action === "ARCHIVE" ? "Documento archivado sin eliminar su evidencia." : "Expediente actualizado y auditado.");
+    await openDispositionWorkflow();
+  }
+
   function installButton() {
     const card = document.querySelector("[data-privacy-governance-card]");
-    if (!card || card.querySelector("[data-file-access-monitor]")) return;
-    const actions = card.querySelector(".heading-row");
-    if (!actions) return;
-    const button = document.createElement("button");
-    button.className = "button secondary";
-    button.dataset.fileAccessMonitor = "";
-    button.textContent = "Alertas de acceso";
-    actions.appendChild(button);
+    if (card && !card.querySelector("[data-file-access-monitor]")) {
+      const actions = card.querySelector(".heading-row");
+      if (actions) {
+        const button = document.createElement("button");
+        button.className = "button secondary";
+        button.dataset.fileAccessMonitor = "";
+        button.textContent = "Alertas de acceso";
+        actions.appendChild(button);
+      }
+    }
     const documentCard = document.querySelector("[data-document-governance-card]");
     if (documentCard && !documentCard.querySelector("[data-evidence-verification]")) {
       const documentActions = documentCard.querySelector(".heading-row");
@@ -91,6 +135,16 @@
         documentActions.appendChild(evidenceButton);
       }
     }
+    if (documentCard && !documentCard.querySelector("[data-document-dispositions]")) {
+      const documentActions = documentCard.querySelector(".heading-row");
+      if (documentActions) {
+        const dispositionButton = document.createElement("button");
+        dispositionButton.className = "button secondary";
+        dispositionButton.dataset.documentDispositions = "";
+        dispositionButton.textContent = "Disposición documental";
+        documentActions.appendChild(dispositionButton);
+      }
+    }
   }
 
   new MutationObserver(installButton).observe(document.getElementById("view"), {
@@ -99,7 +153,7 @@
   installButton();
 
   document.addEventListener("click", async event => {
-    const target = event.target.closest?.("[data-file-access-monitor],[data-file-alert-review],[data-file-alert-dismiss],[data-file-alert-confirm],[data-evidence-verification],[data-run-evidence-verification]");
+    const target = event.target.closest?.("[data-file-access-monitor],[data-file-alert-review],[data-file-alert-dismiss],[data-file-alert-confirm],[data-evidence-verification],[data-run-evidence-verification],[data-document-dispositions],[data-disposition-action]");
     if (!target) return;
     try {
       if (target.dataset.fileAccessMonitor !== undefined) await openAccessMonitor();
@@ -108,6 +162,8 @@
       if (target.dataset.fileAlertConfirm) await updateAlert(target.dataset.fileAlertConfirm, "CONFIRMED");
       if (target.dataset.evidenceVerification !== undefined) await openEvidenceVerification();
       if (target.dataset.runEvidenceVerification) await runEvidenceCheck(target.dataset.runEvidenceVerification);
+      if (target.dataset.documentDispositions !== undefined) await openDispositionWorkflow();
+      if (target.dataset.dispositionAction) await updateDisposition(target.dataset.dispositionId, target.dataset.dispositionAction);
     } catch (error) {
       toast(error.message || "No se pudo revisar la alerta de acceso.");
     }

@@ -1766,7 +1766,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("051_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("052_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2329,9 +2329,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("051_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("052_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("051_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("052_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -5150,7 +5150,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar conservación documental." });
     }
-    const [policies, holds, reviews] = await Promise.all([
+    const [policies, holds, reviews, dispositions] = await Promise.all([
       pool.query(`SELECT policy.*,creator.name AS created_by_name,updater.name AS updated_by_name
         FROM logistics_retention_policies policy
         LEFT JOIN inventory_user_profiles creator ON creator.id::text=policy.created_by::text
@@ -5164,12 +5164,25 @@ async function handleHttpRequest(req, res, requestId) {
       pool.query(`SELECT review.*,profile.name AS reviewed_by_name
         FROM logistics_retention_reviews review
         LEFT JOIN inventory_user_profiles profile ON profile.id::text=review.reviewed_by::text
-        WHERE review.organization_id=$1 ORDER BY review.reviewed_at DESC LIMIT 30`, [logisticsOrganizationId])
+        WHERE review.organization_id=$1 ORDER BY review.reviewed_at DESC LIMIT 30`, [logisticsOrganizationId]),
+      pool.query(`SELECT disposition.*,document.title,document.document_type,
+          document.document_number,reviewer.name AS reviewer_name,
+          approver.name AS approver_name,hold.hold_number
+        FROM logistics_document_dispositions disposition
+        JOIN logistics_documents document ON document.id=disposition.document_id
+        LEFT JOIN inventory_user_profiles reviewer
+          ON reviewer.id::text=disposition.reviewer_profile_id::text
+        LEFT JOIN inventory_user_profiles approver
+          ON approver.id::text=disposition.approver_profile_id::text
+        LEFT JOIN logistics_legal_holds hold ON hold.id=disposition.legal_hold_id
+        WHERE disposition.organization_id=$1
+        ORDER BY disposition.created_at DESC LIMIT 100`, [logisticsOrganizationId])
     ]);
     return json(res, 200, {
       policies: policies.rows,
       holds: holds.rows,
-      reviews: reviews.rows
+      reviews: reviews.rows,
+      dispositions: dispositions.rows
     });
   }
 
@@ -5256,14 +5269,46 @@ async function handleHttpRequest(req, res, requestId) {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede revisar conservación documental." });
     }
+    const client = await pool.connect();
     try {
-      const result = await pool.query(`WITH candidates AS (
+      await client.query("BEGIN");
+      const createdCases = (await client.query(`INSERT INTO logistics_document_dispositions
+          (organization_id,document_id,retention_policy_id,legal_hold_id,status,reason)
+        SELECT document.organization_id,document.id,policy.id,hold.id,
+          CASE WHEN hold.id IS NULL THEN 'CANDIDATE' ELSE 'BLOCKED' END,
+          CASE WHEN hold.id IS NULL THEN 'Plazo de conservación cumplido; requiere revisión.'
+            ELSE 'Documento protegido por bloqueo legal activo.' END
+        FROM logistics_documents document
+        JOIN logistics_retention_policies policy
+          ON policy.organization_id=document.organization_id
+         AND policy.document_type=document.document_type AND policy.active=TRUE
+        LEFT JOIN LATERAL (SELECT legal.id FROM logistics_legal_holds legal
+          WHERE legal.organization_id=document.organization_id AND legal.status='ACTIVE'
+            AND (legal.document_type IS NULL OR legal.document_type=document.document_type)
+            AND (legal.entity_type IS NULL OR EXISTS (
+              SELECT 1 FROM logistics_document_links link
+              WHERE link.document_id=document.id AND link.entity_type=legal.entity_type
+                AND (legal.entity_id IS NULL OR link.entity_id=legal.entity_id)))
+          ORDER BY legal.placed_at DESC LIMIT 1) hold ON TRUE
+        WHERE document.organization_id=$1 AND document.status='ACTIVE'
+          AND document.created_at<NOW()-(policy.retention_years::text||' years')::interval
+        ON CONFLICT (organization_id,document_id) DO NOTHING RETURNING *`,
+      [logisticsOrganizationId])).rows;
+      for (const disposition of createdCases) {
+        await client.query(`INSERT INTO logistics_document_disposition_events
+          (organization_id,disposition_id,event_type,new_status,actor_profile_id,detail,payload)
+          VALUES ($1,$2,'DISPOSITION_CANDIDATE_CREATED',$3,$4,$5,$6::jsonb)`,
+        [logisticsOrganizationId, disposition.id, disposition.status, apiProfile.id,
+          disposition.reason, asJson({ documentId: disposition.document_id,
+            legalHoldId: disposition.legal_hold_id })]);
+      }
+      const result = await client.query(`WITH candidates AS (
           SELECT document.id,document.document_type,policy.retention_years
           FROM logistics_documents document
           JOIN logistics_retention_policies policy
             ON policy.organization_id=document.organization_id
            AND policy.document_type=document.document_type AND policy.active=TRUE
-          WHERE document.organization_id=$1
+           WHERE document.organization_id=$1 AND document.status='ACTIVE'
             AND document.created_at<NOW()-(policy.retention_years::text||' years')::interval
         ), classified AS (
           SELECT candidate.*,
@@ -5280,19 +5325,146 @@ async function handleHttpRequest(req, res, requestId) {
         FROM (SELECT document_type,protected,COUNT(*) OVER (PARTITION BY document_type)::int AS type_count
           FROM classified) summary`, [logisticsOrganizationId]);
       const summary = result.rows[0] || { candidate_count: 0, protected_count: 0, by_type: {} };
-      const review = (await pool.query(`INSERT INTO logistics_retention_reviews
+      const review = (await client.query(`INSERT INTO logistics_retention_reviews
         (organization_id,reviewed_by,candidate_count,protected_count,summary,notes)
         VALUES ($1,$2,$3,$4,$5::jsonb,$6) RETURNING *`, [logisticsOrganizationId,
         apiProfile.id, Number(summary.candidate_count || 0), Number(summary.protected_count || 0),
         asJson(summary), "Revisión informativa; no elimina archivos automáticamente."])).rows[0];
-      await pool.query(`INSERT INTO logistics_audit_events
+      await client.query(`INSERT INTO logistics_audit_events
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
         VALUES ($1,'RETENTION_REVIEW_COMPLETED','retention_review',$2,$3,$4,'SYSTEM',$5::jsonb)`,
       [logisticsOrganizationId, review.id, apiProfile.id,
         `retention-review:${review.id}`, asJson(review)]);
-      return json(res, 200, { review });
+      await client.query("COMMIT");
+      return json(res, 200, { review, createdCases: createdCases.length });
     } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
       return json(res, 400, { error: error.message || "No se pudo revisar la conservación documental." });
+    } finally {
+      client.release();
+    }
+  }
+
+  const dispositionRoute = url.pathname.match(
+    /^\/api\/admin\/document-dispositions\/([0-9a-f-]+)$/i);
+  if (dispositionRoute && req.method === "PATCH") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede gestionar disposición documental." });
+    }
+    const client = await pool.connect();
+    try {
+      const body = await readJson(req);
+      const action = String(body.action || "").toUpperCase();
+      const notes = String(body.notes || "").trim();
+      await client.query("BEGIN");
+      const current = (await client.query(`SELECT disposition.*,document.document_type
+        FROM logistics_document_dispositions disposition
+        JOIN logistics_documents document ON document.id=disposition.document_id
+        WHERE disposition.id=$1 AND disposition.organization_id=$2 FOR UPDATE`,
+      [dispositionRoute[1], logisticsOrganizationId])).rows[0];
+      if (!current) throw new Error("Expediente de disposición no encontrado.");
+      const activeHold = (await client.query(`SELECT hold.id,hold.hold_number
+        FROM logistics_legal_holds hold
+        WHERE hold.organization_id=$1 AND hold.status='ACTIVE'
+          AND (hold.document_type IS NULL OR hold.document_type=$2)
+          AND (hold.entity_type IS NULL OR EXISTS (
+            SELECT 1 FROM logistics_document_links link
+            WHERE link.document_id=$3 AND link.entity_type=hold.entity_type
+              AND (hold.entity_id IS NULL OR link.entity_id=hold.entity_id)))
+        ORDER BY hold.placed_at DESC LIMIT 1`,
+      [logisticsOrganizationId, current.document_type, current.document_id])).rows[0];
+      if (activeHold && action !== "REJECT") {
+        const blocked = (await client.query(`UPDATE logistics_document_dispositions SET
+          status='BLOCKED',legal_hold_id=$1,reason=$2,updated_at=NOW()
+          WHERE id=$3 RETURNING *`, [activeHold.id,
+          `Protegido por bloqueo legal ${activeHold.hold_number}.`, current.id])).rows[0];
+        await client.query(`INSERT INTO logistics_document_disposition_events
+          (organization_id,disposition_id,event_type,previous_status,new_status,
+           actor_profile_id,detail,payload)
+          VALUES ($1,$2,'LEGAL_HOLD_BLOCKED',$3,'BLOCKED',$4,$5,$6::jsonb)`,
+        [logisticsOrganizationId, current.id, current.status, apiProfile.id,
+          blocked.reason, asJson({ legalHoldId: activeHold.id })]);
+        await client.query("COMMIT");
+        return json(res, 409, { error: blocked.reason, blocked: true, disposition: blocked });
+      }
+      let nextStatus;
+      const changes = { reason: current.reason, reviewer: current.reviewer_profile_id,
+        approver: current.approver_profile_id };
+      if (action === "START_REVIEW" && ["CANDIDATE", "BLOCKED"].includes(current.status)) {
+        nextStatus = "UNDER_REVIEW";
+        changes.reviewer = apiProfile.id;
+        changes.reason = notes || "Revisión documental iniciada.";
+      } else if (action === "SUBMIT" && current.status === "UNDER_REVIEW") {
+        if (String(current.reviewer_profile_id) !== String(apiProfile.id)) {
+          throw new Error("Sólo el revisor asignado puede enviar la propuesta.");
+        }
+        if (notes.length < 10) throw new Error("Fundamenta la propuesta de archivo.");
+        nextStatus = "AWAITING_APPROVAL";
+        changes.reason = notes;
+      } else if (["APPROVE", "REJECT"].includes(action) && current.status === "AWAITING_APPROVAL") {
+        if (String(current.reviewer_profile_id) === String(apiProfile.id)) {
+          throw new Error("El revisor no puede aprobar ni rechazar su propia propuesta.");
+        }
+        if (notes.length < 10) throw new Error("Registra el fundamento de la decisión.");
+        nextStatus = action === "APPROVE" ? "APPROVED" : "REJECTED";
+        changes.approver = apiProfile.id;
+        changes.reason = notes;
+      } else if (action === "ARCHIVE" && current.status === "APPROVED") {
+        nextStatus = "ARCHIVED";
+        changes.reason = notes || current.reason;
+      } else {
+        throw new Error("La acción no corresponde al estado actual del expediente.");
+      }
+      const disposition = (await client.query(`UPDATE logistics_document_dispositions SET
+        status=$1,reason=$2,reviewer_profile_id=$3,
+        reviewed_at=CASE WHEN $1 IN ('AWAITING_APPROVAL','APPROVED','REJECTED','ARCHIVED')
+          THEN COALESCE(reviewed_at,NOW()) ELSE reviewed_at END,
+        approver_profile_id=$4,
+        approved_at=CASE WHEN $1='APPROVED' THEN NOW() ELSE approved_at END,
+        archived_by=CASE WHEN $1='ARCHIVED' THEN $5 ELSE archived_by END,
+        archived_at=CASE WHEN $1='ARCHIVED' THEN NOW() ELSE archived_at END,
+        legal_hold_id=NULL,updated_at=NOW() WHERE id=$6 RETURNING *`,
+      [nextStatus, changes.reason, changes.reviewer, changes.approver,
+        apiProfile.id, current.id])).rows[0];
+      if (nextStatus === "ARCHIVED") {
+        await client.query(`UPDATE logistics_documents SET status='ARCHIVED'
+          WHERE id=$1 AND organization_id=$2`, [current.document_id, logisticsOrganizationId]);
+      }
+      await client.query(`INSERT INTO logistics_document_disposition_events
+        (organization_id,disposition_id,event_type,previous_status,new_status,
+         actor_profile_id,detail,payload)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+      [logisticsOrganizationId, disposition.id, `DISPOSITION_${action}`,
+        current.status, nextStatus, apiProfile.id, changes.reason,
+        asJson({ documentId: current.document_id })]);
+      if (nextStatus === "AWAITING_APPROVAL") {
+        await client.query(`INSERT INTO inventory_tasks
+          (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,payload,updated_at)
+          VALUES ($1,'Disposición documental','Aprobar archivo documental',$2,'Alta',
+            'Pendiente','Bodega Central','document_disposition',$3,$4::jsonb,NOW())
+          ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,status='Pendiente',
+            resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`,
+        [`document-disposition-${disposition.id}`, changes.reason,
+          disposition.id, asJson(disposition)]);
+      } else if (["APPROVED", "REJECTED", "ARCHIVED"].includes(nextStatus)) {
+        await client.query(`UPDATE inventory_tasks SET status='Resuelta',
+          resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+          WHERE id=$1`, [`document-disposition-${disposition.id}`]);
+      }
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,before_data,after_data)
+        VALUES ($1,'DOCUMENT_DISPOSITION_UPDATED','document_disposition',$2,$3,$4,
+          'WEB',$5::jsonb,$6::jsonb)`, [logisticsOrganizationId, disposition.id,
+        apiProfile.id, `document-disposition:${disposition.id}:${action}`,
+        asJson({ status: current.status }), asJson({ status: nextStatus, reason: changes.reason })]);
+      await client.query("COMMIT");
+      return json(res, 200, { disposition });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 400, { error: error.message || "No se pudo gestionar el expediente." });
+    } finally {
+      client.release();
     }
   }
 
