@@ -354,3 +354,14 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   integración o acceso privilegiado omita la regla operacional.
 - La revisión periódica de accesos identifica autoaprobaciones históricas sin borrar ni
   modificar sus evidencias y las presenta como observaciones de riesgo alto.
+
+## Integridad del expediente de inspección
+
+- Las respuestas, decisiones y puntos de una plantilla quedan inalterables en PostgreSQL
+  después de su registro; un cambio de formulario exige crear una versión nueva.
+- La identidad del equipo, plantilla, inspector, fecha, resultado y observaciones originales
+  no pueden reescribirse durante las etapas posteriores de aprobación o corrección.
+- Cada cambio de un hallazgo conserva estado anterior, estado posterior, responsable, fecha
+  y fundamento en un historial append-only protegido con RLS.
+- El historial también cubre correcciones realizadas mediante una orden de mantenimiento,
+  además de plazos, levantamientos y verificaciones del flujo de inspección.
