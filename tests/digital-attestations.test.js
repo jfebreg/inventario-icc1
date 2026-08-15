@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const migration = await readFile(new URL("../migrations/053_digital_attestation_ledger.sql", import.meta.url), "utf8");
+const certificateMigration = await readFile(new URL("../migrations/054_attestation_certificates.sql", import.meta.url), "utf8");
 const logistics = await readFile(new URL("../lib/logistics.js", import.meta.url), "utf8");
 const server = await readFile(new URL("../server.js", import.meta.url), "utf8");
 const monitor = await readFile(new URL("../security-monitor.js", import.meta.url), "utf8");
@@ -10,7 +11,9 @@ const monitor = await readFile(new URL("../security-monitor.js", import.meta.url
 test("las constancias digitales son inalterables y encadenadas", () => {
   assert.match(migration, /logistics_digital_attestations/);
   assert.match(migration, /previous_attestation_hash/);
-  assert.match(migration, /hash_envelope JSONB NOT NULL/);
+  assert.match(certificateMigration, /ADD COLUMN IF NOT EXISTS hash_envelope JSONB/);
+  assert.match(certificateMigration, /legacyAttestationHash/);
+  assert.match(certificateMigration, /INSPECTION_SUBMISSION/);
   assert.match(migration, /BEFORE UPDATE OR DELETE ON logistics_digital_attestations/);
   assert.match(migration, /REVOKE ALL ON logistics_digital_attestations FROM anon,authenticated/);
 });
@@ -25,9 +28,17 @@ test("la huella usa contenido canónico, consentimiento e idempotencia", () => {
 });
 
 test("aprobar y verificar inspecciones generan una constancia autenticada", () => {
+  assert.match(logistics, /INSPECTION_SUBMISSION/);
   assert.match(logistics, /INSPECTION_CORRECTION_VERIFICATION/);
   assert.match(logistics, /INSPECTION_APPROVAL/);
   assert.match(logistics, /signingMethod: "AUTHENTICATED_SESSION"/);
+});
+
+test("el PDF incorpora las constancias obtenidas desde el servidor", () => {
+  assert.match(server, /Constancias digitales trazables/);
+  assert.match(server, /SHA-256/);
+  assert.match(server, /body\.attestations = attestations\.rows/);
+  assert.match(server, /canonicalInspectionId/);
 });
 
 test("aceptar EPP genera constancia sin conservar ni exponer el token", () => {

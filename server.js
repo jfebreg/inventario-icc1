@@ -587,6 +587,31 @@ async function createInspectionPdf(body) {
   drawSignature(doc, left, sigY, "Firma inspector", body?.inspection?.inspector, body?.inspectorSignature);
   drawSignature(doc, right, sigY, "Firma aprobador / revisor", body?.inspection?.approver || body?.inspection?.reviewer, body?.approverSignature);
   doc.y = sigY + 112;
+  const attestations = Array.isArray(body?.attestations) ? body.attestations : [];
+  if (attestations.length) {
+    if (doc.y > 570) doc.addPage();
+    doc.font("Helvetica-Bold").fontSize(12).fillColor("#10251c").text("Constancias digitales trazables", left, doc.y);
+    doc.moveDown(0.4);
+    for (const attestation of attestations) {
+      if (doc.y > 700) doc.addPage();
+      const label = attestation.attestation_type === "INSPECTION_SUBMISSION"
+        ? "Envío del inspector"
+        : attestation.attestation_type === "INSPECTION_CORRECTION_VERIFICATION"
+          ? "Verificación de corrección" : "Aprobación del revisor";
+      doc.roundedRect(left, doc.y, 500, 57, 6).strokeColor("#d7e2dc").stroke();
+      const boxY = doc.y;
+      doc.font("Helvetica-Bold").fontSize(9).fillColor("#10251c")
+        .text(`${label} · ${pdfText(attestation.signer_name)}`, left + 9, boxY + 8, { width: 482 });
+      doc.font("Helvetica").fontSize(7.5).fillColor("#50635a")
+        .text(`ID ${attestation.id} · ${new Date(attestation.signed_at).toLocaleString("es-CL")}`, left + 9, boxY + 23, { width: 482 });
+      doc.font("Courier").fontSize(6.5).fillColor("#006b3a")
+        .text(`SHA-256 ${attestation.attestation_hash}`, left + 9, boxY + 39, { width: 482 });
+      doc.y = boxY + 65;
+    }
+    doc.font("Helvetica").fontSize(7).fillColor("#50635a")
+      .text("Integridad comprobable en Configuración > Gobierno documental > Constancias digitales. No equivale por sí sola a firma electrónica avanzada certificada.", left, doc.y, { width: 500 });
+    doc.moveDown(0.5);
+  }
   doc.font("Helvetica").fontSize(8).fillColor("#50635a").text(`Documento generado automáticamente por la aplicación el ${new Date().toLocaleString("es-CL")}.`, left, doc.y, { width: 500 });
   doc.end();
   return done;
@@ -1768,7 +1793,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("053_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("054_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2331,9 +2356,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("053_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("054_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("053_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("054_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -6252,6 +6277,14 @@ async function handleHttpRequest(req, res, requestId) {
       const inspectionCenter = body?.asset?.location || body?.inspection?.project || "";
       if (!apiProfile.admin && !sameCenter(inspectionCenter, apiProfile.cost_center)) {
         return json(res, 403, { error: "La inspección pertenece a otro centro de costo." });
+      }
+      const canonicalInspectionId = String(body?.inspection?.canonicalInspectionId || "").trim();
+      if (canonicalInspectionId) {
+        const attestations = await pool.query(`SELECT id,attestation_type,signer_name,
+          signing_method,attestation_hash,signed_at FROM logistics_digital_attestations
+          WHERE organization_id=$1 AND entity_type='inspection_run' AND entity_id=$2
+          ORDER BY signed_at,id`, [logisticsOrganizationId, canonicalInspectionId]);
+        body.attestations = attestations.rows;
       }
       const pdf = await createInspectionPdf(body);
       const code = safeName(body?.asset?.code || "inspeccion");

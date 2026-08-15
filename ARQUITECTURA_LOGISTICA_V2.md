@@ -336,6 +336,8 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   hash del token de un solo uso; el token original no se incluye en respuestas ni evidencias.
 - La aprobación de una inspección y la verificación de una corrección requieren una sesión
   autenticada y conservan el perfil responsable y el contenido exacto del acto.
+- El envío original del inspector genera su propia constancia y el PDF incorpora las etapas
+  disponibles con identificador, firmante, fecha y huella SHA-256 obtenidos desde el servidor.
 - Cada constancia incorpora huellas SHA-256 del consentimiento y del contenido, además de
   la huella de la constancia anterior para formar una cadena verificable.
 - PostgreSQL impide modificar o eliminar las constancias y bloquea el acceso directo desde
