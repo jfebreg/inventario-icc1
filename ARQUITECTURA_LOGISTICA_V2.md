@@ -329,3 +329,17 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - El sistema impide que el revisor apruebe o rechace su propia propuesta.
 - Archivar conserva el contenido, huella, relaciones, historial y capacidad de descarga.
 - Cada transición queda en eventos inalterables y en la auditoría logística.
+
+## Constancias digitales trazables
+
+- La aceptación de EPP queda vinculada al cargo, trabajador, artículo, cantidad, fecha y
+  hash del token de un solo uso; el token original no se incluye en respuestas ni evidencias.
+- La aprobación de una inspección y la verificación de una corrección requieren una sesión
+  autenticada y conservan el perfil responsable y el contenido exacto del acto.
+- Cada constancia incorpora huellas SHA-256 del consentimiento y del contenido, además de
+  la huella de la constancia anterior para formar una cadena verificable.
+- PostgreSQL impide modificar o eliminar las constancias y bloquea el acceso directo desde
+  clientes anónimos o autenticados; sólo el servidor autorizado puede crearlas y consultarlas.
+- La idempotencia evita duplicar evidencia si una petición segura se reintenta.
+- Estas constancias aportan trazabilidad e integridad, pero no se presentan como una firma
+  electrónica avanzada o certificada por un prestador acreditado.

@@ -15,6 +15,7 @@ import {
   createAssetDisposal,
   createInspectionRun,
   createCustodyAssignment,
+  createDigitalAttestation,
   createInboundReceipt,
   createInventoryAdjustment,
   createInventoryPeriod,
@@ -96,6 +97,7 @@ import {
   updateSupplierReturn,
   updateStorageLocation,
   updateInspectionRun,
+  verifyDigitalAttestationChain,
   closeInventoryPeriod,
   runAssetDepreciation,
   upsertReplenishmentPolicy,
@@ -1766,7 +1768,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("052_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("053_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2329,9 +2331,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("052_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("053_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("052_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("053_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -3019,7 +3021,8 @@ async function handleHttpRequest(req, res, requestId) {
     const assignment = (current.assignments || []).find(item => item.token === token);
     const asset = (current.assets || []).find(item => item.id === assignment?.assetId || item.code === assignment?.code);
     if (!assignment || !asset) return json(res, 404, { error: "No encontramos el cargo." });
-    return json(res, 200, { assignment, asset: { id: asset.id, code: asset.code, name: asset.name, type: asset.type } });
+    const { token: _secretToken, ...publicAssignment } = assignment;
+    return json(res, 200, { assignment: publicAssignment, asset: { id: asset.id, code: asset.code, name: asset.name, type: asset.type } });
   }
 
   if (url.pathname === "/api/public/acceptance" && req.method === "POST") {
@@ -3048,8 +3051,39 @@ async function handleHttpRequest(req, res, requestId) {
         WHERE id=1 RETURNING revision`, [asJson(current)]);
       await syncNormalizedTables(client, current, assignment.acceptedBy, updatedState.rows[0]?.revision);
       await syncOperationalTasks(client, current);
+      const tokenHash = createHash("sha256").update(String(body.token || "")).digest("hex");
+      const organizationId = logisticsOrganizationId || (await client.query(
+        "SELECT id FROM logistics_organizations ORDER BY created_at LIMIT 1"
+      )).rows[0]?.id;
+      const attestation = await createDigitalAttestation(client, {
+        organizationId,
+        attestationType: "EPP_ACCEPTANCE",
+        entityType: "legacy_assignment",
+        entityId: String(assignment.id || assignment.token || tokenHash),
+        signerSubjectId: String(assignment.workerId || assignment.worker || ""),
+        signerName: assignment.acceptedBy,
+        signingMethod: "PUBLIC_SINGLE_USE_TOKEN",
+        consentVersion: "epp-v1",
+        consentText: "Declaro haber recibido los elementos de protección personal individualizados y acepto su entrega.",
+        payload: {
+          assignmentId: assignment.id || "",
+          assetCode: asset.code,
+          assetName: asset.name,
+          quantity: assignment.qty,
+          origin: assignment.from,
+          worker: assignment.worker,
+          acceptedDate: today,
+          acceptanceTokenSha256: tokenHash
+        },
+        idempotencyKey: `epp:${assignment.id || tokenHash}:acceptance`
+      });
       await client.query("COMMIT");
-      return json(res, 200, { ok: true, message: "Cargo aceptado correctamente." });
+      return json(res, 200, {
+        ok: true,
+        message: "Cargo aceptado correctamente.",
+        attestationId: attestation.attestation.id,
+        attestationHash: attestation.attestation.attestation_hash
+      });
     } catch (error) {
       try { await client.query("ROLLBACK"); } catch {}
       return json(res, 400, { error: error.message || "No se pudo aceptar el cargo." });
@@ -3253,6 +3287,32 @@ async function handleHttpRequest(req, res, requestId) {
       ORDER BY CASE priority WHEN 'Crítica' THEN 1 WHEN 'Alta' THEN 2 ELSE 3 END, due_at NULLS LAST, created_at DESC`,
       [Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
     return json(res, 200, { tasks: result.rows });
+  }
+
+  if (url.pathname === "/api/v1/attestations" && req.method === "GET") {
+    if (!profileCan(apiProfile, "audit")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar constancias digitales." });
+    }
+    const entityType = String(url.searchParams.get("entityType") || "").trim();
+    const entityId = String(url.searchParams.get("entityId") || "").trim();
+    if (!entityType || !entityId) {
+      return json(res, 400, { error: "Indica el tipo y el identificador de la entidad." });
+    }
+    const result = await pool.query(`SELECT id,attestation_type,entity_type,entity_id,
+      document_id,signer_profile_id,signer_subject_id,signer_name,signing_method,
+      consent_version,consent_text_hash,payload_sha256,previous_attestation_hash,
+      attestation_hash,signed_at
+      FROM logistics_digital_attestations
+      WHERE organization_id=$1 AND entity_type=$2 AND entity_id=$3
+      ORDER BY signed_at,id`, [logisticsOrganizationId, entityType, entityId]);
+    return json(res, 200, { attestations: result.rows });
+  }
+
+  if (url.pathname === "/api/v1/attestations/verify" && req.method === "GET") {
+    if (!profileCan(apiProfile, "audit")) {
+      return json(res, 403, { error: "Tu perfil no puede verificar constancias digitales." });
+    }
+    return json(res, 200, await verifyDigitalAttestationChain(pool, logisticsOrganizationId));
   }
 
   if (url.pathname.startsWith("/api/tasks/") && req.method === "PATCH") {

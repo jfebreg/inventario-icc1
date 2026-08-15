@@ -73,6 +73,19 @@
     await openEvidenceVerification();
   }
 
+  async function openAttestationVerification() {
+    modal("Constancias digitales", '<p class="empty">Verificando la cadena de constancias…</p>');
+    const result = await logisticsFetch("/api/v1/attestations/verify");
+    modal("Constancias digitales", `<div class="grid metrics">
+      <div class="card"><div class="metric-label">Constancias</div><div class="metric-value">${result.count || 0}</div></div>
+      <div class="card"><div class="metric-label">Integridad</div><div class="metric-value">${result.valid ? "OK" : "REVISAR"}</div></div>
+    </div><div class="access-box"><strong>Cadena SHA-256</strong><div>${result.valid
+      ? "Las huellas y los enlaces entre constancias son coherentes."
+      : `Se detectaron ${result.failures?.length || 0} diferencia(s) que requieren revisión administrativa.`}</div></div>
+    <div class="config-item"><div><strong>Huella de cabecera</strong><small class="code">${htmlSafe(result.headHash || "Aún no existen constancias")}</small></div></div>
+    <p class="page-subtitle">Las constancias acreditan trazabilidad e integridad interna. No equivalen por sí solas a una firma electrónica avanzada certificada.</p>`);
+  }
+
   function dispositionActions(item) {
     if (["CANDIDATE", "BLOCKED"].includes(item.status)) return `<button class="link-button" data-disposition-action="START_REVIEW" data-disposition-id="${item.id}">Iniciar revisión</button>`;
     if (item.status === "UNDER_REVIEW") return `<button class="link-button" data-disposition-action="SUBMIT" data-disposition-id="${item.id}">Enviar a aprobación</button>`;
@@ -145,6 +158,16 @@
         documentActions.appendChild(dispositionButton);
       }
     }
+    if (documentCard && !documentCard.querySelector("[data-attestation-verification]")) {
+      const documentActions = documentCard.querySelector(".heading-row");
+      if (documentActions) {
+        const attestationButton = document.createElement("button");
+        attestationButton.className = "button secondary";
+        attestationButton.dataset.attestationVerification = "";
+        attestationButton.textContent = "Constancias digitales";
+        documentActions.appendChild(attestationButton);
+      }
+    }
   }
 
   new MutationObserver(installButton).observe(document.getElementById("view"), {
@@ -153,7 +176,7 @@
   installButton();
 
   document.addEventListener("click", async event => {
-    const target = event.target.closest?.("[data-file-access-monitor],[data-file-alert-review],[data-file-alert-dismiss],[data-file-alert-confirm],[data-evidence-verification],[data-run-evidence-verification],[data-document-dispositions],[data-disposition-action]");
+    const target = event.target.closest?.("[data-file-access-monitor],[data-file-alert-review],[data-file-alert-dismiss],[data-file-alert-confirm],[data-evidence-verification],[data-run-evidence-verification],[data-document-dispositions],[data-disposition-action],[data-attestation-verification]");
     if (!target) return;
     try {
       if (target.dataset.fileAccessMonitor !== undefined) await openAccessMonitor();
@@ -163,6 +186,7 @@
       if (target.dataset.evidenceVerification !== undefined) await openEvidenceVerification();
       if (target.dataset.runEvidenceVerification) await runEvidenceCheck(target.dataset.runEvidenceVerification);
       if (target.dataset.documentDispositions !== undefined) await openDispositionWorkflow();
+      if (target.dataset.attestationVerification !== undefined) await openAttestationVerification();
       if (target.dataset.dispositionAction) await updateDisposition(target.dataset.dispositionId, target.dataset.dispositionAction);
     } catch (error) {
       toast(error.message || "No se pudo revisar la alerta de acceso.");
