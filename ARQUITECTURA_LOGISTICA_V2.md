@@ -365,3 +365,19 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   y fundamento en un historial append-only protegido con RLS.
 - El historial también cubre correcciones realizadas mediante una orden de mantenimiento,
   además de plazos, levantamientos y verificaciones del flujo de inspección.
+
+## Asignación y SLA de revisión
+
+- Cada inspección nueva intenta vincular al revisor seleccionado con un perfil activo del
+  centro de costo o con un administrador; la asignación queda almacenada en el expediente.
+- El envío crea una tarea y una notificación en tiempo real, con un plazo predeterminado de
+  24 horas. Las inspecciones no conformes se presentan con prioridad crítica.
+- Establecer un plazo resuelve la revisión inicial y crea una tarea de corrección para el
+  centro responsable. Registrar el levantamiento crea una verificación independiente para
+  el revisor asignado.
+- Aprobar o verificar resuelve las tareas correspondientes. El proceso conserva la regla de
+  que el inspector no puede aprobar ni verificar su propio trabajo.
+- Un proceso periódico detecta plazos vencidos, eleva la prioridad, marca el expediente como
+  escalado y publica una notificación crítica sin duplicarla en ejecuciones posteriores.
+- El correo puede complementar la comunicación, pero la fuente oficial de pendientes,
+  responsables y vencimientos es la bandeja de tareas de la aplicación.

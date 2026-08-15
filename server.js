@@ -67,6 +67,7 @@ import {
   registerItemFamily,
   registerWarehouse,
   reviewReplenishmentTasks,
+  reviewInspectionWorkflowTasks,
   reviewCycleCountTasks,
   reviewCatalogDataQuality,
   reviewCatalogDuplicateDecision,
@@ -1809,7 +1810,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("056_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("057_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2199,7 +2200,8 @@ async function sweepScheduledLogisticsJobs() {
   try {
     const evidence = await runDueEvidenceVerificationJobs();
     const logistics = await runDueLogisticsJobs(pool);
-    return { ...logistics, evidence };
+    const inspectionReviews = await reviewInspectionWorkflowTasks(pool, logisticsOrganizationId);
+    return { ...logistics, evidence, inspectionReviews };
   } finally {
     logisticsJobSweepRunning = false;
   }
@@ -2372,9 +2374,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("056_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("057_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("056_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("057_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
