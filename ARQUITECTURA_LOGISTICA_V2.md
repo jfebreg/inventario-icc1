@@ -345,3 +345,12 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - La idempotencia evita duplicar evidencia si una petición segura se reintenta.
 - Estas constancias aportan trazabilidad e integridad, pero no se presentan como una firma
   electrónica avanzada o certificada por un prestador acreditado.
+
+## Segregación en inspecciones
+
+- La persona que ejecuta y envía una inspección no puede aprobarla ni verificar su propia
+  corrección, incluso si su perfil administrativo reúne ambos permisos.
+- El control se aplica en interfaz, servicio y triggers de PostgreSQL para evitar que una
+  integración o acceso privilegiado omita la regla operacional.
+- La revisión periódica de accesos identifica autoaprobaciones históricas sin borrar ni
+  modificar sus evidencias y las presenta como observaciones de riesgo alto.

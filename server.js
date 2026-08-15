@@ -1264,7 +1264,7 @@ function profileCan(profile, permission) {
 }
 
 async function securityGovernanceOverview() {
-  const [profilesResult, rolesResult, lastReviewResult] = await Promise.all([
+  const [profilesResult, rolesResult, lastReviewResult, selfApprovalsResult] = await Promise.all([
     pool.query(`SELECT id,auth_user_id,name,email,role,cost_center,admin,permissions,
       active,invitation_status,invited_at,activated_at,last_seen_at,
       security_version,last_security_change_at
@@ -1272,7 +1272,14 @@ async function securityGovernanceOverview() {
     pool.query(`SELECT role_code,role_name,permissions,privileged,can_initiate,
       can_approve,description FROM inventory_role_templates
       WHERE active=TRUE ORDER BY privileged,role_name`),
-    pool.query(`SELECT * FROM inventory_access_reviews ORDER BY reviewed_at DESC LIMIT 1`)
+    pool.query(`SELECT * FROM inventory_access_reviews ORDER BY reviewed_at DESC LIMIT 1`),
+    pool.query(`SELECT approval.id,approval.inspection_id,approval.decided_at,
+      profile.id AS profile_id,profile.name
+      FROM logistics_inspection_approvals approval
+      JOIN logistics_inspection_runs inspection ON inspection.id=approval.inspection_id
+      JOIN inventory_user_profiles profile ON profile.id=approval.approver_profile_id
+      WHERE inspection.inspector_profile_id=approval.approver_profile_id
+      ORDER BY approval.decided_at DESC LIMIT 50`)
   ]);
   const issues = [];
   for (const profile of profilesResult.rows) {
@@ -1320,6 +1327,15 @@ async function securityGovernanceOverview() {
         detail: `Sin uso hace ${Math.floor(inactivityDays)} días.`
       });
     }
+  }
+  for (const approval of selfApprovalsResult.rows) {
+    issues.push({
+      code: "INSPECTION_SELF_APPROVAL",
+      severity: "HIGH",
+      profileId: approval.profile_id,
+      name: approval.name,
+      detail: `Aprobación histórica de la inspección ${approval.inspection_id} realizada por su inspector.`
+    });
   }
   return {
     profiles: profilesResult.rows,
@@ -1793,7 +1809,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("054_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("055_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2356,9 +2372,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("054_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("055_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("054_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("055_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
