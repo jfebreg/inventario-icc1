@@ -416,3 +416,17 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   coincidan exactamente. Nunca crea, modifica ni publica formularios automáticamente.
 - Las versiones activas anteriores a este control se identifican como legado para mantener
   continuidad. Su siguiente modificación debe seguir el flujo formal de borrador y aprobación.
+
+## Ejecución de inspecciones con formulario publicado
+
+- Antes de abrir una inspección, el cliente consulta la versión `ACTIVE` aplicable a la unidad serializada.
+- Si existe un plan preventivo, su `required_template_key` tiene prioridad sobre la familia del artículo.
+- El móvil muestra los ítems almacenados en PostgreSQL; no mantiene listas de inspección escritas en el navegador.
+- La inspección conserva el identificador de la versión presentada al inspector.
+- Al guardar, el servidor vuelve a comprobar que esa versión continúa vigente y que códigos, orden y textos coinciden.
+- Si administración publicó otra versión mientras el formulario estaba abierto, el registro se rechaza y debe recargarse.
+- Las inspecciones históricas siguen vinculadas a su versión inmutable para conservar evidencia y trazabilidad.
+- Cada punto conserva su tipo de respuesta: cumplimiento, sí/no, número, texto, fecha o alternativa.
+- Las alternativas pueden declarar explícitamente si representan conformidad, no conformidad o no aplicación; el sistema no deduce fallas a partir de textos ambiguos.
+- El editor administrativo crea los puntos en filas visuales y conserva descripción, tipo, obligatoriedad, alternativas y exigencia de evidencia.
+- Las familias serializadas y los planes preventivos sólo pueden seleccionar formularios publicados y vigentes; los consumibles pueden quedar sin formulario.

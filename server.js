@@ -45,6 +45,7 @@ import {
   listInventoryControls,
   listInspectionPlans,
   listInspectionTemplates,
+  resolveApprovedInspectionTemplate,
   listLogisticsKpis,
   listKpiTargets,
   listScheduledLogisticsJobs,
@@ -4860,6 +4861,24 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, { templates: await listInspectionTemplates(pool, logisticsOrganizationId) });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron consultar los formularios." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-templates/resolve" && req.method === "GET") {
+    if (!profileCan(apiProfile, "inspect") && !profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede consultar formularios de inspección." });
+    }
+    try {
+      const assetUnitId = String(url.searchParams.get("assetUnitId") || "").trim();
+      if (!assetUnitId) return json(res, 400, { error: "Indica la unidad que se inspeccionará." });
+      const resolved = await resolveApprovedInspectionTemplate(pool, logisticsOrganizationId, assetUnitId);
+      if (!apiProfile.admin && resolved.asset.warehouse_id &&
+          !(await profileMayAccessWarehouse(apiProfile, resolved.asset.warehouse_id))) {
+        return json(res, 403, { error: "Sólo puedes inspeccionar equipos de tu centro de costo." });
+      }
+      return json(res, 200, resolved);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo resolver el formulario vigente." });
     }
   }
 
