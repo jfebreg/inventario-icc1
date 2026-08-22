@@ -397,3 +397,9 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   posterior. Desactivar un plan no elimina su historial.
 - La pantalla de Inspecciones permite crear y editar planes y ejecutar una revisión inmediata;
   la fuente oficial es PostgreSQL, no la fecha conservada por el navegador.
+- Cada plan conserva la clave del formulario exigido. Una inspección de otra familia o con un
+  checklist distinto no puede satisfacer accidentalmente la periodicidad del equipo.
+- La ejecución registra el identificador del plan y PostgreSQL comprueba que coincidan equipo
+  y formulario. Las inspecciones históricas compatibles se vinculan durante la migración.
+- Aprobar o verificar la ejecución correcta recalcula el vencimiento y resuelve su tarea de
+  manera inmediata; no es necesario esperar al proceso diario.

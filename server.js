@@ -1813,7 +1813,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("058_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("059_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2377,9 +2377,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("058_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("059_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("058_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("059_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4902,6 +4902,9 @@ async function handleHttpRequest(req, res, requestId) {
         ...body,
         action: actionByOperation[operation]
       }, apiProfile.id);
+      if (["approve", "verify"].includes(operation)) {
+        await reviewInspectionSchedules(pool, logisticsOrganizationId);
+      }
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la inspección." });
