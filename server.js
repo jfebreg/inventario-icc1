@@ -41,6 +41,7 @@ import {
   listCatalogDataQuality,
   listInventoryClassifications,
   listInventoryControls,
+  listInspectionPlans,
   listLogisticsKpis,
   listKpiTargets,
   listScheduledLogisticsJobs,
@@ -68,6 +69,7 @@ import {
   registerWarehouse,
   reviewReplenishmentTasks,
   reviewInspectionWorkflowTasks,
+  reviewInspectionSchedules,
   reviewCycleCountTasks,
   reviewCatalogDataQuality,
   reviewCatalogDuplicateDecision,
@@ -105,6 +107,7 @@ import {
   upsertItemPresentation,
   upsertSupplierItem,
   upsertKpiTarget,
+  upsertInspectionPlan,
   updateScheduledLogisticsJob,
   updateCutoverMode,
   retryOutboxEvent
@@ -1810,7 +1813,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("057_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("058_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2374,9 +2377,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("057_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("058_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("057_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("058_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -3416,7 +3419,7 @@ async function handleHttpRequest(req, res, requestId) {
         }
       };
       const [schema, items, warehouses, stock, transfers, custody, cycleCounts, suppliers, supplierCatalog, inboundReceipts,
-        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryAccuracy, catalogQuality, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, logisticsKpis, logisticsJobs, outboxHealth,
+        replenishmentSuggestions, purchaseRequisitions, materialRequests, maintenance, inventoryAnalytics, inventoryAccuracy, catalogQuality, inventoryClassifications, inventoryControl, procurement, assetDisposals, assetFinancials, assetCompliance, inspectionPlans, logisticsKpis, logisticsJobs, outboxHealth,
         warehouseDirectory, workers, reconciliation, cutover] = await Promise.all([
         logisticsHealth(pool),
         listCanonicalItems(pool, dashboardProfile, { search: "" }),
@@ -3442,6 +3445,7 @@ async function handleHttpRequest(req, res, requestId) {
         panelQuery("Bajas de activos", () => listAssetDisposals(pool, dashboardProfile, logisticsOrganizationId), []),
         panelQuery("Registro financiero", () => listAssetFinancials(pool, dashboardProfile, logisticsOrganizationId), { rows: [], totals: {} }),
         panelQuery("Cumplimiento de activos", () => listAssetCompliance(pool, dashboardProfile, logisticsOrganizationId), { rows: [], summary: {} }),
+        panelQuery("Planes de inspección", () => listInspectionPlans(pool, dashboardProfile, logisticsOrganizationId), []),
         panelQuery("Indicadores logísticos", () => listLogisticsKpis(pool, dashboardProfile, logisticsOrganizationId, 90), { summary: {}, warehouses: [], snapshots: [], periodDays: 90 }),
         dashboardProfile.admin ? panelQuery("Trabajos programados", () => listScheduledLogisticsJobs(pool, logisticsOrganizationId), []) : Promise.resolve([]),
         dashboardProfile.admin ? panelQuery("Cola de eventos", () => listOutboxHealth(pool, logisticsOrganizationId), null) : Promise.resolve(null),
@@ -3486,6 +3490,7 @@ async function handleHttpRequest(req, res, requestId) {
         assetDisposals,
         assetFinancials,
         assetCompliance,
+        inspectionPlans,
         logisticsKpis,
         logisticsJobs,
         outboxHealth,
@@ -4797,6 +4802,52 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, result);
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la orden de trabajo." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-plans" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar planes de inspección." });
+    try {
+      return json(res, 200, { plans: await listInspectionPlans(pool, apiProfile, logisticsOrganizationId) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar los planes de inspección." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-plans" && req.method === "POST") {
+    if (!profileCan(apiProfile, "inspect") && !profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Tu perfil no puede programar inspecciones." });
+    }
+    try {
+      const body = await readJson(req);
+      const location = await pool.query(`SELECT location.warehouse_id FROM logistics_asset_units unit
+        LEFT JOIN logistics_stock_balances balance ON balance.asset_unit_id=unit.id AND balance.quantity>0
+        LEFT JOIN logistics_locations location ON location.id=balance.location_id
+        WHERE unit.id=$1 AND unit.organization_id=$2
+        ORDER BY CASE location.location_type WHEN 'STORAGE' THEN 0 ELSE 1 END LIMIT 1`,
+      [body.assetUnitId, logisticsOrganizationId]);
+      if (!location.rows[0]) return json(res, 404, { error: "No encontramos el equipo serializado." });
+      if (!apiProfile.admin && (!location.rows[0].warehouse_id
+          || !(await profileMayAccessWarehouse(apiProfile, location.rows[0].warehouse_id)))) {
+        return json(res, 403, { error: "Sólo puedes programar equipos de tu centro de costo." });
+      }
+      const plan = await upsertInspectionPlan(pool, {
+        ...body,
+        organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      await reviewInspectionSchedules(pool, logisticsOrganizationId);
+      return json(res, 200, { plan });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el plan de inspección." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-plans/review" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) return json(res, 403, { error: "Sólo administración puede ejecutar la revisión global." });
+    try {
+      return json(res, 200, await reviewInspectionSchedules(pool, logisticsOrganizationId));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron revisar los vencimientos de inspección." });
     }
   }
 

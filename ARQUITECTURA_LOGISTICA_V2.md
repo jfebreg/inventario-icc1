@@ -381,3 +381,19 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   escalado y publica una notificación crítica sin duplicarla en ejecuciones posteriores.
 - El correo puede complementar la comunicación, pero la fuente oficial de pendientes,
   responsables y vencimientos es la bandeja de tareas de la aplicación.
+
+## Programación preventiva de inspecciones
+
+- Cada unidad serializada puede tener un plan activo con primera fecha, frecuencia,
+  anticipación de aviso, días de gracia y criterio de bloqueo por vencimiento.
+- La siguiente fecha se calcula desde la última inspección aprobada o cerrada; si todavía no
+  existe una, se utiliza la primera fecha configurada por el usuario.
+- Una revisión diaria crea o actualiza tareas y notificaciones del centro de costo sin
+  duplicarlas. Los avisos próximos son de prioridad alta y los vencidos son críticos.
+- Cuando el plan exige bloqueo, el equipo pasa a bloqueado después del plazo de gracia. La
+  liberación automática sólo ocurre tras una inspección válida y si no existen órdenes de
+  mantenimiento ni antecedentes técnicos críticos vencidos.
+- Crear o modificar un plan deja auditoría y un evento inalterable con el estado anterior y
+  posterior. Desactivar un plan no elimina su historial.
+- La pantalla de Inspecciones permite crear y editar planes y ejecutar una revisión inmediata;
+  la fuente oficial es PostgreSQL, no la fecha conservada por el navegador.
