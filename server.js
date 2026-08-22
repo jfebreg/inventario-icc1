@@ -14,6 +14,8 @@ import {
   createAssetCompliance,
   createAssetDisposal,
   createInspectionRun,
+  createInspectionTemplateDraft,
+  approveInspectionTemplate,
   createCustodyAssignment,
   createDigitalAttestation,
   createInboundReceipt,
@@ -42,6 +44,7 @@ import {
   listInventoryClassifications,
   listInventoryControls,
   listInspectionPlans,
+  listInspectionTemplates,
   listLogisticsKpis,
   listKpiTargets,
   listScheduledLogisticsJobs,
@@ -1813,7 +1816,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("059_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("060_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2377,9 +2380,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("059_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("060_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("059_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("060_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4848,6 +4851,43 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, await reviewInspectionSchedules(pool, logisticsOrganizationId));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudieron revisar los vencimientos de inspección." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-templates" && req.method === "GET") {
+    if (!profileCan(apiProfile, "view")) return json(res, 403, { error: "Tu perfil no puede consultar formularios." });
+    try {
+      return json(res, 200, { templates: await listInspectionTemplates(pool, logisticsOrganizationId) });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron consultar los formularios." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-templates" && req.method === "POST") {
+    if (!profileCan(apiProfile, "inspect") && !profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Tu perfil no puede proponer formularios." });
+    }
+    try {
+      const body = await readJson(req);
+      const result = await createInspectionTemplateDraft(pool, {
+        ...body,
+        organizationId: logisticsOrganizationId
+      }, apiProfile.id);
+      return json(res, 201, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo crear el borrador." });
+    }
+  }
+
+  const inspectionTemplateApproval = url.pathname.match(/^\/api\/v1\/inspection-templates\/([^/]+)\/approve$/);
+  if (inspectionTemplateApproval && req.method === "POST") {
+    if (!profileCan(apiProfile, "approve") && !profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Tu perfil no puede aprobar formularios." });
+    }
+    try {
+      return json(res, 200, await approveInspectionTemplate(pool, inspectionTemplateApproval[1], apiProfile.id));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo aprobar el formulario." });
     }
   }
 

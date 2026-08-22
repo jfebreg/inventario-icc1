@@ -403,3 +403,16 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
   y formulario. Las inspecciones históricas compatibles se vinculan durante la migración.
 - Aprobar o verificar la ejecución correcta recalcula el vencimiento y resuelve su tarea de
   manera inmediata; no es necesario esperar al proceso diario.
+
+## Gobierno de formularios de inspección
+
+- Todo formulario nuevo o modificado se guarda primero como borrador inalterable. Publicarlo
+  requiere una sesión con permiso de aprobación y una persona distinta de quien lo creó.
+- Cada versión conserva autor, aprobador, motivo del cambio, fechas y huella SHA-256 de la
+  definición. Los eventos de creación, aprobación y retiro son append-only.
+- Sólo puede existir una versión publicada por organización y clave de formulario. Publicar
+  una versión nueva retira la anterior sin reescribirla ni afectar inspecciones históricas.
+- La ejecución móvil sólo acepta una versión publicada y comprueba que los ítems recibidos
+  coincidan exactamente. Nunca crea, modifica ni publica formularios automáticamente.
+- Las versiones activas anteriores a este control se identifican como legado para mantener
+  continuidad. Su siguiente modificación debe seguir el flujo formal de borrador y aprobación.
