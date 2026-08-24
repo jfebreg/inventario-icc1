@@ -430,3 +430,10 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Las alternativas pueden declarar explícitamente si representan conformidad, no conformidad o no aplicación; el sistema no deduce fallas a partir de textos ambiguos.
 - El editor administrativo crea los puntos en filas visuales y conserva descripción, tipo, obligatoriedad, alternativas y exigencia de evidencia.
 - Las familias serializadas y los planes preventivos sólo pueden seleccionar formularios publicados y vigentes; los consumibles pueden quedar sin formulario.
+## Cierre formal de evidencia de inspecciones
+
+- Una inspección se crea con evidencia `PENDING` mientras el archivo se transfiere al almacenamiento.
+- Al archivar el archivo, el documento canónico y su vínculo con la inspección se registran en la misma transacción y la evidencia pasa a `VERIFIED`.
+- La aprobación, el cierre y la validación de correcciones quedan bloqueados en el servicio y en PostgreSQL mientras la evidencia no esté verificada.
+- Una interrupción de red no elimina las respuestas del formulario: deja una tarea visible para adjuntar o reintentar el archivo.
+- Las respuestas, el resultado, la identidad del inspector y la versión del formulario permanecen inmutables; sólo cambian los campos controlados del flujo.
