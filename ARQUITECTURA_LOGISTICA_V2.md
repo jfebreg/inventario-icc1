@@ -437,3 +437,5 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - La aprobación, el cierre y la validación de correcciones quedan bloqueados en el servicio y en PostgreSQL mientras la evidencia no esté verificada.
 - Una interrupción de red no elimina las respuestas del formulario: deja una tarea visible para adjuntar o reintentar el archivo.
 - Las respuestas, el resultado, la identidad del inspector y la versión del formulario permanecen inmutables; sólo cambian los campos controlados del flujo.
+- La custodia del archivo tiene un SLA operativo de dos horas. Mientras esté pendiente se crea una tarea automática; al vencer, escala a prioridad crítica.
+- La tarea no admite cierre manual: se resuelve dentro de la misma transacción que verifica el documento y Realtime actualiza los equipos conectados.

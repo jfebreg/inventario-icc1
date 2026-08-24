@@ -1817,7 +1817,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("061_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("062_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2381,9 +2381,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("061_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("062_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("061_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("062_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -3375,9 +3375,12 @@ async function handleHttpRequest(req, res, requestId) {
       WHERE id=$1 AND ($2::boolean OR assignee_auth_user_id=$3 OR center_name=$4)`,
     [id, Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
     if (!taskType.rows[0]) return json(res, 404, { error: "Tarea no encontrada o sin permiso." });
-    if (taskType.rows[0].task_type === "CYCLE_COUNT_REVIEW" && body.status === "Resuelta") {
+    if ((taskType.rows[0].task_type === "CYCLE_COUNT_REVIEW"
+        || taskType.rows[0].task_type === "INSPECTION_EVIDENCE") && body.status === "Resuelta") {
       return json(res, 400, {
-        error: "La tarea se resolverá automáticamente al contabilizar el conteo físico."
+        error: taskType.rows[0].task_type === "INSPECTION_EVIDENCE"
+          ? "La tarea se resolverá automáticamente al archivar la evidencia."
+          : "La tarea se resolverá automáticamente al contabilizar el conteo físico."
       });
     }
     const result = await pool.query(`UPDATE inventory_tasks SET status=$1, resolved_at=CASE WHEN $1='Resuelta' THEN NOW() ELSE NULL END, updated_at=NOW()
