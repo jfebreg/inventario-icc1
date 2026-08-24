@@ -727,6 +727,101 @@ async function canonicalInspectionReportData(inspectionId) {
   };
 }
 
+async function ensureCanonicalInspectionReport(inspectionId, profile) {
+  const lockClient = await pool.connect();
+  try {
+    await lockClient.query("SELECT pg_advisory_lock(hashtext($1))", [`inspection-final-report:${inspectionId}`]);
+    const reportData = await canonicalInspectionReportData(inspectionId);
+    if (!profile.admin && !sameCenter(reportData.center, profile.cost_center)) {
+      throw new HttpRequestError(403, "INSPECTION_SCOPE", "La inspección pertenece a otro centro de costo.");
+    }
+    if (!["APPROVED", "CLOSED"].includes(reportData.status)) {
+      throw new HttpRequestError(409, "REPORT_NOT_FINAL", "El informe final estará disponible cuando la inspección sea aprobada o cerrada.");
+    }
+    const previous = await pool.query(`SELECT file.id AS file_id,document.sha256
+      FROM logistics_inspection_reports report
+      JOIN logistics_documents document ON document.id=report.document_id
+      JOIN inventory_file_objects file ON file.id=document.file_object_id
+      WHERE report.inspection_id=$1`, [inspectionId]);
+    if (previous.rows[0]) {
+      await resolveInspectionReportTask(inspectionId);
+      return { existing: true, fileId: previous.rows[0].file_id, sha256: previous.rows[0].sha256, reportData };
+    }
+    const pdf = await createInspectionPdf(reportData.body);
+    const filename = `Inspeccion_${safeName(reportData.code)}_${safeName(reportData.date)}_FINAL.pdf`;
+    const stored = await uploadFileObject({
+      filename, category: "informes-inspeccion", ref: inspectionId,
+      dataUrl: `data:application/pdf;base64,${pdf.toString("base64")}`,
+      uploadedBy: profile.name || profile.id,
+      code: reportData.code, center: reportData.center
+    });
+    const canonical = await registerCanonicalDocument(pool, {
+      organizationId: logisticsOrganizationId,
+      fileObjectId: stored.id,
+      legacyId: `inspection-final-report-${inspectionId}`,
+      documentType: "INSPECTION_FINAL_REPORT",
+      title: `Informe final inspección ${reportData.code}`,
+      documentNumber: `INS-${reportData.code}-${reportData.date}`,
+      sha256: stored.sha256,
+      entityType: "inspection_run",
+      entityId: inspectionId,
+      relationship: "FINAL_REPORT"
+    }, profile.id);
+    await pool.query(`INSERT INTO logistics_inspection_reports
+      (organization_id,inspection_id,document_id,report_sha256,generated_by)
+      VALUES ($1,$2,$3,$4,$5) ON CONFLICT (inspection_id) DO NOTHING`,
+    [logisticsOrganizationId, inspectionId, canonical.document.id, stored.sha256, profile.id]);
+    await resolveInspectionReportTask(inspectionId);
+    return { existing: false, pdf, filename, sha256: stored.sha256, fileId: stored.id, reportData };
+  } finally {
+    try { await lockClient.query("SELECT pg_advisory_unlock(hashtext($1))", [`inspection-final-report:${inspectionId}`]); } catch {}
+    lockClient.release();
+  }
+}
+
+async function resolveInspectionReportTask(inspectionId) {
+  const taskId = `inspection-final-report-${inspectionId}`;
+  await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
+    resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW() WHERE id=$1`, [taskId]);
+  await pool.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
+    WHERE id=$1`, [`notification-${taskId}`]);
+}
+
+async function createInspectionReportRecoveryTask(inspectionId, profile, error) {
+  const context = (await pool.query(`SELECT unit.unit_code,item.name AS item_name,
+      COALESCE(center.name,warehouse.name,'Bodega Central') AS center_name
+    FROM logistics_inspection_runs inspection
+    JOIN logistics_asset_units unit ON unit.id=inspection.asset_unit_id
+    JOIN logistics_items item ON item.id=unit.item_id
+    LEFT JOIN logistics_warehouses warehouse ON warehouse.id=inspection.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    WHERE inspection.id=$1`, [inspectionId])).rows[0];
+  const taskId = `inspection-final-report-${inspectionId}`;
+  const title = `Recuperar informe final: ${context?.unit_code || inspectionId}`;
+  const detail = `${context?.item_name || "Inspección aprobada"}. La aprobación fue conservada, pero el PDF no pudo archivarse: ${String(error?.message || error).slice(0, 300)}`;
+  await pool.query(`INSERT INTO inventory_tasks
+    (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,
+     entity_type,entity_id,payload,updated_at)
+    VALUES ($1,'INSPECTION_REPORT_ARCHIVE',$2,$3,'Crítica','Pendiente',$4,$5,
+      'inspection_run',$6,$7::jsonb,NOW())
+    ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,
+      priority='Crítica',status='Pendiente',center_name=EXCLUDED.center_name,
+      assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,resolved_at=NULL,
+      payload=EXCLUDED.payload,updated_at=NOW()`,
+  [taskId, title, detail, context?.center_name || profile.cost_center,
+    profile.auth_user_id || null, inspectionId,
+    JSON.stringify({ inspectionId, automaticResolution: true, retryAction: "GENERATE_FINAL_REPORT" })]);
+  await pool.query(`INSERT INTO inventory_notifications
+    (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,
+     entity_type,entity_id,payload)
+    VALUES ($1,$2,$3,'INSPECTION_REPORT_ARCHIVE',$4,$5,'critical','inspection_run',$6,$7::jsonb)
+    ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,body=EXCLUDED.body,
+      severity='critical',read_at=NULL,payload=EXCLUDED.payload`,
+  [`notification-${taskId}`, profile.auth_user_id || null,
+    context?.center_name || profile.cost_center, title, detail, inspectionId,
+    JSON.stringify({ inspectionId, retryAction: "GENERATE_FINAL_REPORT" })]);
+}
+
 async function uploadFileObject(body) {
   if (!pool) throw new Error("DATABASE_URL no configurada");
   const id = `file-${randomUUID()}`;
@@ -3478,9 +3573,12 @@ async function handleHttpRequest(req, res, requestId) {
     [id, Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
     if (!taskType.rows[0]) return json(res, 404, { error: "Tarea no encontrada o sin permiso." });
     if ((taskType.rows[0].task_type === "CYCLE_COUNT_REVIEW"
-        || taskType.rows[0].task_type === "INSPECTION_EVIDENCE") && body.status === "Resuelta") {
+        || taskType.rows[0].task_type === "INSPECTION_EVIDENCE"
+        || taskType.rows[0].task_type === "INSPECTION_REPORT_ARCHIVE") && body.status === "Resuelta") {
       return json(res, 400, {
-        error: taskType.rows[0].task_type === "INSPECTION_EVIDENCE"
+        error: taskType.rows[0].task_type === "INSPECTION_REPORT_ARCHIVE"
+          ? "La tarea se resolverá automáticamente al archivar el informe final."
+          : taskType.rows[0].task_type === "INSPECTION_EVIDENCE"
           ? "La tarea se resolverá automáticamente al archivar la evidencia."
           : "La tarea se resolverá automáticamente al contabilizar el conteo físico."
       });
@@ -5066,10 +5164,20 @@ async function handleHttpRequest(req, res, requestId) {
         ...body,
         action: actionByOperation[operation]
       }, apiProfile.id);
+      let reportArchived = false;
+      let reportWarning = "";
       if (["approve", "verify"].includes(operation)) {
         await reviewInspectionSchedules(pool, logisticsOrganizationId);
+        try {
+          await ensureCanonicalInspectionReport(inspectionId, apiProfile);
+          reportArchived = true;
+        } catch (reportError) {
+          reportWarning = "La aprobación quedó registrada, pero el informe final requiere recuperación.";
+          console.error("No se pudo archivar automáticamente el informe final:", reportError.message);
+          await createInspectionReportRecoveryTask(inspectionId, apiProfile, reportError);
+        }
       }
-      return json(res, 200, result);
+      return json(res, 200, { ...result, reportArchived, reportWarning });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo actualizar la inspección." });
     }
@@ -6510,63 +6618,24 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 403, { error: "Tu perfil no puede descargar inspecciones." });
     }
     const inspectionId = decodeURIComponent(canonicalInspectionReportMatch[1]);
-    const lockClient = await pool.connect();
     try {
-      await lockClient.query("SELECT pg_advisory_lock(hashtext($1))", [`inspection-final-report:${inspectionId}`]);
-      const reportData = await canonicalInspectionReportData(inspectionId);
-      if (!apiProfile.admin && !sameCenter(reportData.center, apiProfile.cost_center)) {
-        return json(res, 403, { error: "La inspección pertenece a otro centro de costo." });
-      }
-      if (!["APPROVED", "CLOSED"].includes(reportData.status)) {
-        return json(res, 409, { error: "El informe final estará disponible cuando la inspección sea aprobada o cerrada." });
-      }
-      const previous = await pool.query(`SELECT file.id AS file_id FROM logistics_inspection_reports report
-        JOIN logistics_documents document ON document.id=report.document_id
-        JOIN inventory_file_objects file ON file.id=document.file_object_id
-        WHERE report.inspection_id=$1`, [inspectionId]);
-      if (previous.rows[0]) {
-        res.writeHead(303, { "Location": `/api/files/${encodeURIComponent(previous.rows[0].file_id)}`, "Cache-Control": "no-store" });
+      const report = await ensureCanonicalInspectionReport(inspectionId, apiProfile);
+      if (report.existing) {
+        res.writeHead(303, { "Location": `/api/files/${encodeURIComponent(report.fileId)}`, "Cache-Control": "no-store" });
         return res.end();
       }
-      const pdf = await createInspectionPdf(reportData.body);
-      const filename = `Inspeccion_${safeName(reportData.code)}_${safeName(reportData.date)}_FINAL.pdf`;
-      const stored = await uploadFileObject({
-        filename, category: "informes-inspeccion", ref: inspectionId,
-        dataUrl: `data:application/pdf;base64,${pdf.toString("base64")}`,
-        uploadedBy: apiProfile.name || apiProfile.id,
-        code: reportData.code, center: reportData.center
-      });
-      const canonical = await registerCanonicalDocument(pool, {
-        organizationId: logisticsOrganizationId,
-        fileObjectId: stored.id,
-        legacyId: `inspection-final-report-${inspectionId}`,
-        documentType: "INSPECTION_FINAL_REPORT",
-        title: `Informe final inspección ${reportData.code}`,
-        documentNumber: `INS-${reportData.code}-${reportData.date}`,
-        sha256: stored.sha256,
-        entityType: "inspection_run",
-        entityId: inspectionId,
-        relationship: "FINAL_REPORT"
-      }, apiProfile.id);
-      await pool.query(`INSERT INTO logistics_inspection_reports
-        (organization_id,inspection_id,document_id,report_sha256,generated_by)
-        VALUES ($1,$2,$3,$4,$5) ON CONFLICT (inspection_id) DO NOTHING`,
-      [logisticsOrganizationId, inspectionId, canonical.document.id, stored.sha256, apiProfile.id]);
       res.writeHead(200, {
         "Content-Type": "application/pdf",
-        "Content-Disposition": `attachment; filename="${filename}"`,
-        "Content-Length": String(pdf.length),
-        "X-Content-SHA256": stored.sha256,
+        "Content-Disposition": `attachment; filename="${report.filename}"`,
+        "Content-Length": String(report.pdf.length),
+        "X-Content-SHA256": report.sha256,
         "X-Report-Status": "FINAL",
         "Cache-Control": "no-store"
       });
-      return res.end(pdf);
+      return res.end(report.pdf);
     } catch (error) {
       console.error("Error generando informe canónico de inspección:", error.message);
       return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo generar el informe final." });
-    } finally {
-      try { await lockClient.query("SELECT pg_advisory_unlock(hashtext($1))", [`inspection-final-report:${inspectionId}`]); } catch {}
-      lockClient.release();
     }
   }
 

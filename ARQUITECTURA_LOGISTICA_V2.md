@@ -442,3 +442,5 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Después de la aprobación o cierre, el informe PDF se reconstruye exclusivamente desde las tablas canónicas, firmas enroladas y constancias digitales del servidor.
 - Cada inspección posee una sola versión final inmutable, archivada en Storage como documento canónico con SHA-256. Las descargas posteriores reutilizan exactamente el mismo archivo.
 - Antes de la aprobación sólo se permite una vista preliminar; nunca se presenta como informe final ni sustituye el documento bajo custodia.
+- Aprobar o verificar intenta emitir el informe final en ese mismo flujo. La aprobación no se revierte si Storage está temporalmente indisponible.
+- Una falla de archivo genera una tarea crítica automática y visible en Realtime; su botón reintenta la emisión y la tarea sólo se resuelve cuando el documento existe bajo custodia.
