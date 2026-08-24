@@ -625,6 +625,108 @@ async function createInspectionPdf(body) {
   return done;
 }
 
+async function readInternalFileObject(row) {
+  if (!row) return null;
+  let data;
+  if (row.provider === "supabase" && row.storage_path && storageConfigured()) {
+    const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${String(row.storage_path).split("/").map(encodeURIComponent).join("/")}`;
+    const response = await fetchWithTimeout(endpoint, { headers: {
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY
+    } }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
+    if (!response.ok) throw new Error("No se pudo recuperar la evidencia desde Supabase Storage.");
+    data = Buffer.from(await response.arrayBuffer());
+  } else data = Buffer.from(String(row.data_base64 || ""), "base64");
+  const expected = String(row.payload?.sha256 || "").toLowerCase();
+  const actual = createHash("sha256").update(data).digest("hex");
+  if (expected && !safeTokenEqual(expected, actual)) throw new Error("La evidencia no superó la verificación de integridad.");
+  return data;
+}
+
+async function canonicalInspectionReportData(inspectionId) {
+  const inspectionResult = await pool.query(`SELECT inspection.*,
+      organization.name AS organization_name,organization.tax_id,organization.address,
+      unit.unit_code,item.name AS item_name,family.name AS family_name,
+      COALESCE(center.name,warehouse.name,'Sin centro') AS center_name,
+      inspector.name AS inspector_name,
+      COALESCE(approver.name,reviewer.name) AS approver_name,
+      inspector_signature.signature_data AS inspector_signature,
+      approver_signature.signature_data AS approver_signature,
+      legacy.metadata AS legacy_metadata,submission.payload AS submission_payload
+    FROM logistics_inspection_runs inspection
+    JOIN logistics_organizations organization ON organization.id=inspection.organization_id
+    JOIN logistics_asset_units unit ON unit.id=inspection.asset_unit_id
+    JOIN logistics_items item ON item.id=unit.item_id
+    LEFT JOIN logistics_item_families family ON family.id=item.family_id
+    LEFT JOIN logistics_warehouses warehouse ON warehouse.id=inspection.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    LEFT JOIN inventory_user_profiles inspector ON inspector.id=inspection.inspector_profile_id
+    LEFT JOIN inventory_user_profiles approver ON approver.id=inspection.approver_profile_id
+    LEFT JOIN inventory_user_profiles reviewer ON reviewer.id=inspection.assigned_reviewer_profile_id
+    LEFT JOIN inventory_worker_signatures inspector_signature ON LOWER(inspector_signature.worker_name)=LOWER(inspector.name)
+    LEFT JOIN inventory_worker_signatures approver_signature ON LOWER(approver_signature.worker_name)=LOWER(COALESCE(approver.name,reviewer.name))
+    LEFT JOIN LATERAL (SELECT metadata FROM logistics_legacy_links link
+      WHERE link.organization_id=inspection.organization_id
+        AND link.canonical_type='inspection_run' AND link.canonical_id=inspection.id
+      ORDER BY link.created_at DESC LIMIT 1) legacy ON TRUE
+    LEFT JOIN LATERAL (SELECT payload FROM logistics_digital_attestations attestation
+      WHERE attestation.organization_id=inspection.organization_id
+        AND attestation.entity_type='inspection_run' AND attestation.entity_id=inspection.id::text
+        AND attestation.attestation_type='INSPECTION_SUBMISSION'
+      ORDER BY attestation.signed_at LIMIT 1) submission ON TRUE
+    WHERE inspection.id=$1 AND inspection.organization_id=$2`, [inspectionId, logisticsOrganizationId]);
+  const row = inspectionResult.rows[0];
+  if (!row) throw new HttpRequestError(404, "INSPECTION_NOT_FOUND", "No encontramos la inspección canónica.");
+  const answers = await pool.query(`SELECT item.label,answer.result,answer.value_text,answer.value_number,answer.notes
+    FROM logistics_inspection_answers answer
+    JOIN logistics_inspection_template_items item ON item.id=answer.template_item_id
+    WHERE answer.inspection_id=$1 ORDER BY item.item_order`, [inspectionId]);
+  const attestations = await pool.query(`SELECT id,attestation_type,signer_name,signing_method,
+      attestation_hash,signed_at FROM logistics_digital_attestations
+    WHERE organization_id=$1 AND entity_type='inspection_run' AND entity_id=$2
+    ORDER BY signed_at,id`, [logisticsOrganizationId, inspectionId]);
+  let evidenceImage = "";
+  const evidence = await pool.query(`SELECT file.* FROM logistics_document_links link
+    JOIN logistics_documents document ON document.id=link.document_id AND document.status='ACTIVE'
+    JOIN inventory_file_objects file ON file.id=document.file_object_id
+    WHERE link.entity_type='inspection_run' AND link.entity_id=$1 AND link.relationship='EVIDENCE'
+      AND file.mime_type LIKE 'image/%' ORDER BY link.created_at DESC LIMIT 1`, [inspectionId]);
+  if (evidence.rows[0]) {
+    const image = await readInternalFileObject(evidence.rows[0]);
+    evidenceImage = `data:${evidence.rows[0].mime_type};base64,${image.toString("base64")}`;
+  }
+  const resultLabel = row.result === "COMPLIANT" ? "Aprobado"
+    : row.result === "NON_COMPLIANT" ? "No aprobado" : "No aplica";
+  return {
+    center: row.center_name,
+    status: row.status,
+    code: row.unit_code,
+    date: new Date(row.inspected_at || row.created_at).toISOString().slice(0, 10),
+    body: {
+      organization: { name: row.organization_name, rut: row.tax_id, address: row.address, label: "Control de Activos" },
+      asset: { code: row.unit_code, name: row.item_name, location: row.center_name },
+      familyName: row.family_name || "Sin familia",
+      inspection: {
+        canonicalInspectionId: row.id,
+        date: new Date(row.inspected_at || row.created_at).toISOString().slice(0, 10),
+        result: resultLabel, inspector: row.inspector_name || row.legacy_metadata?.inspectorName || "Inspector registrado",
+        approver: row.approver_name || row.legacy_metadata?.approverName || "Pendiente",
+        project: row.legacy_metadata?.project || row.center_name,
+        documentName: row.submission_payload?.documentName || "Evidencia digital archivada",
+        notes: row.notes || "", answers: answers.rows.map(answer => ({
+          item: answer.label,
+          result: answer.value_text || (answer.result === "COMPLIANT" ? "Cumple" : answer.result === "NON_COMPLIANT" ? "No cumple" : "No aplica"),
+          note: answer.notes || ""
+        }))
+      },
+      inspectorSignature: row.inspector_signature || "",
+      approverSignature: row.approver_signature || "",
+      evidenceImage,
+      attestations: attestations.rows
+    }
+  };
+}
+
 async function uploadFileObject(body) {
   if (!pool) throw new Error("DATABASE_URL no configurada");
   const id = `file-${randomUUID()}`;
@@ -1817,7 +1919,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("062_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("063_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2381,9 +2483,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("062_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("063_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("062_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("063_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -6399,6 +6501,72 @@ async function handleHttpRequest(req, res, requestId) {
     } catch (error) {
       console.error("Error subiendo archivo:", error.message);
       return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo guardar el archivo" });
+    }
+  }
+
+  const canonicalInspectionReportMatch = url.pathname.match(/^\/api\/v1\/inspections\/([^/]+)\/report\.pdf$/);
+  if (canonicalInspectionReportMatch && req.method === "GET") {
+    if (!profileCan(apiProfile, "inspect") && !profileCan(apiProfile, "view")) {
+      return json(res, 403, { error: "Tu perfil no puede descargar inspecciones." });
+    }
+    const inspectionId = decodeURIComponent(canonicalInspectionReportMatch[1]);
+    const lockClient = await pool.connect();
+    try {
+      await lockClient.query("SELECT pg_advisory_lock(hashtext($1))", [`inspection-final-report:${inspectionId}`]);
+      const reportData = await canonicalInspectionReportData(inspectionId);
+      if (!apiProfile.admin && !sameCenter(reportData.center, apiProfile.cost_center)) {
+        return json(res, 403, { error: "La inspección pertenece a otro centro de costo." });
+      }
+      if (!["APPROVED", "CLOSED"].includes(reportData.status)) {
+        return json(res, 409, { error: "El informe final estará disponible cuando la inspección sea aprobada o cerrada." });
+      }
+      const previous = await pool.query(`SELECT file.id AS file_id FROM logistics_inspection_reports report
+        JOIN logistics_documents document ON document.id=report.document_id
+        JOIN inventory_file_objects file ON file.id=document.file_object_id
+        WHERE report.inspection_id=$1`, [inspectionId]);
+      if (previous.rows[0]) {
+        res.writeHead(303, { "Location": `/api/files/${encodeURIComponent(previous.rows[0].file_id)}`, "Cache-Control": "no-store" });
+        return res.end();
+      }
+      const pdf = await createInspectionPdf(reportData.body);
+      const filename = `Inspeccion_${safeName(reportData.code)}_${safeName(reportData.date)}_FINAL.pdf`;
+      const stored = await uploadFileObject({
+        filename, category: "informes-inspeccion", ref: inspectionId,
+        dataUrl: `data:application/pdf;base64,${pdf.toString("base64")}`,
+        uploadedBy: apiProfile.name || apiProfile.id,
+        code: reportData.code, center: reportData.center
+      });
+      const canonical = await registerCanonicalDocument(pool, {
+        organizationId: logisticsOrganizationId,
+        fileObjectId: stored.id,
+        legacyId: `inspection-final-report-${inspectionId}`,
+        documentType: "INSPECTION_FINAL_REPORT",
+        title: `Informe final inspección ${reportData.code}`,
+        documentNumber: `INS-${reportData.code}-${reportData.date}`,
+        sha256: stored.sha256,
+        entityType: "inspection_run",
+        entityId: inspectionId,
+        relationship: "FINAL_REPORT"
+      }, apiProfile.id);
+      await pool.query(`INSERT INTO logistics_inspection_reports
+        (organization_id,inspection_id,document_id,report_sha256,generated_by)
+        VALUES ($1,$2,$3,$4,$5) ON CONFLICT (inspection_id) DO NOTHING`,
+      [logisticsOrganizationId, inspectionId, canonical.document.id, stored.sha256, apiProfile.id]);
+      res.writeHead(200, {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Length": String(pdf.length),
+        "X-Content-SHA256": stored.sha256,
+        "X-Report-Status": "FINAL",
+        "Cache-Control": "no-store"
+      });
+      return res.end(pdf);
+    } catch (error) {
+      console.error("Error generando informe canónico de inspección:", error.message);
+      return json(res, error.status || 400, { code: error.code, error: error.message || "No se pudo generar el informe final." });
+    } finally {
+      try { await lockClient.query("SELECT pg_advisory_unlock(hashtext($1))", [`inspection-final-report:${inspectionId}`]); } catch {}
+      lockClient.release();
     }
   }
 

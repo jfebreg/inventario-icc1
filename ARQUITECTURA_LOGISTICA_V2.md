@@ -439,3 +439,6 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Las respuestas, el resultado, la identidad del inspector y la versión del formulario permanecen inmutables; sólo cambian los campos controlados del flujo.
 - La custodia del archivo tiene un SLA operativo de dos horas. Mientras esté pendiente se crea una tarea automática; al vencer, escala a prioridad crítica.
 - La tarea no admite cierre manual: se resuelve dentro de la misma transacción que verifica el documento y Realtime actualiza los equipos conectados.
+- Después de la aprobación o cierre, el informe PDF se reconstruye exclusivamente desde las tablas canónicas, firmas enroladas y constancias digitales del servidor.
+- Cada inspección posee una sola versión final inmutable, archivada en Storage como documento canónico con SHA-256. Las descargas posteriores reutilizan exactamente el mismo archivo.
+- Antes de la aprobación sólo se permite una vista preliminar; nunca se presenta como informe final ni sustituye el documento bajo custodia.

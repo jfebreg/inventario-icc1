@@ -158,7 +158,26 @@ function documentsPanel(){
 function downloadGeneratedHtml(name,content){let blob=new Blob([content],{type:'text/html'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=(name||'documento').replace(/[^\w.-]+/g,'_')+'.html';a.click();URL.revokeObjectURL(url)}
 function blobToDataUrl(blob){return new Promise((resolve,reject)=>{let r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(blob)})}
 async function evidenceImageForInspection(id){let d=state.documents.find(x=>x.ref===id&&x.fileId&&String(x.type||'').startsWith('image/'));if(!d)return '';try{let res=await fetch(`/api/files/${encodeURIComponent(d.fileId)}`);if(!res.ok)return '';return await blobToDataUrl(await res.blob())}catch{return ''}}
-async function downloadInspection(id){let i=state.inspections.find(x=>x.id===id),a=state.assets.find(x=>x.id===i?.assetId);if(!i||!a)return toast('No encontramos la inspección.');try{toast('Generando PDF de inspección...');let evidenceImage=await evidenceImageForInspection(id),res=await fetch('/api/inspection/pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({organization:org(),asset:a,familyName:family(a.family)?.name||'',inspection:i,inspectorSignature:signatureForPerson(i.inspector),approverSignature:signatureForPerson(i.approver||i.reviewer),evidenceImage})});if(!res.ok){let p=await res.json().catch(()=>({}));throw new Error(p.error||'No se pudo generar PDF')}let blob=await res.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`Inspeccion_${a.code}_${i.date}.pdf`;link.click();URL.revokeObjectURL(url)}catch(err){toast(err.message||'No se pudo generar el PDF.');downloadGeneratedHtml(`Inspeccion_${a.code}_${i.date}`,inspectionReportHtml(i,a))}}
+async function downloadInspection(id){
+  let i=state.inspections.find(x=>x.id===id),a=state.assets.find(x=>x.id===i?.assetId);
+  if(!i||!a)return toast('No encontramos la inspección.');
+  let finalReport=Boolean(i.canonicalInspectionId&&(i.approvedDate||i.verifiedDate));
+  try{
+    toast(finalReport?'Preparando informe final verificado…':'Generando vista preliminar de inspección…');
+    let res;
+    if(finalReport)res=await fetch(`/api/v1/inspections/${encodeURIComponent(i.canonicalInspectionId)}/report.pdf`);
+    else{
+      let evidenceImage=await evidenceImageForInspection(id);
+      res=await fetch('/api/inspection/pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({organization:org(),asset:a,familyName:family(a.family)?.name||'',inspection:i,inspectorSignature:signatureForPerson(i.inspector),approverSignature:signatureForPerson(i.approver||i.reviewer),evidenceImage})});
+    }
+    if(!res.ok){let p=await res.json().catch(()=>({}));throw new Error(p.error||'No se pudo generar PDF')}
+    let blob=await res.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');
+    link.href=url;link.download=`Inspeccion_${a.code}_${i.date}${finalReport?'_FINAL':''}.pdf`;link.click();URL.revokeObjectURL(url);
+  }catch(err){
+    toast(err.message||'No se pudo generar el PDF.');
+    if(!finalReport)downloadGeneratedHtml(`Inspeccion_${a.code}_${i.date}`,inspectionReportHtml(i,a));
+  }
+}
 function downloadDocument(id){let d=state.documents.find(x=>x.id===id);if(!d)return toast('No encontramos el documento.');let i=state.inspections.find(x=>x.id===d.ref);if(i)return downloadInspection(i.id);if(d.content)return downloadGeneratedHtml(d.name||'documento',d.content);toast('Este registro aún no tiene archivo descargable.')}
 async function downloadStoredFile(href,name='archivo'){let res=await fetch(href);if(!res.ok){let payload=await res.json().catch(()=>({}));throw new Error(payload.error||'No se pudo descargar el archivo.')}let blob=await res.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=name;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}
 function canonicalDocumentLink(doc){let ref=String(doc?.ref||''),inspection=state.inspections.find(i=>i.id===ref||`${i.id}-correction`===ref);if(inspection?.canonicalInspectionId)return{entityType:'inspection_run',entityId:inspection.canonicalInspectionId,relationship:ref.endsWith('-correction')?'CORRECTION_EVIDENCE':'EVIDENCE'};let assignment=state.assignments.find(x=>x.id===ref);if(assignment?.canonicalCustodyId)return{entityType:'custody_assignment',entityId:assignment.canonicalCustodyId,relationship:'EVIDENCE'};let workOrder=(logisticsV2.maintenance?.workOrders||[]).find(x=>String(x.id)===ref);if(workOrder)return{entityType:'work_order',entityId:workOrder.id,relationship:'COMPLETION_EVIDENCE'};let draft=state.aiDrafts.find(x=>x.id===ref);if(draft)return{entityType:'ai_draft',entityId:draft.id,relationship:'SOURCE'};return{entityType:'legacy_record',entityId:ref||doc.id,relationship:'EVIDENCE'}}
