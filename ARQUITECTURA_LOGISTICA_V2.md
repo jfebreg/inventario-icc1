@@ -444,3 +444,8 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Antes de la aprobación sólo se permite una vista preliminar; nunca se presenta como informe final ni sustituye el documento bajo custodia.
 - Aprobar o verificar intenta emitir el informe final en ese mismo flujo. La aprobación no se revierte si Storage está temporalmente indisponible.
 - Una falla de archivo genera una tarea crítica automática y visible en Realtime; su botón reintenta la emisión y la tarea sólo se resuelve cuando el documento existe bajo custodia.
+- Las inspecciones históricas aprobadas o cerradas que aún no tengan informe final se concilian automáticamente en lotes pequeños. Sólo ingresan expedientes con evidencia verificada y sin informe canónico previo.
+- La conciliación es idempotente: reutiliza el mismo control único por inspección, puede ejecutarse nuevamente sin duplicar archivos y crea una tarea crítica individual si Storage no responde.
+- Administración puede iniciar una conciliación manual; cada ejecución deja auditoría con la cantidad revisada, archivada y fallida.
+- Configuración presenta un tablero de custodia con expedientes elegibles, PDF archivados, pendientes, errores y las huellas de los informes recientes. Desde allí se procesa el siguiente lote sin acceder a herramientas técnicas.
+- El tablero calcula el avance porcentual y permite descargar cada informe final reciente mediante la ruta canónica protegida. La entrega reutiliza el archivo inmutable y expone su huella de integridad en la respuesta.

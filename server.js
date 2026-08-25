@@ -822,6 +822,47 @@ async function createInspectionReportRecoveryTask(inspectionId, profile, error) 
     JSON.stringify({ inspectionId, retryAction: "GENERATE_FINAL_REPORT" })]);
 }
 
+async function sweepMissingInspectionReports(limit = 5) {
+  const pending = await pool.query(`SELECT inspection.id,
+      COALESCE(approver.id,reviewer.id,administrator.id) AS profile_id,
+      COALESCE(approver.name,reviewer.name,administrator.name,'Sistema') AS profile_name,
+      COALESCE(approver.auth_user_id,reviewer.auth_user_id,administrator.auth_user_id) AS auth_user_id,
+      COALESCE(center.name,warehouse.name,'Bodega Central') AS cost_center
+    FROM logistics_inspection_runs inspection
+    LEFT JOIN logistics_inspection_reports report ON report.inspection_id=inspection.id
+    LEFT JOIN inventory_user_profiles approver ON approver.id=inspection.approver_profile_id
+    LEFT JOIN inventory_user_profiles reviewer ON reviewer.id=inspection.assigned_reviewer_profile_id
+    LEFT JOIN logistics_warehouses warehouse ON warehouse.id=inspection.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    LEFT JOIN LATERAL (SELECT profile.id,profile.name,profile.auth_user_id
+      FROM inventory_user_profiles profile WHERE profile.active=TRUE AND profile.admin=TRUE
+      ORDER BY profile.updated_at DESC LIMIT 1) administrator ON TRUE
+    WHERE inspection.organization_id=$1 AND inspection.status IN ('APPROVED','CLOSED')
+      AND inspection.evidence_status='VERIFIED' AND report.id IS NULL
+      AND COALESCE(inspection.approved_at,inspection.updated_at)<=NOW()-INTERVAL '1 minute'
+    ORDER BY COALESCE(inspection.approved_at,inspection.updated_at),inspection.id LIMIT $2`,
+  [logisticsOrganizationId, Math.max(1, Math.min(20, Number(limit) || 5))]);
+  let archived = 0,failed = 0;
+  for (const inspection of pending.rows) {
+    const systemProfile = {
+      id: inspection.profile_id || null,
+      name: inspection.profile_name || "Sistema",
+      auth_user_id: inspection.auth_user_id || null,
+      cost_center: inspection.cost_center,
+      admin: true
+    };
+    try {
+      await ensureCanonicalInspectionReport(inspection.id, systemProfile);
+      archived += 1;
+    } catch (error) {
+      failed += 1;
+      console.error(`No se pudo conciliar informe final ${inspection.id}:`, error.message);
+      await createInspectionReportRecoveryTask(inspection.id, systemProfile, error);
+    }
+  }
+  return { scanned: pending.rowCount, archived, failed, batchLimit: Math.max(1, Math.min(20, Number(limit) || 5)) };
+}
+
 async function uploadFileObject(body) {
   if (!pool) throw new Error("DATABASE_URL no configurada");
   const id = `file-${randomUUID()}`;
@@ -2405,7 +2446,8 @@ async function sweepScheduledLogisticsJobs() {
     const evidence = await runDueEvidenceVerificationJobs();
     const logistics = await runDueLogisticsJobs(pool);
     const inspectionReviews = await reviewInspectionWorkflowTasks(pool, logisticsOrganizationId);
-    return { ...logistics, evidence, inspectionReviews };
+    const inspectionReports = await sweepMissingInspectionReports(5);
+    return { ...logistics, evidence, inspectionReviews, inspectionReports };
   } finally {
     logisticsJobSweepRunning = false;
   }
@@ -3897,6 +3939,62 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, await sweepScheduledLogisticsJobs());
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo ejecutar la automatizaciÃ³n." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-reports/status" && req.method === "GET") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede supervisar los informes finales." });
+    }
+    try {
+      const summary = (await pool.query(`SELECT
+          COUNT(*) FILTER (WHERE inspection.status IN ('APPROVED','CLOSED')
+            AND inspection.evidence_status='VERIFIED')::int AS eligible,
+          COUNT(report.id)::int AS archived,
+          COUNT(*) FILTER (WHERE inspection.status IN ('APPROVED','CLOSED')
+            AND inspection.evidence_status='VERIFIED' AND report.id IS NULL)::int AS pending
+        FROM logistics_inspection_runs inspection
+        LEFT JOIN logistics_inspection_reports report ON report.inspection_id=inspection.id
+        WHERE inspection.organization_id=$1`, [logisticsOrganizationId])).rows[0];
+      const failed = Number((await pool.query(`SELECT COUNT(*)::int AS count
+        FROM inventory_tasks task
+        JOIN logistics_inspection_runs inspection ON inspection.id::text=task.entity_id
+        WHERE task.task_type='INSPECTION_REPORT_ARCHIVE' AND task.status<>'Resuelta'
+          AND inspection.organization_id=$1`, [logisticsOrganizationId])).rows[0]?.count || 0);
+      const recent = (await pool.query(`SELECT report.inspection_id,report.generated_at,
+          report.report_sha256,unit.unit_code,item.name AS item_name
+        FROM logistics_inspection_reports report
+        JOIN logistics_inspection_runs inspection ON inspection.id=report.inspection_id
+        JOIN logistics_asset_units unit ON unit.id=inspection.asset_unit_id
+        JOIN logistics_items item ON item.id=unit.item_id
+        WHERE report.organization_id=$1 ORDER BY report.generated_at DESC LIMIT 10`,
+      [logisticsOrganizationId])).rows;
+      return json(res, 200, {
+        summary: { eligible: Number(summary?.eligible || 0), archived: Number(summary?.archived || 0),
+          pending: Number(summary?.pending || 0), failed },
+        recent
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar la custodia de informes." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-reports/reconcile" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede conciliar informes históricos." });
+    }
+    try {
+      const body = await readJson(req);
+      const result = await sweepMissingInspectionReports(body.limit || 5);
+      const batchId = `inspection-report-batch-${Date.now()}`;
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,after_data)
+        VALUES ($1,'INSPECTION_REPORTS_RECONCILED','inspection_report_batch',$2,$3,$2,
+          'WEB',$4::jsonb)`, [logisticsOrganizationId, batchId, apiProfile.id, asJson(result)]);
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudieron conciliar los informes históricos." });
     }
   }
 

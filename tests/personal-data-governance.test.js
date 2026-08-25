@@ -30,5 +30,5 @@ test("la interfaz tramita privacidad sin borrar evidencia logística", () => {
   assert.match(app, /data-data-request-action/);
   assert.match(app, /No elimina movimientos, inspecciones, firmas ni documentos/);
   assert.match(app, /if\(route==='settings'\)\{renderAuthActivationCard\(\);if\(window\.ICCAuth\?\.configured\)/);
-  assert.match(app, /renderDocumentGovernanceCard\(\);renderPrivacyGovernanceCard\(\)/);
+  assert.match(app, /renderDocumentGovernanceCard\(\);[\s\S]{0,120}renderPrivacyGovernanceCard\(\)/);
 });
