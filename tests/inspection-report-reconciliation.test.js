@@ -53,3 +53,46 @@ test("el panel muestra avance y descarga el PDF canónico verificable", () => {
   assert.match(app, /\/api\/v1\/inspections\/\$\{encodeURIComponent\(inspectionId\)\}\/report\.pdf/);
   assert.match(app, /x-content-sha256/);
 });
+
+test("el registro completo filtra y pagina la custodia por organización", () => {
+  assert.match(server, /url\.pathname === "\/api\/v1\/inspection-reports"/);
+  assert.match(server, /report\.organization_id=\$1/);
+  assert.match(server, /unit\.unit_code ILIKE/);
+  assert.match(server, /report\.generated_at >= NULLIF\(\$4,''\)::date/);
+  assert.match(server, /COUNT\(\*\) OVER\(\)::int AS total_count/);
+  assert.match(server, /LIMIT \$6 OFFSET \$7/);
+});
+
+test("la interfaz permite buscar navegar y descargar desde el registro", () => {
+  assert.match(app, /data-open-inspection-report-registry/);
+  assert.match(app, /function inspectionReportRegistryModal/);
+  assert.match(app, /inspectionReportRegistryForm/);
+  assert.match(app, /data-report-registry-page/);
+  assert.match(app, /Código o equipo/);
+});
+
+test("la exportación CSV es filtrada verificable segura y auditada", () => {
+  assert.match(server, /url\.pathname === "\/api\/v1\/inspection-reports\/export\.csv"/);
+  assert.match(server, /LIMIT 10000/);
+  assert.match(server, /INSPECTION_REPORT_REGISTRY_EXPORTED/);
+  assert.match(server, /X-Content-SHA256/);
+  assert.match(server, /if \(\/\^\[=\+\\-@\]\//);
+  assert.match(app, /data-export-inspection-reports/);
+  assert.match(app, /function exportInspectionReportRegistry/);
+});
+
+test("la integridad específica recupera cada PDF y compara la huella canónica", () => {
+  assert.match(server, /async function verifyCanonicalInspectionReports/);
+  assert.match(server, /await readEvidenceBody\(row\)/);
+  assert.match(server, /row\.report_sha256/);
+  assert.match(server, /safeTokenEqual\(expectedSha256, actualSha256\)/);
+  assert.match(server, /INSPECTION_REPORT_INTEGRITY_VERIFIED/);
+});
+
+test("las diferencias generan tareas críticas que no se cierran manualmente", () => {
+  assert.match(server, /'INSPECTION_REPORT_INTEGRITY'/);
+  assert.match(server, /Integridad de informe comprometida/);
+  assert.match(server, /después de restaurar y verificar el informe/);
+  assert.match(app, /data-verify-inspection-report-integrity/);
+  assert.match(app, /function verifyInspectionReportIntegrity/);
+});

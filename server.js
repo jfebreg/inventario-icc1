@@ -863,6 +863,98 @@ async function sweepMissingInspectionReports(limit = 5) {
   return { scanned: pending.rowCount, archived, failed, batchLimit: Math.max(1, Math.min(20, Number(limit) || 5)) };
 }
 
+async function verifyCanonicalInspectionReports(profile, requestedLimit = 25) {
+  const limit = Math.min(100, Math.max(1, Number(requestedLimit) || 25));
+  const run = (await pool.query(`INSERT INTO logistics_evidence_verification_runs
+    (organization_id,requested_count,initiated_by,summary)
+    VALUES ($1,$2,$3,$4::jsonb) RETURNING *`, [logisticsOrganizationId, limit,
+    profile.id, asJson({ scope: "INSPECTION_FINAL_REPORT" })])).rows[0];
+  const reports = (await pool.query(`SELECT file.*,report.inspection_id,
+      report.report_sha256,unit.unit_code,item.name AS item_name,
+      COALESCE(center.name,warehouse.name,'Bodega Central') AS center_name
+    FROM logistics_inspection_reports report
+    JOIN logistics_inspection_runs inspection ON inspection.id=report.inspection_id
+    JOIN logistics_asset_units unit ON unit.id=inspection.asset_unit_id
+    JOIN logistics_items item ON item.id=unit.item_id
+    JOIN logistics_documents document ON document.id=report.document_id
+    JOIN inventory_file_objects file ON file.id=document.file_object_id
+    LEFT JOIN logistics_warehouses warehouse ON warehouse.id=inspection.warehouse_id
+    LEFT JOIN logistics_cost_centers center ON center.id=warehouse.cost_center_id
+    LEFT JOIN LATERAL (SELECT result.checked_at
+      FROM logistics_evidence_verification_results result
+      WHERE result.file_object_id=file.id ORDER BY result.checked_at DESC LIMIT 1) latest ON TRUE
+    WHERE report.organization_id=$1
+    ORDER BY latest.checked_at NULLS FIRST,report.generated_at LIMIT $2`,
+  [logisticsOrganizationId, limit])).rows;
+  const counts = { VERIFIED: 0, MISSING: 0, CORRUPT: 0, ERROR: 0 };
+  for (const row of reports) {
+    const expectedSha256 = String(row.report_sha256 || "").trim().toLowerCase();
+    const expectedSize = Number(row.size_bytes);
+    let status = "VERIFIED", body = null, actualSha256 = null;
+    let detail = "Informe final disponible y huella canónica coincidente.";
+    try {
+      body = await readEvidenceBody(row);
+      actualSha256 = createHash("sha256").update(body).digest("hex");
+      const sizeMismatch = Number.isFinite(expectedSize) && expectedSize >= 0 && expectedSize !== body.length;
+      const hashMismatch = !/^[0-9a-f]{64}$/.test(expectedSha256)
+        || !safeTokenEqual(expectedSha256, actualSha256);
+      if (sizeMismatch || hashMismatch) {
+        status = "CORRUPT";
+        detail = sizeMismatch ? "El tamaño del PDF no coincide con el registro original."
+          : "La huella del PDF no coincide con el informe canónico.";
+      }
+    } catch (error) {
+      status = error.evidenceStatus || "ERROR";
+      detail = error.message || "No fue posible recuperar el informe final.";
+    }
+    counts[status] += 1;
+    await pool.query(`INSERT INTO logistics_evidence_verification_results
+      (organization_id,run_id,file_object_id,status,expected_size,actual_size,
+       expected_sha256,actual_sha256,provider,detail)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [logisticsOrganizationId,
+      run.id, row.id, status, Number.isFinite(expectedSize) ? expectedSize : null,
+      body?.length ?? null, expectedSha256 || null, actualSha256, row.provider, detail]);
+    const taskId = `inspection-report-integrity-${row.inspection_id}`;
+    if (status === "VERIFIED") {
+      await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+        WHERE id=$1`, [taskId]);
+      await pool.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW()) WHERE id=$1`,
+      [`notification-${taskId}`]);
+    } else {
+      const title = `Integridad de informe comprometida: ${row.unit_code}`;
+      await pool.query(`INSERT INTO inventory_tasks
+        (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,
+         entity_type,entity_id,payload,updated_at)
+        VALUES ($1,'INSPECTION_REPORT_INTEGRITY',$2,$3,'Crítica','Pendiente',$4,$5,
+          'inspection_run',$6,$7::jsonb,NOW()) ON CONFLICT (id) DO UPDATE SET
+          title=EXCLUDED.title,detail=EXCLUDED.detail,priority='Crítica',status='Pendiente',
+          resolved_at=NULL,payload=EXCLUDED.payload,updated_at=NOW()`, [taskId, title,
+        `${row.item_name}. ${detail}`, row.center_name, profile.auth_user_id || null,
+        row.inspection_id, asJson({ inspectionId: row.inspection_id, verificationRunId: run.id, status })]);
+      await pool.query(`INSERT INTO inventory_notifications
+        (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,
+         entity_type,entity_id,payload) VALUES ($1,$2,$3,'INSPECTION_REPORT_INTEGRITY',$4,$5,
+          'critical','inspection_run',$6,$7::jsonb) ON CONFLICT (id) DO UPDATE SET
+          title=EXCLUDED.title,body=EXCLUDED.body,severity='critical',read_at=NULL,
+          payload=EXCLUDED.payload`, [`notification-${taskId}`, profile.auth_user_id || null,
+        row.center_name, title, detail, row.inspection_id,
+        asJson({ verificationRunId: run.id, status })]);
+    }
+  }
+  const failureCount = counts.MISSING + counts.CORRUPT + counts.ERROR;
+  const completed = (await pool.query(`UPDATE logistics_evidence_verification_runs SET
+    status=$1,verified_count=$2,missing_count=$3,corrupt_count=$4,error_count=$5,
+    completed_at=NOW(),summary=$6::jsonb WHERE id=$7 RETURNING *`,
+  [failureCount ? "FAIL" : "PASS", counts.VERIFIED, counts.MISSING, counts.CORRUPT,
+    counts.ERROR, asJson({ scope: "INSPECTION_FINAL_REPORT", checked: reports.length, limit }), run.id])).rows[0];
+  await pool.query(`INSERT INTO logistics_audit_events
+    (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+     correlation_id,source,after_data) VALUES ($1,'INSPECTION_REPORT_INTEGRITY_VERIFIED',
+      'evidence_verification',$2,$3,$4,'WEB',$5::jsonb)`, [logisticsOrganizationId,
+    run.id, profile.id, `inspection-report-integrity:${run.id}`, asJson(completed)]);
+  return completed;
+}
+
 async function uploadFileObject(body) {
   if (!pool) throw new Error("DATABASE_URL no configurada");
   const id = `file-${randomUUID()}`;
@@ -3616,9 +3708,12 @@ async function handleHttpRequest(req, res, requestId) {
     if (!taskType.rows[0]) return json(res, 404, { error: "Tarea no encontrada o sin permiso." });
     if ((taskType.rows[0].task_type === "CYCLE_COUNT_REVIEW"
         || taskType.rows[0].task_type === "INSPECTION_EVIDENCE"
-        || taskType.rows[0].task_type === "INSPECTION_REPORT_ARCHIVE") && body.status === "Resuelta") {
+        || taskType.rows[0].task_type === "INSPECTION_REPORT_ARCHIVE"
+        || taskType.rows[0].task_type === "INSPECTION_REPORT_INTEGRITY") && body.status === "Resuelta") {
       return json(res, 400, {
-        error: taskType.rows[0].task_type === "INSPECTION_REPORT_ARCHIVE"
+        error: taskType.rows[0].task_type === "INSPECTION_REPORT_INTEGRITY"
+          ? "La tarea se resolverá automáticamente después de restaurar y verificar el informe."
+          : taskType.rows[0].task_type === "INSPECTION_REPORT_ARCHIVE"
           ? "La tarea se resolverá automáticamente al archivar el informe final."
           : taskType.rows[0].task_type === "INSPECTION_EVIDENCE"
           ? "La tarea se resolverá automáticamente al archivar la evidencia."
@@ -3969,13 +4064,132 @@ async function handleHttpRequest(req, res, requestId) {
         JOIN logistics_items item ON item.id=unit.item_id
         WHERE report.organization_id=$1 ORDER BY report.generated_at DESC LIMIT 10`,
       [logisticsOrganizationId])).rows;
+      const integrity = (await pool.query(`SELECT id,status,verified_count,missing_count,
+          corrupt_count,error_count,started_at,completed_at,summary
+        FROM logistics_evidence_verification_runs
+        WHERE organization_id=$1 AND summary->>'scope'='INSPECTION_FINAL_REPORT'
+        ORDER BY started_at DESC LIMIT 1`, [logisticsOrganizationId])).rows[0] || null;
       return json(res, 200, {
         summary: { eligible: Number(summary?.eligible || 0), archived: Number(summary?.archived || 0),
           pending: Number(summary?.pending || 0), failed },
-        recent
+        recent, integrity
       });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo consultar la custodia de informes." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-reports/verify-integrity" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede verificar la integridad de los informes." });
+    }
+    try {
+      const body = await readJson(req);
+      return json(res, 200, await verifyCanonicalInspectionReports(apiProfile, body.limit || 25));
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo verificar la integridad de los informes." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-reports/export.csv" && req.method === "GET") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede exportar el registro de informes." });
+    }
+    try {
+      const search = String(url.searchParams.get("search") || "").trim().slice(0, 100);
+      const center = String(url.searchParams.get("center") || "").trim().slice(0, 120);
+      const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "";
+      const from = validDate(String(url.searchParams.get("from") || ""));
+      const to = validDate(String(url.searchParams.get("to") || ""));
+      const reports = (await pool.query(`SELECT report.inspection_id,report.generated_at,
+          report.report_sha256,unit.unit_code,item.name AS item_name,
+          COALESCE(cost_center.name,warehouse.name,'Bodega Central') AS center_name,
+          COALESCE(generator.name,'Sistema') AS generated_by_name,inspection.status
+        FROM logistics_inspection_reports report
+        JOIN logistics_inspection_runs inspection ON inspection.id=report.inspection_id
+        JOIN logistics_asset_units unit ON unit.id=inspection.asset_unit_id
+        JOIN logistics_items item ON item.id=unit.item_id
+        LEFT JOIN logistics_warehouses warehouse ON warehouse.id=inspection.warehouse_id
+        LEFT JOIN logistics_cost_centers cost_center ON cost_center.id=warehouse.cost_center_id
+        LEFT JOIN inventory_user_profiles generator ON generator.id=report.generated_by
+        WHERE report.organization_id=$1
+          AND ($2='' OR unit.unit_code ILIKE '%'||$2||'%' OR item.name ILIKE '%'||$2||'%')
+          AND ($3='' OR COALESCE(cost_center.name,warehouse.name,'Bodega Central')=$3)
+          AND (NULLIF($4,'') IS NULL OR report.generated_at >= NULLIF($4,'')::date)
+          AND (NULLIF($5,'') IS NULL OR report.generated_at < NULLIF($5,'')::date + INTERVAL '1 day')
+        ORDER BY report.generated_at DESC,report.id DESC LIMIT 10000`,
+      [logisticsOrganizationId, search, center, from, to])).rows;
+      const csvCell = value => {
+        let text = String(value ?? "");
+        if (/^[=+\-@]/.test(text)) text = `'${text}`;
+        return `"${text.replaceAll('"', '""')}"`;
+      };
+      const csvRows = [["inspeccion_id", "codigo_equipo", "equipo", "centro_costo",
+        "fecha_generacion", "generado_por", "estado", "sha256"]];
+      reports.forEach(row => csvRows.push([row.inspection_id, row.unit_code, row.item_name,
+        row.center_name, new Date(row.generated_at).toISOString(), row.generated_by_name,
+        row.status, row.report_sha256]));
+      const body = Buffer.from(`\uFEFF${csvRows.map(row => row.map(csvCell).join(';')).join('\r\n')}\r\n`, "utf8");
+      const sha256 = createHash("sha256").update(body).digest("hex");
+      const exportId = `inspection-report-export-${Date.now()}`;
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,
+         correlation_id,source,after_data)
+        VALUES ($1,'INSPECTION_REPORT_REGISTRY_EXPORTED','inspection_report_export',$2,$3,$2,
+          'WEB',$4::jsonb)`, [logisticsOrganizationId, exportId, apiProfile.id,
+        asJson({ filters: { search, center, from, to }, count: reports.length, sha256 })]);
+      const date = new Date().toISOString().slice(0, 10);
+      res.writeHead(200, { "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="Informes_Inspeccion_${date}.csv"`,
+        "Content-Length": String(body.length), "X-Content-SHA256": sha256,
+        "Cache-Control": "no-store" });
+      return res.end(body);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo exportar el registro de informes." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-reports" && req.method === "GET") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede consultar el registro completo de informes." });
+    }
+    try {
+      const search = String(url.searchParams.get("search") || "").trim().slice(0, 100);
+      const center = String(url.searchParams.get("center") || "").trim().slice(0, 120);
+      const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "";
+      const from = validDate(String(url.searchParams.get("from") || ""));
+      const to = validDate(String(url.searchParams.get("to") || ""));
+      const requestedPage = Number(url.searchParams.get("page") || 1);
+      const requestedLimit = Number(url.searchParams.get("limit") || 25);
+      const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+      const limit = Number.isInteger(requestedLimit)
+        ? Math.max(10, Math.min(100, requestedLimit)) : 25;
+      const offset = (page - 1) * limit;
+      const rows = (await pool.query(`SELECT report.inspection_id,report.generated_at,
+          report.report_sha256,unit.unit_code,item.name AS item_name,
+          COALESCE(cost_center.name,warehouse.name,'Bodega Central') AS center_name,
+          COALESCE(generator.name,'Sistema') AS generated_by_name,
+          inspection.status,COUNT(*) OVER()::int AS total_count
+        FROM logistics_inspection_reports report
+        JOIN logistics_inspection_runs inspection ON inspection.id=report.inspection_id
+        JOIN logistics_asset_units unit ON unit.id=inspection.asset_unit_id
+        JOIN logistics_items item ON item.id=unit.item_id
+        LEFT JOIN logistics_warehouses warehouse ON warehouse.id=inspection.warehouse_id
+        LEFT JOIN logistics_cost_centers cost_center ON cost_center.id=warehouse.cost_center_id
+        LEFT JOIN inventory_user_profiles generator ON generator.id=report.generated_by
+        WHERE report.organization_id=$1
+          AND ($2='' OR unit.unit_code ILIKE '%'||$2||'%' OR item.name ILIKE '%'||$2||'%')
+          AND ($3='' OR COALESCE(cost_center.name,warehouse.name,'Bodega Central')=$3)
+          AND (NULLIF($4,'') IS NULL OR report.generated_at >= NULLIF($4,'')::date)
+          AND (NULLIF($5,'') IS NULL OR report.generated_at < NULLIF($5,'')::date + INTERVAL '1 day')
+        ORDER BY report.generated_at DESC,report.id DESC LIMIT $6 OFFSET $7`,
+      [logisticsOrganizationId, search, center, from, to, limit, offset])).rows;
+      const total = Number(rows[0]?.total_count || 0);
+      return json(res, 200, { reports: rows.map(({ total_count, ...row }) => row),
+        pagination: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) },
+        filters: { search, center, from, to } });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo consultar el registro de informes." });
     }
   }
 
