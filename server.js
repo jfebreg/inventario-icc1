@@ -955,6 +955,24 @@ async function verifyCanonicalInspectionReports(profile, requestedLimit = 25) {
   return completed;
 }
 
+async function runCanonicalReportVerificationWithLock(profile, limit) {
+  const lockClient = await pool.connect();
+  let locked = false;
+  try {
+    locked = Boolean((await lockClient.query(
+      "SELECT pg_try_advisory_lock(hashtext('icc:inspection-report-integrity')) AS acquired"
+    )).rows[0]?.acquired);
+    if (!locked) throw new HttpRequestError(409, "REPORT_VERIFICATION_RUNNING",
+      "Ya existe una verificación de informes en ejecución.");
+    return await verifyCanonicalInspectionReports(profile, limit);
+  } finally {
+    if (locked) await lockClient.query(
+      "SELECT pg_advisory_unlock(hashtext('icc:inspection-report-integrity'))"
+    ).catch(() => {});
+    lockClient.release();
+  }
+}
+
 async function uploadFileObject(body) {
   if (!pool) throw new Error("DATABASE_URL no configurada");
   const id = `file-${randomUUID()}`;
@@ -1242,7 +1260,8 @@ async function runDueEvidenceVerificationJobs() {
     )).rows[0]?.acquired);
     if (!locked) return { skipped: true, reason: "scheduler_locked", processed: 0 };
     const jobs = (await pool.query(`SELECT * FROM logistics_scheduled_jobs
-      WHERE enabled=TRUE AND job_code='EVIDENCE_WEEKLY_VERIFICATION'
+      WHERE enabled=TRUE AND job_code IN ('EVIDENCE_WEEKLY_VERIFICATION',
+        'INSPECTION_REPORT_WEEKLY_VERIFICATION')
         AND next_run_at<=NOW() ORDER BY next_run_at LIMIT 5`)).rows;
     const results = [];
     for (const job of jobs) {
@@ -1253,7 +1272,9 @@ async function runDueEvidenceVerificationJobs() {
         const profile = (await pool.query(`SELECT * FROM inventory_user_profiles
           WHERE admin=TRUE AND active=TRUE ORDER BY activated_at NULLS LAST,created_at LIMIT 1`)).rows[0];
         if (!profile) throw new Error("No existe un administrador activo para firmar la comprobación.");
-        const run = await runEvidenceVerification(profile, job.batch_limit || 25);
+        const run = job.job_code === "INSPECTION_REPORT_WEEKLY_VERIFICATION"
+          ? await runCanonicalReportVerificationWithLock(profile, job.batch_limit || 25)
+          : await runEvidenceVerification(profile, job.batch_limit || 25);
         const summary = { runId: run.id, status: run.status,
           verified: run.verified_count, missing: run.missing_count,
           corrupt: run.corrupt_count, errors: run.error_count };
@@ -1272,23 +1293,26 @@ async function runDueEvidenceVerificationJobs() {
           last_completed_at=NOW(),last_error=$2,last_result='{}'::jsonb,
           next_run_at=NOW()+INTERVAL '4 hours',updated_at=NOW() WHERE id=$1`,
         [job.id, message]);
+        const failureTitle = job.job_code === "INSPECTION_REPORT_WEEKLY_VERIFICATION"
+          ? "Falló la verificación automática de informes finales"
+          : "Falló la verificación automática de evidencias";
         await pool.query(`INSERT INTO inventory_tasks
           (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,
            due_at,payload,updated_at)
-          VALUES ($1,'SCHEDULER_FAILURE','Falló la verificación automática de evidencias',$2,
-            'Crítica','Pendiente','Bodega Central','scheduled_job',$3,
-            NOW()+INTERVAL '4 hours',$4::jsonb,NOW())
+          VALUES ($1,'SCHEDULER_FAILURE',$2,$3,
+            'Crítica','Pendiente','Bodega Central','scheduled_job',$4,
+            NOW()+INTERVAL '4 hours',$5::jsonb,NOW())
           ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,priority='Crítica',
             status='Pendiente',resolved_at=NULL,due_at=EXCLUDED.due_at,
             payload=EXCLUDED.payload,updated_at=NOW()`,
-        [`scheduler-${job.id}`, message, job.id,
+        [`scheduler-${job.id}`, failureTitle, message, job.id,
           asJson({ jobCode: job.job_code, failedAt: new Date().toISOString() })]);
         await pool.query(`INSERT INTO inventory_notifications
           (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
           VALUES ($1,'Bodega Central','SCHEDULER_FAILURE',$2,$3,'critical',
             'scheduled_job',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
         [`notification-scheduler-${job.id}-${new Date().toISOString().slice(0, 10)}`,
-          "Falló la verificación automática de evidencias", message, job.id,
+          failureTitle, message, job.id,
           asJson({ jobCode: job.job_code })]);
         results.push({ jobId: job.id, ok: false, error: message });
       }
@@ -2147,7 +2171,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("063_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("064_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2712,9 +2736,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("063_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("064_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("063_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("064_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4069,10 +4093,15 @@ async function handleHttpRequest(req, res, requestId) {
         FROM logistics_evidence_verification_runs
         WHERE organization_id=$1 AND summary->>'scope'='INSPECTION_FINAL_REPORT'
         ORDER BY started_at DESC LIMIT 1`, [logisticsOrganizationId])).rows[0] || null;
+      const schedule = (await pool.query(`SELECT enabled,next_run_at,last_completed_at,
+          last_status,last_error,last_result,schedule_interval_days,batch_limit
+        FROM logistics_scheduled_jobs WHERE organization_id=$1
+          AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION' LIMIT 1`,
+      [logisticsOrganizationId])).rows[0] || null;
       return json(res, 200, {
         summary: { eligible: Number(summary?.eligible || 0), archived: Number(summary?.archived || 0),
           pending: Number(summary?.pending || 0), failed },
-        recent, integrity
+        recent, integrity, schedule
       });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo consultar la custodia de informes." });
@@ -4085,7 +4114,7 @@ async function handleHttpRequest(req, res, requestId) {
     }
     try {
       const body = await readJson(req);
-      return json(res, 200, await verifyCanonicalInspectionReports(apiProfile, body.limit || 25));
+      return json(res, 200, await runCanonicalReportVerificationWithLock(apiProfile, body.limit || 25));
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo verificar la integridad de los informes." });
     }

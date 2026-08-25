@@ -22,7 +22,7 @@ test("el ejecutor usa bloqueo distribuido y reintento ante caída", () => {
 });
 
 test("el planificador genérico no reclama el trabajo especializado", () => {
-  assert.match(logistics, /job_code<>'EVIDENCE_WEEKLY_VERIFICATION'/);
+  assert.match(logistics, /job_code NOT IN \('EVIDENCE_WEEKLY_VERIFICATION',\s*'INSPECTION_REPORT_WEEKLY_VERIFICATION'\)/);
   assert.match(server, /const evidence = await runDueEvidenceVerificationJobs/);
   assert.match(server, /const logistics = await runDueLogisticsJobs/);
 });
