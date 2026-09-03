@@ -6,7 +6,7 @@ import pg from "pg";
 import QRCode from "qrcode";
 import PDFDocument from "pdfkit";
 import { createClient } from "@supabase/supabase-js";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   backfillLegacyState,
   calculateInventoryClassifications,
@@ -182,6 +182,48 @@ function storageConfigured() {
 
 function authConfigured() {
   return Boolean(supabaseBaseUrl() && process.env.SUPABASE_SERVICE_ROLE_KEY && (process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY));
+}
+
+function outboxWebhookSettings() {
+  const endpoint = String(process.env.OUTBOX_WEBHOOK_URL || "").trim();
+  const secret = String(process.env.OUTBOX_WEBHOOK_SECRET || "").trim();
+  if (!endpoint && !secret) return { enabled: false, valid: true, endpoint: "", secret: "" };
+  if (!endpoint || !secret) return { enabled: false, valid: false, endpoint, secret };
+  try {
+    const parsed = new URL(endpoint);
+    const secure = parsed.protocol === "https:"
+      || (process.env.NODE_ENV !== "production" && parsed.protocol === "http:"
+        && ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname));
+    return { enabled: secure, valid: secure, endpoint: parsed.toString(), secret };
+  } catch {
+    return { enabled: false, valid: false, endpoint, secret };
+  }
+}
+
+async function deliverOutboxWebhook(envelope) {
+  const settings = outboxWebhookSettings();
+  if (!settings.enabled) throw new Error("El webhook de eventos no está configurado correctamente.");
+  const body = JSON.stringify(envelope);
+  const timestamp = String(Math.trunc(Date.now() / 1000));
+  const signature = createHmac("sha256", settings.secret)
+    .update(`${timestamp}.${body}`).digest("hex");
+  const response = await fetchWithTimeout(settings.endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-ICC-Event-Id": envelope.id,
+      "X-ICC-Event-Type": envelope.eventType,
+      "X-ICC-Timestamp": timestamp,
+      "X-ICC-Signature": `sha256=${signature}`,
+      "Idempotency-Key": envelope.id
+    },
+    body
+  }, { service: "El receptor de eventos", timeoutMs: process.env.OUTBOX_WEBHOOK_TIMEOUT_MS || 10_000 });
+  if (!response.ok) {
+    const error = new Error(`El receptor respondió HTTP ${response.status}.`);
+    error.code = `WEBHOOK_HTTP_${response.status}`;
+    throw error;
+  }
 }
 
 function criticalReauthMinutes() {
@@ -1250,6 +1292,56 @@ async function runEvidenceVerification(profile, requestedLimit = 25) {
   return completed;
 }
 
+async function recoverInterruptedVerificationRuns() {
+  const recovered = (await pool.query(`WITH stale AS (
+      SELECT started.execution_id,started.organization_id,started.scheduled_job_id,
+        started.job_code,started.occurred_at
+      FROM logistics_scheduled_job_events started
+      LEFT JOIN logistics_scheduled_job_events terminal
+        ON terminal.execution_id=started.execution_id
+       AND terminal.event_type IN ('SUCCESS','FAILED')
+      WHERE started.event_type='STARTED' AND terminal.id IS NULL
+        AND started.occurred_at < NOW()-INTERVAL '30 minutes'
+    )
+    INSERT INTO logistics_scheduled_job_events
+      (execution_id,organization_id,scheduled_job_id,job_code,event_type,duration_ms,
+       result,error_detail)
+    SELECT execution_id,organization_id,scheduled_job_id,job_code,'FAILED',
+      GREATEST(0,(EXTRACT(EPOCH FROM (NOW()-occurred_at))*1000)::bigint),
+      jsonb_build_object('recovered',TRUE),
+      'Ejecución interrumpida por reinicio o pérdida del proceso.'
+    FROM stale ON CONFLICT DO NOTHING
+    RETURNING execution_id,organization_id,scheduled_job_id,job_code,error_detail`)).rows;
+  for (const run of recovered) {
+    await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='FAILED',
+      last_completed_at=NOW(),last_error=$2,last_result=$3::jsonb,next_run_at=NOW(),
+      updated_at=NOW() WHERE id=$1 AND last_status='RUNNING'`,
+    [run.scheduled_job_id, run.error_detail,
+      asJson({ recovered: true, executionId: run.execution_id })]);
+    const title = run.job_code === "INSPECTION_REPORT_WEEKLY_VERIFICATION"
+      ? "Reintentar verificación interrumpida de informes finales"
+      : "Reintentar verificación interrumpida de evidencias";
+    await pool.query(`INSERT INTO inventory_tasks
+      (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,
+       due_at,payload,updated_at)
+      VALUES ($1,'SCHEDULER_FAILURE',$2,$3,'Crítica','Pendiente','Bodega Central',
+        'scheduled_job',$4,NOW()+INTERVAL '30 minutes',$5::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,detail=EXCLUDED.detail,
+        priority='Crítica',status='Pendiente',resolved_at=NULL,
+        due_at=NOW()+INTERVAL '30 minutes',
+        payload=EXCLUDED.payload,updated_at=NOW()`,
+    [`scheduler-${run.scheduled_job_id}`, title, run.error_detail,
+      run.scheduled_job_id, asJson({ executionId: run.execution_id, recovered: true })]);
+    await pool.query(`INSERT INTO inventory_notifications
+      (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+      VALUES ($1,'Bodega Central','SCHEDULER_INTERRUPTED',$2,$3,'critical',
+        'scheduled_job',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
+    [`notification-scheduler-interrupted-${run.execution_id}`, title, run.error_detail,
+      run.scheduled_job_id, asJson({ executionId: run.execution_id })]);
+  }
+  return recovered;
+}
+
 async function runDueEvidenceVerificationJobs() {
   if (!pool || !logisticsReady) return { skipped: true, processed: 0 };
   const lockClient = await pool.connect();
@@ -1259,12 +1351,19 @@ async function runDueEvidenceVerificationJobs() {
       "SELECT pg_try_advisory_lock(hashtext('icc:evidence-verification-scheduler')) AS acquired"
     )).rows[0]?.acquired);
     if (!locked) return { skipped: true, reason: "scheduler_locked", processed: 0 };
+    const recovered = await recoverInterruptedVerificationRuns();
     const jobs = (await pool.query(`SELECT * FROM logistics_scheduled_jobs
       WHERE enabled=TRUE AND job_code IN ('EVIDENCE_WEEKLY_VERIFICATION',
         'INSPECTION_REPORT_WEEKLY_VERIFICATION')
         AND next_run_at<=NOW() ORDER BY next_run_at LIMIT 5`)).rows;
     const results = [];
     for (const job of jobs) {
+      const executionId = randomUUID();
+      const executionStartedAt = Date.now();
+      await pool.query(`INSERT INTO logistics_scheduled_job_events
+        (execution_id,organization_id,scheduled_job_id,job_code,event_type,result)
+        VALUES ($1,$2,$3,$4,'STARTED','{}'::jsonb)`,
+      [executionId, job.organization_id, job.id, job.job_code]);
       await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='RUNNING',
         last_started_at=NOW(),last_error=NULL,next_run_at=NOW()+INTERVAL '30 minutes',
         updated_at=NOW() WHERE id=$1`, [job.id]);
@@ -1283,9 +1382,27 @@ async function runDueEvidenceVerificationJobs() {
           next_run_at=((((NOW() AT TIME ZONE timezone_name)::date+schedule_interval_days)
             +make_interval(hours=>local_hour)) AT TIME ZONE timezone_name),updated_at=NOW()
           WHERE id=$1`, [job.id, asJson(summary)]);
-        await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
+        await pool.query(`INSERT INTO logistics_scheduled_job_events
+          (execution_id,organization_id,scheduled_job_id,job_code,event_type,initiated_by,
+           duration_ms,result)
+          VALUES ($1,$2,$3,$4,'SUCCESS',$5,$6,$7::jsonb)`,
+        [executionId, job.organization_id, job.id, job.job_code, profile.id,
+          Date.now() - executionStartedAt, asJson(summary)]);
+        const resolvedTask = await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
           resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
-          WHERE id=$1 AND status<>'Resuelta'`, [`scheduler-${job.id}`]);
+          WHERE id=$1 AND status<>'Resuelta' RETURNING id,title`, [`scheduler-${job.id}`]);
+        if (resolvedTask.rowCount) {
+          await pool.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
+            WHERE entity_type='scheduled_job' AND entity_id=$1 AND read_at IS NULL`, [job.id]);
+          await pool.query(`INSERT INTO inventory_notifications
+            (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+            VALUES ($1,'Bodega Central','SCHEDULER_RECOVERED',$2,$3,'info',
+              'scheduled_job',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
+          [`notification-scheduler-recovered-${executionId}`,
+            "Automatización recuperada correctamente",
+            `${resolvedTask.rows[0].title}. La ejecución posterior terminó sin errores.`,
+            job.id, asJson({ executionId, jobCode: job.job_code })]);
+        }
         results.push({ jobId: job.id, ok: true, ...summary });
       } catch (error) {
         const message = String(error?.message || error).slice(0, 2000);
@@ -1296,12 +1413,18 @@ async function runDueEvidenceVerificationJobs() {
         const failureTitle = job.job_code === "INSPECTION_REPORT_WEEKLY_VERIFICATION"
           ? "Falló la verificación automática de informes finales"
           : "Falló la verificación automática de evidencias";
+        await pool.query(`INSERT INTO logistics_scheduled_job_events
+          (execution_id,organization_id,scheduled_job_id,job_code,event_type,duration_ms,
+           result,error_detail)
+          VALUES ($1,$2,$3,$4,'FAILED',$5,'{}'::jsonb,$6)`,
+        [executionId, job.organization_id, job.id, job.job_code,
+          Date.now() - executionStartedAt, message]);
         await pool.query(`INSERT INTO inventory_tasks
           (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,
            due_at,payload,updated_at)
           VALUES ($1,'SCHEDULER_FAILURE',$2,$3,
             'Crítica','Pendiente','Bodega Central','scheduled_job',$4,
-            NOW()+INTERVAL '4 hours',$5::jsonb,NOW())
+            NOW()+INTERVAL '2 hours',$5::jsonb,NOW())
           ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,priority='Crítica',
             status='Pendiente',resolved_at=NULL,due_at=EXCLUDED.due_at,
             payload=EXCLUDED.payload,updated_at=NOW()`,
@@ -1317,7 +1440,7 @@ async function runDueEvidenceVerificationJobs() {
         results.push({ jobId: job.id, ok: false, error: message });
       }
     }
-    return { skipped: false, processed: jobs.length, results };
+    return { skipped: false, processed: jobs.length, recovered: recovered.length, results };
   } finally {
     if (locked) await lockClient.query(
       "SELECT pg_advisory_unlock(hashtext('icc:evidence-verification-scheduler'))"
@@ -2171,7 +2294,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("064_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("068_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2553,17 +2676,126 @@ function startComplianceScheduler() {
 }
 
 let logisticsJobSweepRunning = false;
+async function escalateOverdueSchedulerFailures() {
+  const escalated = (await pool.query(`UPDATE inventory_tasks SET
+      payload=jsonb_set(COALESCE(payload,'{}'::jsonb),'{escalatedAt}',to_jsonb(NOW()),TRUE),
+      priority='Crítica',updated_at=NOW()
+    WHERE task_type='SCHEDULER_FAILURE' AND status<>'Resuelta' AND due_at<=NOW()
+      AND COALESCE(payload->>'escalatedAt','')=''
+    RETURNING id,title,detail,entity_id,payload`)).rows;
+  for (const task of escalated) {
+    await pool.query(`INSERT INTO inventory_notifications
+      (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+      VALUES ($1,'Bodega Central','SCHEDULER_ESCALATION',$2,$3,'critical',
+        'scheduled_job',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
+    [`notification-escalation-${task.id}-${Date.now()}`,
+      `Plazo vencido: ${task.title}`, task.detail, task.entity_id,
+      asJson({ taskId: task.id, escalatedAt: task.payload?.escalatedAt })]);
+  }
+  return escalated;
+}
+
+async function evaluateInspectionReportAutomationSlo() {
+  const policy = (await pool.query(`SELECT * FROM logistics_automation_slo_policies
+    WHERE organization_id=$1 AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'
+      AND enabled=TRUE LIMIT 1`, [logisticsOrganizationId])).rows[0];
+  if (!policy) return { status: "DISABLED", reasons: [] };
+  const metrics = (await pool.query(`SELECT COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE event_type='SUCCESS')::int AS successful,
+      COALESCE(ROUND(AVG(duration_ms) FILTER (WHERE duration_ms IS NOT NULL)),0)::bigint
+        AS average_duration_ms
+    FROM logistics_scheduled_job_events WHERE organization_id=$1
+      AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'
+      AND event_type IN ('SUCCESS','FAILED')
+      AND occurred_at>=NOW()-($2::int*INTERVAL '1 day')`,
+  [logisticsOrganizationId, policy.evaluation_window_days])).rows[0];
+  const total = Number(metrics?.total || 0);
+  if (!total) return { status: "PENDING", reasons: [] };
+  const successRate = Number(metrics.successful || 0) * 100 / total;
+  const averageDurationMs = Number(metrics.average_duration_ms || 0);
+  const openIncidents = Number((await pool.query(`SELECT COUNT(*)::int AS count
+    FROM inventory_tasks task JOIN logistics_scheduled_jobs job ON job.id::text=task.entity_id
+    WHERE task.task_type='SCHEDULER_FAILURE' AND task.status<>'Resuelta'
+      AND job.organization_id=$1 AND job.job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'`,
+  [logisticsOrganizationId])).rows[0]?.count || 0);
+  const reasons = [];
+  if (successRate < Number(policy.target_success_rate)) {
+    reasons.push(`Éxito ${successRate.toFixed(1)}% bajo meta ${policy.target_success_rate}%`);
+  }
+  if (averageDurationMs > Number(policy.max_average_duration_ms)) {
+    reasons.push(`Duración promedio ${Math.round(averageDurationMs / 1000)} s sobre máximo ${Math.round(Number(policy.max_average_duration_ms) / 1000)} s`);
+  }
+  if (openIncidents > Number(policy.max_open_incidents)) {
+    reasons.push(`${openIncidents} incidente(s) abierto(s), máximo ${policy.max_open_incidents}`);
+  }
+  const taskId = "automation-slo-inspection-reports";
+  const current = (await pool.query(`SELECT id,status FROM inventory_tasks WHERE id=$1`, [taskId])).rows[0];
+  const adminId = (await pool.query(`SELECT id FROM inventory_user_profiles
+    WHERE admin=TRUE AND active=TRUE ORDER BY activated_at NULLS LAST,created_at LIMIT 1`)).rows[0]?.id || null;
+  const detail = reasons.join(" · ");
+  if (reasons.length) {
+    await pool.query(`INSERT INTO inventory_tasks
+      (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,
+       due_at,payload,updated_at)
+      VALUES ($1,'AUTOMATION_SLO','Recuperar objetivo de servicio de informes',$2,
+        'Crítica','Pendiente','Bodega Central','automation_slo',$3,
+        NOW()+INTERVAL '24 hours',$4::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,priority='Crítica',
+        status='Pendiente',resolved_at=NULL,due_at=EXCLUDED.due_at,
+        payload=EXCLUDED.payload,updated_at=NOW()`,
+    [taskId, detail, policy.id, asJson({ successRate, averageDurationMs,
+      openIncidents, reasons, evaluatedAt: new Date().toISOString() })]);
+    await pool.query(`INSERT INTO inventory_notifications
+      (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+      VALUES ($1,'Bodega Central','AUTOMATION_SLO_BREACH',$2,$3,'critical',
+        'automation_slo',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
+    [`notification-${taskId}-${new Date().toISOString().slice(0, 10)}`,
+      "Objetivo de servicio incumplido", detail, policy.id, asJson({ taskId, reasons })]);
+    if (!current || current.status === "Resuelta") {
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'AUTOMATION_SLO_BREACHED','automation_slo',$2,$3,'SYSTEM',$4::jsonb)`,
+      [logisticsOrganizationId, policy.id, adminId,
+        asJson({ successRate, averageDurationMs, openIncidents, reasons })]);
+    }
+    return { status: "BREACH", reasons, successRate, averageDurationMs, openIncidents };
+  }
+  const resolved = await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
+    resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+    WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [taskId]);
+  if (resolved.rowCount) {
+    await pool.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
+      WHERE entity_type='automation_slo' AND entity_id=$1 AND read_at IS NULL`, [policy.id]);
+    await pool.query(`INSERT INTO inventory_notifications
+      (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+      VALUES ($1,'Bodega Central','AUTOMATION_SLO_RECOVERED',$2,$3,'info',
+        'automation_slo',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
+    [`notification-${taskId}-recovered-${Date.now()}`, "Objetivo de servicio recuperado",
+      `La automatización volvió a cumplir: ${successRate.toFixed(1)}% de éxito.`,
+      policy.id, asJson({ taskId, successRate })]);
+    await pool.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+      VALUES ($1,'AUTOMATION_SLO_RECOVERED','automation_slo',$2,$3,'SYSTEM',$4::jsonb)`,
+    [logisticsOrganizationId, policy.id, adminId,
+      asJson({ successRate, averageDurationMs, openIncidents })]);
+  }
+  return { status: "COMPLIANT", reasons: [], successRate, averageDurationMs, openIncidents };
+}
+
 async function sweepScheduledLogisticsJobs() {
   if (!pool || !logisticsReady || logisticsJobSweepRunning) {
     return { skipped: true, processed: 0 };
   }
   logisticsJobSweepRunning = true;
   try {
+    const escalations = await escalateOverdueSchedulerFailures();
     const evidence = await runDueEvidenceVerificationJobs();
+    const inspectionReportSlo = await evaluateInspectionReportAutomationSlo();
     const logistics = await runDueLogisticsJobs(pool);
     const inspectionReviews = await reviewInspectionWorkflowTasks(pool, logisticsOrganizationId);
     const inspectionReports = await sweepMissingInspectionReports(5);
-    return { ...logistics, evidence, inspectionReviews, inspectionReports };
+    return { ...logistics, evidence, inspectionReportSlo, escalations: escalations.length,
+      inspectionReviews, inspectionReports };
   } finally {
     logisticsJobSweepRunning = false;
   }
@@ -2583,7 +2815,13 @@ async function sweepLogisticsOutbox() {
   }
   outboxSweepRunning = true;
   try {
-    return await processOutboxEvents(pool, { limit: 100, maxAttempts: 5 });
+    const webhook = outboxWebhookSettings();
+    const deliveryTargets = webhook.enabled ? [{
+      channel: "SIGNED_WEBHOOK",
+      destination: new URL(webhook.endpoint).origin,
+      deliver: deliverOutboxWebhook
+    }] : [];
+    return await processOutboxEvents(pool, { limit: 100, maxAttempts: 5, deliveryTargets });
   } finally {
     outboxSweepRunning = false;
   }
@@ -2736,9 +2974,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("064_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("068_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("064_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("068_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -2848,6 +3086,70 @@ async function productionReadiness() {
     evidenceScheduleStatus, evidenceScheduleDetail,
     evidenceScheduleStatus === "PASS" ? "" : "Abrir Configuración y ejecutar una comprobación manual.");
 
+  const inspectionReportSchedule = (await pool.query(`SELECT enabled,next_run_at,
+      last_completed_at,last_status,last_error,last_result,batch_limit,schedule_interval_days
+    FROM logistics_scheduled_jobs
+    WHERE organization_id=$1 AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION' LIMIT 1`,
+  [logisticsOrganizationId])).rows[0];
+  const inspectionReportAgeDays = inspectionReportSchedule?.last_completed_at
+    ? (Date.now() - new Date(inspectionReportSchedule.last_completed_at).getTime()) / 86_400_000 : null;
+  const inspectionReportOverdue = inspectionReportSchedule?.enabled
+    && inspectionReportSchedule.next_run_at
+    && new Date(inspectionReportSchedule.next_run_at).getTime() < Date.now() - 6 * 3_600_000;
+  const inspectionReportScheduleStatus = !inspectionReportSchedule
+    || inspectionReportSchedule.last_status === "FAILED" || inspectionReportOverdue
+    ? "FAIL" : !inspectionReportSchedule.enabled || inspectionReportAgeDays === null
+      || inspectionReportAgeDays > 8 ? "WARN" : "PASS";
+  const inspectionReportScheduleDetail = !inspectionReportSchedule
+    ? "No existe la agenda semanal de informes finales."
+    : inspectionReportSchedule.last_status === "FAILED"
+      ? `Última ejecución fallida: ${inspectionReportSchedule.last_error || "sin detalle"}.`
+      : inspectionReportOverdue
+        ? `Ejecución atrasada desde ${new Date(inspectionReportSchedule.next_run_at).toLocaleString("es-CL")}.`
+        : !inspectionReportSchedule.enabled ? "La verificación automática está detenida."
+          : inspectionReportAgeDays === null
+            ? `Primera ejecución programada para ${new Date(inspectionReportSchedule.next_run_at).toLocaleString("es-CL")}.`
+            : `Última comprobación hace ${Math.floor(inspectionReportAgeDays)} día(s); lote ${inspectionReportSchedule.batch_limit || 25}.`;
+  add("inspectionReportAutomation", "Integridad automática de informes finales",
+    inspectionReportScheduleStatus, inspectionReportScheduleDetail,
+    inspectionReportScheduleStatus === "PASS" ? ""
+      : "Abrir Configuración, revisar Informes finales verificables y ejecutar Verificar integridad.");
+
+  const reportSloPolicy = (await pool.query(`SELECT evaluation_window_days,
+      target_success_rate,max_average_duration_ms,max_open_incidents,enabled
+    FROM logistics_automation_slo_policies WHERE organization_id=$1
+      AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION' LIMIT 1`,
+  [logisticsOrganizationId])).rows[0];
+  const reportSloWindow = Number(reportSloPolicy?.evaluation_window_days || 30);
+  const reportSloMetrics = (await pool.query(`SELECT COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE event_type='SUCCESS')::int AS successful,
+      COALESCE(ROUND(AVG(duration_ms) FILTER (WHERE duration_ms IS NOT NULL)),0)::bigint
+        AS average_duration_ms
+    FROM logistics_scheduled_job_events WHERE organization_id=$1
+      AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'
+      AND event_type IN ('SUCCESS','FAILED')
+      AND occurred_at>=NOW()-($2::int*INTERVAL '1 day')`,
+  [logisticsOrganizationId, reportSloWindow])).rows[0];
+  const reportSloOpen = Number((await pool.query(`SELECT COUNT(*)::int AS count
+    FROM inventory_tasks task JOIN logistics_scheduled_jobs job ON job.id::text=task.entity_id
+    WHERE task.task_type='SCHEDULER_FAILURE' AND task.status<>'Resuelta'
+      AND job.organization_id=$1 AND job.job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'`,
+  [logisticsOrganizationId])).rows[0]?.count || 0);
+  const reportSloTotal = Number(reportSloMetrics?.total || 0);
+  const reportSloRate = reportSloTotal
+    ? Number(reportSloMetrics?.successful || 0) * 100 / reportSloTotal : null;
+  const reportSloBreached = reportSloRate !== null && reportSloPolicy?.enabled
+    && (reportSloRate < Number(reportSloPolicy.target_success_rate)
+      || Number(reportSloMetrics?.average_duration_ms || 0) > Number(reportSloPolicy.max_average_duration_ms)
+      || reportSloOpen > Number(reportSloPolicy.max_open_incidents));
+  const reportSloStatus = !reportSloPolicy || !reportSloPolicy.enabled || reportSloRate === null
+    ? "WARN" : reportSloBreached ? "FAIL" : "PASS";
+  add("inspectionReportSlo", "Objetivo de servicio de informes finales", reportSloStatus,
+    reportSloRate === null ? "Aún no existen ejecuciones terminadas para medir el objetivo."
+      : `${reportSloRate.toFixed(1)}% de éxito; ${reportSloOpen} incidente(s) abierto(s).`,
+    reportSloStatus === "PASS" ? ""
+      : "Abrir Configuración y revisar o ajustar el Objetivo de servicio.");
+
   const outbox = await listOutboxHealth(pool, logisticsOrganizationId);
   const deadLetters = Number(outbox.summary?.dead_letter || 0);
   const oldestPendingAge = outbox.summary?.oldest_pending_at
@@ -2858,6 +3160,17 @@ async function productionReadiness() {
       : `${Number(outbox.summary?.pending || 0)} pendiente(s); ${Number(outbox.summary?.published_24h || 0)} publicados en 24 horas.`,
     deadLetters || oldestPendingAge > 15
       ? "Abrir Configuracion, revisar Cola de eventos y ejecutar la recuperacion." : "");
+
+  const webhook = outboxWebhookSettings();
+  const webhookPartiallyConfigured = Boolean(process.env.OUTBOX_WEBHOOK_URL)
+    !== Boolean(process.env.OUTBOX_WEBHOOK_SECRET);
+  add("outboxWebhook", "Canal externo firmado",
+    webhookPartiallyConfigured || !webhook.valid ? "FAIL" : "PASS",
+    webhook.enabled ? `Webhook HTTPS activo hacia ${new URL(webhook.endpoint).origin}.`
+      : webhookPartiallyConfigured ? "La URL y el secreto deben configurarse juntos."
+        : "Canal opcional desactivado; permanece activa la entrega interna.",
+    webhookPartiallyConfigured || !webhook.valid
+      ? "Revisar OUTBOX_WEBHOOK_URL y OUTBOX_WEBHOOK_SECRET en Render." : "");
 
   const deviceChecks = await pool.query(`SELECT check_type,
       (ARRAY_AGG(status ORDER BY performed_at DESC))[1] AS status,
@@ -4093,18 +4406,118 @@ async function handleHttpRequest(req, res, requestId) {
         FROM logistics_evidence_verification_runs
         WHERE organization_id=$1 AND summary->>'scope'='INSPECTION_FINAL_REPORT'
         ORDER BY started_at DESC LIMIT 1`, [logisticsOrganizationId])).rows[0] || null;
-      const schedule = (await pool.query(`SELECT enabled,next_run_at,last_completed_at,
+      const schedule = (await pool.query(`SELECT id,enabled,next_run_at,last_completed_at,
           last_status,last_error,last_result,schedule_interval_days,batch_limit
         FROM logistics_scheduled_jobs WHERE organization_id=$1
           AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION' LIMIT 1`,
       [logisticsOrganizationId])).rows[0] || null;
+      const executions = (await pool.query(`SELECT execution_id,event_type,initiated_by,
+          duration_ms,result,error_detail,occurred_at
+        FROM logistics_scheduled_job_events
+        WHERE organization_id=$1 AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'
+          AND event_type IN ('SUCCESS','FAILED')
+        ORDER BY occurred_at DESC LIMIT 10`, [logisticsOrganizationId])).rows;
+      const automationPolicy = (await pool.query(`SELECT id,enabled,evaluation_window_days,
+          target_success_rate,max_average_duration_ms,max_open_incidents,updated_at
+        FROM logistics_automation_slo_policies
+        WHERE organization_id=$1 AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION' LIMIT 1`,
+      [logisticsOrganizationId])).rows[0] || null;
+      const evaluationWindowDays = Number(automationPolicy?.evaluation_window_days || 30);
+      const reliability = (await pool.query(`SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE event_type='SUCCESS')::int AS successful,
+          COUNT(*) FILTER (WHERE event_type='FAILED')::int AS failed,
+          COUNT(*) FILTER (WHERE result->>'recovered'='true')::int AS interrupted,
+          COALESCE(ROUND(AVG(duration_ms) FILTER (WHERE duration_ms IS NOT NULL)),0)::bigint
+            AS average_duration_ms
+        FROM logistics_scheduled_job_events
+        WHERE organization_id=$1 AND job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'
+          AND event_type IN ('SUCCESS','FAILED')
+          AND occurred_at>=NOW()-($2::int*INTERVAL '1 day')`,
+      [logisticsOrganizationId, evaluationWindowDays])).rows[0];
+      const incidentSummary = (await pool.query(`SELECT
+          COUNT(*) FILTER (WHERE task.status<>'Resuelta')::int AS open,
+          COUNT(*) FILTER (WHERE task.status<>'Resuelta'
+            AND COALESCE(task.payload->>'escalatedAt','')<>'')::int AS escalated
+        FROM inventory_tasks task
+        JOIN logistics_scheduled_jobs job ON job.id::text=task.entity_id
+        WHERE task.task_type='SCHEDULER_FAILURE' AND job.organization_id=$1
+          AND job.job_code='INSPECTION_REPORT_WEEKLY_VERIFICATION'`,
+      [logisticsOrganizationId])).rows[0];
+      const totalExecutions = Number(reliability?.total || 0);
+      const successRate = totalExecutions
+        ? Math.round(Number(reliability?.successful || 0) * 1000 / totalExecutions) / 10 : null;
+      const averageDurationMs = Number(reliability?.average_duration_ms || 0);
+      const openIncidents = Number(incidentSummary?.open || 0);
+      const sloStatus = !automationPolicy?.enabled || successRate === null ? "PENDING"
+        : successRate < Number(automationPolicy.target_success_rate)
+          || averageDurationMs > Number(automationPolicy.max_average_duration_ms)
+          || openIncidents > Number(automationPolicy.max_open_incidents) ? "BREACH" : "COMPLIANT";
+      const automationHealth = {
+        total: totalExecutions,
+        successful: Number(reliability?.successful || 0),
+        failed: Number(reliability?.failed || 0),
+        interrupted: Number(reliability?.interrupted || 0),
+        averageDurationMs,
+        successRate,
+        openIncidents,
+        escalatedIncidents: Number(incidentSummary?.escalated || 0),
+        windowDays: evaluationWindowDays,
+        sloStatus,
+        policy: automationPolicy
+      };
       return json(res, 200, {
         summary: { eligible: Number(summary?.eligible || 0), archived: Number(summary?.archived || 0),
           pending: Number(summary?.pending || 0), failed },
-        recent, integrity, schedule
+        recent, integrity, schedule, executions, automationHealth
       });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo consultar la custodia de informes." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/inspection-reports/automation-policy" && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede configurar los objetivos de automatización." });
+    }
+    try {
+      const body = await readJson(req);
+      const targetSuccessRate = Number(body.targetSuccessRate);
+      const maxAverageDurationSeconds = Number(body.maxAverageDurationSeconds);
+      const maxOpenIncidents = Number(body.maxOpenIncidents);
+      const evaluationWindowDays = Number(body.evaluationWindowDays);
+      if (!Number.isFinite(targetSuccessRate) || targetSuccessRate < 50 || targetSuccessRate > 100) {
+        throw new Error("La tasa objetivo debe estar entre 50 y 100 por ciento.");
+      }
+      if (!Number.isInteger(evaluationWindowDays) || evaluationWindowDays < 7 || evaluationWindowDays > 365) {
+        throw new Error("La ventana debe estar entre 7 y 365 días.");
+      }
+      if (!Number.isFinite(maxAverageDurationSeconds) || maxAverageDurationSeconds < 1
+          || maxAverageDurationSeconds > 3600) {
+        throw new Error("La duración máxima debe estar entre 1 y 3600 segundos.");
+      }
+      if (!Number.isInteger(maxOpenIncidents) || maxOpenIncidents < 0 || maxOpenIncidents > 100) {
+        throw new Error("Los incidentes tolerados deben estar entre 0 y 100.");
+      }
+      const policy = (await pool.query(`INSERT INTO logistics_automation_slo_policies
+        (organization_id,job_code,evaluation_window_days,target_success_rate,
+         max_average_duration_ms,max_open_incidents,updated_by,updated_at)
+        VALUES ($1,'INSPECTION_REPORT_WEEKLY_VERIFICATION',$2,$3,$4,$5,$6,NOW())
+        ON CONFLICT (organization_id,job_code) DO UPDATE SET
+          evaluation_window_days=EXCLUDED.evaluation_window_days,
+          target_success_rate=EXCLUDED.target_success_rate,
+          max_average_duration_ms=EXCLUDED.max_average_duration_ms,
+          max_open_incidents=EXCLUDED.max_open_incidents,updated_by=EXCLUDED.updated_by,
+          updated_at=NOW() RETURNING *`, [logisticsOrganizationId, evaluationWindowDays,
+        targetSuccessRate, Math.round(maxAverageDurationSeconds * 1000), maxOpenIncidents,
+        apiProfile.id])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'AUTOMATION_SLO_UPDATED','automation_slo',$2,$3,'WEB',$4::jsonb)`,
+      [logisticsOrganizationId, policy.id, apiProfile.id, asJson(policy)]);
+      return json(res, 200, { policy });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el objetivo de servicio." });
     }
   }
 
