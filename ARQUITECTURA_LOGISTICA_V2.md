@@ -465,3 +465,4 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Configuración permite supervisar las entregas recientes y distinguir un reintento exitoso de un evento descartado.
 - El canal externo opcional transmite únicamente la envolvente mínima mediante HTTPS. Incluye firma HMAC, fecha e identificador idempotente para que el receptor valide y descarte repeticiones.
 - Administración puede emitir un evento técnico de prueba, sin alterar inventario ni simular una falla. La creación, el procesamiento y todos sus intentos quedan auditados.
+- Un objetivo de servicio supervisa cada minuto la antigüedad de pendientes, los eventos descartados y la tasa de fallos sobre una muestra mínima. Una brecha abre una sola tarea crítica y la recuperación la resuelve automáticamente.
