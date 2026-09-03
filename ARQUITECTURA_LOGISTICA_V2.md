@@ -466,3 +466,5 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - El canal externo opcional transmite únicamente la envolvente mínima mediante HTTPS. Incluye firma HMAC, fecha e identificador idempotente para que el receptor valide y descarte repeticiones.
 - Administración puede emitir un evento técnico de prueba, sin alterar inventario ni simular una falla. La creación, el procesamiento y todos sus intentos quedan auditados.
 - Un objetivo de servicio supervisa cada minuto la antigüedad de pendientes, los eventos descartados y la tasa de fallos sobre una muestra mínima. Una brecha abre una sola tarea crítica y la recuperación la resuelve automáticamente.
+- Administración puede modificar esos umbrales desde Configuración. El servidor valida rangos, aplica la evaluación inmediatamente y audita quién cambió la política.
+- La política y la bitácora de intentos tienen RLS activo; clientes anónimos o autenticados no pueden consultarlas directamente y deben pasar por la API autorizada.

@@ -946,11 +946,12 @@ function kpiScheduleModal(){
 function kpiMetricLabel(code){return({FILL_RATE:'Nivel de servicio (%)',ON_TIME_RATE:'Entregas a tiempo (%)',PICKING_ACCURACY:'Exactitud de picking (%)',INVENTORY_ACCURACY:'Exactitud de inventario (%)',AVERAGE_CYCLE_HOURS:'Tiempo de ciclo (horas)',OVERDUE_OPEN_REQUESTS:'Solicitudes atrasadas'})[code]||code}
 function outboxMonitorMarkup(){
   if(route!=='settings'||!can('admin')||!logisticsV2.loaded||logisticsV2.error)return'';
-  let data=logisticsV2.outboxHealth||{summary:{},failed:[],recentAttempts:[]},s=data.summary||{},failed=data.failed||[],attempts=data.recentAttempts||[];
+  let data=logisticsV2.outboxHealth||{summary:{},failed:[],recentAttempts:[],policy:null},s=data.summary||{},failed=data.failed||[],attempts=data.recentAttempts||[],p=data.policy||{};
   return `<section class="card logistics-v2 settings-wide" style="margin-top:20px" data-outbox-monitor>
     <div class="heading-row"><div><p class="eyebrow">Confiabilidad transaccional</p><h2 class="section-title">Cola de eventos operativos</h2>
     <p class="page-subtitle">Entrega automática con bloqueo distribuido, reintentos progresivos y trazabilidad de fallos.</p></div>
-    <div class="actions"><button class="button secondary" data-test-outbox>Enviar evento de prueba</button><button class="button" data-process-outbox>Procesar y comprobar</button></div></div>
+    <div class="actions"><button class="button secondary" data-edit-outbox-slo>Configurar objetivo</button><button class="button secondary" data-test-outbox>Enviar evento de prueba</button><button class="button" data-process-outbox>Procesar y comprobar</button></div></div>
+    <div class="access-box"><strong>Vigilancia ${p.enabled===false?'detenida':'activa'}</strong><div>Ventana ${Number(p.window_minutes||60)} min · atraso máximo ${Number(p.max_pending_minutes||15)} min · fallos tolerados ${Number(p.max_failure_rate_percent||20)}% desde ${Number(p.minimum_attempts||5)} intentos · descartes permitidos ${Number(p.max_dead_letters||0)}.</div></div>
     <div class="grid metrics"><div class="card"><div class="metric-label">Pendientes</div><div class="metric-value">${Number(s.pending||0)}</div></div>
     <div class="card"><div class="metric-label">En reintento</div><div class="metric-value">${Number(s.retrying||0)}</div></div>
     <div class="card"><div class="metric-label">Fallidos</div><div class="metric-value">${Number(s.dead_letter||0)}</div><div class="metric-foot ${Number(s.dead_letter)?'alert':''}">${Number(s.dead_letter)?'Requieren recuperación':'Sin bloqueos'}</div></div>
@@ -963,6 +964,7 @@ function outboxMonitorMarkup(){
     ${attempts.length?`<details style="margin-top:16px"><summary><strong>Bitácora de entregas recientes</strong></summary><div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Evento</th><th>Canal</th><th>Intento</th><th>Resultado</th><th>Duración</th></tr></thead><tbody>${attempts.map(x=>`<tr><td>${htmlSafe(x.event_type)}<br><small>${new Date(x.started_at).toLocaleString('es-CL')}</small></td><td>${htmlSafe(x.channel)}</td><td>${Number(x.attempt_number||0)}</td><td><span class="status ${x.status==='DELIVERED'?'ok':x.status==='FAILED'?'danger':'warning'}">${x.status==='DELIVERED'?'Entregado':x.status==='FAILED'?'Fallido':'Iniciado'}</span></td><td>${Number(x.duration_ms||0)} ms</td></tr>`).join('')}</tbody></table></div></details>`:''}
   </section>`;
 }
+function outboxSloPolicyModal(){let p=logisticsV2.outboxHealth?.policy||{};modal('Objetivo de entrega de eventos',`<form id="outboxSloPolicyForm"><div class="form-grid"><label>Estado<select name="enabled"><option value="true" ${p.enabled!==false?'selected':''}>Activo</option><option value="false" ${p.enabled===false?'selected':''}>Detenido</option></select></label><label>Ventana de evaluación (minutos)<input name="windowMinutes" type="number" min="15" max="10080" required value="${Number(p.window_minutes||60)}"></label><label>Atraso máximo (minutos)<input name="maxPendingMinutes" type="number" min="1" max="1440" required value="${Number(p.max_pending_minutes||15)}"></label><label>Fallos máximos (%)<input name="maxFailureRatePercent" type="number" min="0" max="100" step="0.1" required value="${Number(p.max_failure_rate_percent||20)}"></label><label>Muestra mínima de intentos<input name="minimumAttempts" type="number" min="1" max="1000" required value="${Number(p.minimum_attempts||5)}"></label><label>Eventos descartados tolerados<input name="maxDeadLetters" type="number" min="0" max="1000" required value="${Number(p.max_dead_letters||0)}"></label></div><div class="access-box" style="margin-top:16px"><strong>Recomendación inicial</strong><div>Mantén 15 minutos de atraso, 20% de fallos desde 5 intentos y ningún evento descartado.</div></div><div class="form-actions"><button type="button" class="outline" data-close>Cancelar</button><button class="button">Guardar y evaluar</button></div></form>`)}
 function kpiTargetFormModal(id=''){
   let existing=(logisticsV2.logisticsKpis?.targets||[]).find(x=>x.id===id),
     code=existing?.metric_code||'FILL_RATE',direction=existing?.direction||'MINIMUM',
@@ -1641,6 +1643,21 @@ document.addEventListener('click',e=>{
   let t=e.target.closest?.('[data-review-duplicate]');if(!t)return;e.preventDefault();
   if(!requirePerm('admin'))return;
   catalogDuplicateReviewModal(t.dataset.reviewDuplicate);
+},true);
+document.addEventListener('click',e=>{let t=e.target.closest?.('[data-edit-outbox-slo]');if(!t)return;e.preventDefault();if(!requirePerm('admin'))return;outboxSloPolicyModal()},true);
+document.addEventListener('submit',async e=>{
+  if(e.target.id!=='outboxSloPolicyForm')return;e.preventDefault();e.stopImmediatePropagation();
+  let unlock=lockFormSubmission(e.target,'Guardando y evaluando…');if(!unlock)return;
+  try{
+    let d=new FormData(e.target);
+    await logisticsFetch('/api/v1/outbox/policy',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      enabled:d.get('enabled')==='true',windowMinutes:Number(d.get('windowMinutes')),
+      maxPendingMinutes:Number(d.get('maxPendingMinutes')),
+      maxFailureRatePercent:Number(d.get('maxFailureRatePercent')),
+      minimumAttempts:Number(d.get('minimumAttempts')),maxDeadLetters:Number(d.get('maxDeadLetters'))
+    })});
+    closeModal();await loadLogisticsV2(true);toast('Objetivo de entrega actualizado y evaluado.');render();
+  }catch(err){toast(err.message||'No se pudo guardar el objetivo de entrega.')}finally{unlock()}
 },true);
 document.addEventListener('submit',async e=>{
   if(e.target.id!=='catalogDuplicateReviewForm')return;

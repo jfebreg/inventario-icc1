@@ -2295,7 +2295,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("069_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("070_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2977,9 +2977,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("069_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("070_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("069_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("070_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -4692,6 +4692,56 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, await sweepLogisticsOutbox());
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo procesar la cola de eventos." });
+    }
+  }
+
+  if (url.pathname === "/api/v1/outbox/policy" && req.method === "PATCH") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede configurar este objetivo de servicio." });
+    }
+    try {
+      const body = await readJson(req);
+      const enabled = body.enabled !== false;
+      const windowMinutes = Number(body.windowMinutes);
+      const maxPendingMinutes = Number(body.maxPendingMinutes);
+      const maxFailureRatePercent = Number(body.maxFailureRatePercent);
+      const minimumAttempts = Number(body.minimumAttempts);
+      const maxDeadLetters = Number(body.maxDeadLetters);
+      if (!Number.isInteger(windowMinutes) || windowMinutes < 15 || windowMinutes > 10080) {
+        throw new Error("La ventana debe estar entre 15 y 10080 minutos.");
+      }
+      if (!Number.isInteger(maxPendingMinutes) || maxPendingMinutes < 1 || maxPendingMinutes > 1440) {
+        throw new Error("El atraso máximo debe estar entre 1 y 1440 minutos.");
+      }
+      if (!Number.isFinite(maxFailureRatePercent) || maxFailureRatePercent < 0
+          || maxFailureRatePercent > 100) {
+        throw new Error("La tasa de fallos debe estar entre 0 y 100 por ciento.");
+      }
+      if (!Number.isInteger(minimumAttempts) || minimumAttempts < 1 || minimumAttempts > 1000) {
+        throw new Error("La muestra mínima debe estar entre 1 y 1000 intentos.");
+      }
+      if (!Number.isInteger(maxDeadLetters) || maxDeadLetters < 0 || maxDeadLetters > 1000) {
+        throw new Error("Los descartes tolerados deben estar entre 0 y 1000.");
+      }
+      const policy = (await pool.query(`INSERT INTO logistics_outbox_slo_policies
+        (organization_id,enabled,window_minutes,max_pending_minutes,max_failure_rate_percent,
+         minimum_attempts,max_dead_letters,updated_by,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+        ON CONFLICT (organization_id) DO UPDATE SET enabled=EXCLUDED.enabled,
+          window_minutes=EXCLUDED.window_minutes,max_pending_minutes=EXCLUDED.max_pending_minutes,
+          max_failure_rate_percent=EXCLUDED.max_failure_rate_percent,
+          minimum_attempts=EXCLUDED.minimum_attempts,max_dead_letters=EXCLUDED.max_dead_letters,
+          updated_by=EXCLUDED.updated_by,updated_at=NOW() RETURNING *`,
+      [logisticsOrganizationId, enabled, windowMinutes, maxPendingMinutes,
+        maxFailureRatePercent, minimumAttempts, maxDeadLetters, apiProfile.id])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'OUTBOX_SLO_POLICY_UPDATED','outbox_slo_policy',$2,$3,'WEB',$4::jsonb)`,
+      [logisticsOrganizationId, policy.id, apiProfile.id, asJson(policy)]);
+      const evaluation = await evaluateOutboxDeliverySlo(pool, logisticsOrganizationId);
+      return json(res, 200, { policy, evaluation });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo actualizar el objetivo de servicio." });
     }
   }
 
