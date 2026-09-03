@@ -4692,6 +4692,38 @@ async function handleHttpRequest(req, res, requestId) {
     }
   }
 
+  if (url.pathname === "/api/v1/outbox/test" && req.method === "POST") {
+    if (!profileCan(apiProfile, "admin")) {
+      return json(res, 403, { error: "Sólo administración puede enviar eventos de prueba." });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const testReference = randomUUID();
+      const event = (await client.query(`INSERT INTO logistics_outbox_events
+        (organization_id,event_type,aggregate_type,aggregate_id,payload,status,available_at,
+         idempotency_key)
+        VALUES ($1,'system.delivery.test','delivery_test',$2,$3::jsonb,'PENDING',NOW(),$4)
+        RETURNING id,event_type,aggregate_type,aggregate_id,status,created_at`,
+      [logisticsOrganizationId, testReference,
+        asJson({ requestedBy: apiProfile.id, purpose: "DELIVERY_VERIFICATION" }),
+        `manual-test:${testReference}`])).rows[0];
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'OUTBOX_TEST_CREATED','outbox_event',$2,$3,'WEB',$4::jsonb)`,
+      [logisticsOrganizationId, event.id, apiProfile.id,
+        asJson({ eventType: event.event_type, aggregateId: event.aggregate_id })]);
+      await client.query("COMMIT");
+      const processing = await sweepLogisticsOutbox();
+      return json(res, 201, { event, processing });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 400, { error: error.message || "No se pudo enviar el evento de prueba." });
+    } finally {
+      client.release();
+    }
+  }
+
   if (url.pathname.startsWith("/api/v1/outbox/") && url.pathname.endsWith("/retry")
       && req.method === "POST") {
     if (!profileCan(apiProfile, "admin")) {

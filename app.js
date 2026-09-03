@@ -950,7 +950,7 @@ function outboxMonitorMarkup(){
   return `<section class="card logistics-v2 settings-wide" style="margin-top:20px" data-outbox-monitor>
     <div class="heading-row"><div><p class="eyebrow">Confiabilidad transaccional</p><h2 class="section-title">Cola de eventos operativos</h2>
     <p class="page-subtitle">Entrega automática con bloqueo distribuido, reintentos progresivos y trazabilidad de fallos.</p></div>
-    <button class="button" data-process-outbox>Procesar y comprobar</button></div>
+    <div class="actions"><button class="button secondary" data-test-outbox>Enviar evento de prueba</button><button class="button" data-process-outbox>Procesar y comprobar</button></div></div>
     <div class="grid metrics"><div class="card"><div class="metric-label">Pendientes</div><div class="metric-value">${Number(s.pending||0)}</div></div>
     <div class="card"><div class="metric-label">En reintento</div><div class="metric-value">${Number(s.retrying||0)}</div></div>
     <div class="card"><div class="metric-label">Fallidos</div><div class="metric-value">${Number(s.dead_letter||0)}</div><div class="metric-foot ${Number(s.dead_letter)?'alert':''}">${Number(s.dead_letter)?'Requieren recuperación':'Sin bloqueos'}</div></div>
@@ -1720,16 +1720,18 @@ document.addEventListener('submit',async e=>{
   }catch(err){toast(err.message||'No se pudo guardar la automatización.')}finally{unlock()}
 },true);
 document.addEventListener('click',async e=>{
-  let t=e.target.closest?.('[data-process-outbox],[data-retry-outbox]');if(!t)return;e.preventDefault();
+  let t=e.target.closest?.('[data-process-outbox],[data-retry-outbox],[data-test-outbox]');if(!t)return;e.preventDefault();
   if(!requirePerm('admin'))return;
-  let retryId=t.dataset.retryOutbox;
+  let retryId=t.dataset.retryOutbox,isTest=t.hasAttribute('data-test-outbox');
   if(retryId&&!confirm('¿Reintentar este evento y comprobar su entrega?'))return;
+  if(isTest&&!confirm('Se enviará un evento técnico sin datos de inventario. ¿Continuar?'))return;
   t.disabled=true;
   try{
     await logisticsFetch(retryId?`/api/v1/outbox/${encodeURIComponent(retryId)}/retry`:
-      '/api/v1/outbox/process-now',{method:'POST'});
+      isTest?'/api/v1/outbox/test':'/api/v1/outbox/process-now',{method:'POST'});
     await loadLogisticsV2(true);
-    toast(retryId?'Evento recuperado o reenviado a procesamiento.':'Cola de eventos procesada y verificada.');
+    toast(retryId?'Evento recuperado o reenviado a procesamiento.':isTest?
+      'Evento de prueba enviado. Revisa la bitácora.':'Cola de eventos procesada y verificada.');
     render();
   }catch(err){toast(err.message||'No se pudo procesar la cola de eventos.');t.disabled=false}
 },true);

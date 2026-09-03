@@ -464,3 +464,4 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Cada intento de entrega conserva canal, resultado, duración y error en una bitácora separada. No se guardan secretos ni el cuerpo completo del evento.
 - Configuración permite supervisar las entregas recientes y distinguir un reintento exitoso de un evento descartado.
 - El canal externo opcional transmite únicamente la envolvente mínima mediante HTTPS. Incluye firma HMAC, fecha e identificador idempotente para que el receptor valide y descarte repeticiones.
+- Administración puede emitir un evento técnico de prueba, sin alterar inventario ni simular una falla. La creación, el procesamiento y todos sus intentos quedan auditados.
