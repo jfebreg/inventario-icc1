@@ -22,7 +22,7 @@ test("la evaluación abre una sola tarea crítica y evidencia la brecha", () => 
   assert.match(logistics, /'OUTBOX_HEALTH_BREACH'/);
   assert.match(logistics, /'OUTBOX_SLO_BREACHED'/);
   assert.match(logistics, /newlyBreached/);
-  assert.match(logistics, /due_at=COALESCE\(inventory_tasks\.due_at,EXCLUDED\.due_at\)/);
+  assert.match(logistics, /ELSE COALESCE\(inventory_tasks\.due_at,EXCLUDED\.due_at\) END/);
 });
 
 test("la recuperación resuelve la tarea y deja notificación y auditoría", () => {
