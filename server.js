@@ -400,13 +400,13 @@ async function fetchWithTimeout(url, options = {}, settings = {}) {
   }
 }
 
-function validateJsonComplexity(value) {
+function validateJsonComplexity(value, maxNodes = 20_000) {
   const stack = [{ value, depth: 0 }];
   let nodes = 0;
   while (stack.length) {
     const current = stack.pop();
     nodes += 1;
-    if (nodes > 20_000) throw new HttpRequestError(422, "JSON_TOO_COMPLEX", "La solicitud contiene demasiados campos.");
+    if (nodes > 20_000 && nodes > maxNodes) throw new HttpRequestError(422, "JSON_TOO_COMPLEX", "La solicitud contiene demasiados campos.");
     if (current.depth > 50) throw new HttpRequestError(422, "JSON_TOO_DEEP", "La solicitud contiene demasiados niveles anidados.");
     if (!current.value || typeof current.value !== "object") continue;
     for (const child of Object.values(current.value)) stack.push({ value: child, depth: current.depth + 1 });
@@ -422,10 +422,15 @@ function requireStableOperationKey(value, field = "idempotencyKey") {
   return key;
 }
 
-async function readJson(req) {
+async function readJson(req, options = {}) {
+  const maxBytes = Number(options.maxBytes || 15_000_000);
+  const maxNodes = Number(options.maxNodes || 20_000);
+  const oversizedMessage = maxBytes === 15_000_000
+    ? "Solicitud demasiado grande. Máximo permitido: 15 MB."
+    : `Solicitud demasiado grande. Máximo permitido: ${Math.floor(maxBytes / 1_000_000)} MB.`;
   const declaredLength = Number(req.headers["content-length"] || 0);
-  if (Number.isFinite(declaredLength) && declaredLength > 15_000_000) {
-    throw new HttpRequestError(413, "PAYLOAD_TOO_LARGE", "Solicitud demasiado grande. Máximo permitido: 15 MB.");
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new HttpRequestError(413, "PAYLOAD_TOO_LARGE", oversizedMessage);
   }
   const hasBody = declaredLength > 0 || Boolean(req.headers["transfer-encoding"]);
   const contentType = String(req.headers["content-type"] || "").trim();
@@ -436,7 +441,7 @@ async function readJson(req) {
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 15_000_000) throw new HttpRequestError(413, "PAYLOAD_TOO_LARGE", "Solicitud demasiado grande. Máximo permitido: 15 MB.");
+    if (size > maxBytes) throw new HttpRequestError(413, "PAYLOAD_TOO_LARGE", oversizedMessage);
     chunks.push(chunk);
   }
   let parsed;
@@ -448,7 +453,7 @@ async function readJson(req) {
   if (!parsed || typeof parsed !== "object") {
     throw new HttpRequestError(400, "JSON_OBJECT_REQUIRED", "La solicitud debe contener un objeto o una lista JSON.");
   }
-  validateJsonComplexity(parsed);
+  validateJsonComplexity(parsed, maxNodes);
   return parsed;
 }
 
@@ -2968,6 +2973,75 @@ async function createCanonicalBackup(actorProfile) {
       JSON.stringify({ auditHeadHash: payload.audit.headHash, auditChainValid: payload.audit.chainValid })]);
     await client.query("COMMIT");
     return { body, manifest };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function verifyCanonicalBackupPackage(actorProfile, payload) {
+  const startedAt = Date.now();
+  const requiredDatasets = [
+    "organizations", "items", "assetUnits", "stockMovements", "stockLedger",
+    "stockBalances", "documents", "auditEvents", "outboxEvents",
+    "outboxDeliveryAttempts", "outboxSloPolicies"
+  ];
+  const datasets = payload?.datasets && typeof payload.datasets === "object" && !Array.isArray(payload.datasets) ? payload.datasets : {};
+  const includedDatasets = Array.isArray(payload?.includedDatasets) ? payload.includedDatasets : [];
+  const body = JSON.stringify(payload);
+  const payloadSha256 = createHash("sha256").update(body).digest("hex");
+  const [manifestResult, schemaResult] = await Promise.all([
+    pool.query(`SELECT * FROM logistics_backup_manifests
+      WHERE organization_id=$1 AND payload_sha256=$2 ORDER BY generated_at DESC LIMIT 1`,
+    [logisticsOrganizationId, payloadSha256]),
+    pool.query(`SELECT version FROM logistics_schema_migrations WHERE version=$1 LIMIT 1`,
+    [String(payload?.schemaVersion || "")])
+  ]);
+  const manifest = manifestResult.rows[0] || null;
+  const datasetNames = Object.keys(datasets).sort();
+  const declaredNames = [...includedDatasets].map(String).sort();
+  const declaredCounts = payload?.recordCounts && typeof payload.recordCounts === "object" ? payload.recordCounts : {};
+  const countDifferences = datasetNames.filter(name => !Array.isArray(datasets[name]) || Number(declaredCounts[name]) !== (Array.isArray(datasets[name]) ? datasets[name].length : -1));
+  const missingRequired = requiredDatasets.filter(name => !Array.isArray(datasets[name]));
+  const checks = [
+    { code: "FORMAT_VALID", label: "Formato de respaldo reconocido", status: payload?.format === "ICC-LOGISTICS-BACKUP-1" ? "PASS" : "FAIL" },
+    { code: "MANIFEST_MATCH", label: "SHA-256 coincide con un manifiesto inmutable", status: manifest ? "PASS" : "FAIL", detail: payloadSha256 },
+    { code: "ORGANIZATION_MATCH", label: "Respaldo perteneciente a la organización activa", status: payload?.organizationId === logisticsOrganizationId ? "PASS" : "FAIL" },
+    { code: "SCHEMA_AVAILABLE", label: "Versión de estructura disponible en producción", status: schemaResult.rows[0] ? "PASS" : "FAIL", detail: String(payload?.schemaVersion || "Sin versión") },
+    { code: "DATASETS_DECLARED", label: "Índice de conjuntos de datos consistente", status: JSON.stringify(datasetNames) === JSON.stringify(declaredNames) ? "PASS" : "FAIL" },
+    { code: "RECORD_COUNTS", label: "Conteos de registros consistentes", status: countDifferences.length === 0 ? "PASS" : "FAIL", detail: countDifferences.length ? `Diferencias: ${countDifferences.join(", ")}` : `${datasetNames.length} conjuntos verificados` },
+    { code: "REQUIRED_DATASETS", label: "Datos operativos mínimos incluidos", status: missingRequired.length === 0 ? "PASS" : "FAIL", detail: missingRequired.length ? `Faltan: ${missingRequired.join(", ")}` : `${requiredDatasets.length} conjuntos críticos presentes` },
+    { code: "AUDIT_CHAIN", label: "Cadena de auditoría declarada íntegra", status: payload?.audit?.chainValid === true && Boolean(payload?.audit?.headHash) ? "PASS" : "FAIL" }
+  ];
+  const valid = checks.every(check => check.status === "PASS");
+  const measuredRpoMinutes = Number.isFinite(Date.parse(payload?.generatedAt)) ? Math.max(0, Math.ceil((Date.now() - Date.parse(payload.generatedAt)) / 60_000)) : 0;
+  const measuredRtoMinutes = Math.max(0, Math.ceil((Date.now() - startedAt) / 60_000));
+  const drillNumber = `DR-${new Date().toISOString().replace(/\D/g, "").slice(0, 17)}`;
+  const findings = valid ? "Paquete íntegro y apto para una restauración controlada en ambiente aislado." : checks.filter(check => check.status === "FAIL").map(check => check.label).join("; ");
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const drill = (await client.query(`INSERT INTO logistics_recovery_drills
+      (organization_id,drill_number,drill_type,environment,status,backup_manifest_id,
+       target_rpo_minutes,target_rto_minutes,measured_rpo_minutes,measured_rto_minutes,
+       scope,checklist,findings,corrective_actions,owner_profile_id,reviewed_by,
+       planned_at,started_at,completed_at,reviewed_at)
+      VALUES ($1,$2,'EXPORT_VERIFY','production-read-only',$3,$4,1440,240,$5,$6,
+        $7,$8::jsonb,$9,$10,$11,$11,NOW(),NOW(),NOW(),NOW()) RETURNING *`,
+    [logisticsOrganizationId, drillNumber, valid ? "PASSED" : "FAILED", manifest?.id || null,
+      measuredRpoMinutes, measuredRtoMinutes, `Validación no destructiva del paquete SHA-256 ${payloadSha256}`,
+      asJson(checks), findings, valid ? null : "Generar un nuevo respaldo V2 y repetir la verificación antes de cualquier recuperación.", actorProfile.id])).rows[0];
+    await client.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,
+       source,after_data,metadata)
+      VALUES ($1,$2,'recovery_drill',$3,$4,$5,'WEB',$6::jsonb,$7::jsonb)`,
+    [logisticsOrganizationId, valid ? "CANONICAL_BACKUP_VERIFIED" : "CANONICAL_BACKUP_REJECTED",
+      drill.id, actorProfile.id, `backup-verify:${drill.id}`, asJson({ valid, checks }),
+      asJson({ payloadSha256, schemaVersion: payload?.schemaVersion || null, manifestId: manifest?.id || null, filePayloadsExcluded: true })]);
+    await client.query("COMMIT");
+    return { valid, payloadSha256, manifestId: manifest?.id || null, schemaVersion: payload?.schemaVersion || null, checks, drill };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
@@ -6368,6 +6442,17 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, await productionReadiness());
     } catch (error) {
       return json(res, 503, { error: error.message || "No se pudo completar el diagnóstico productivo." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/canonical-backups/verify" && req.method === "POST") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede verificar respaldos V2." });
+    if (!logisticsReady) return json(res, 503, { error: "El libro mayor V2 todavía no está disponible." });
+    try {
+      const payload = await readJson(req, { maxBytes: 50_000_000, maxNodes: 500_000 });
+      return json(res, 200, await verifyCanonicalBackupPackage(apiProfile, payload));
+    } catch (error) {
+      return json(res, error.status || 400, { error: error.message || "No se pudo verificar el respaldo V2." });
     }
   }
 

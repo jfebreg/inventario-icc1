@@ -31,3 +31,10 @@ test("configuración permite registrar y revisar RPO y RTO", () => {
   assert.match(app, /completeRecoveryForm/);
   assert.match(app, /Nunca se restaura directamente sobre producción/);
 });
+
+test("verificar una exportación cierra automáticamente una prueba con evidencia", () => {
+  assert.match(server, /'EXPORT_VERIFY','production-read-only'/);
+  assert.match(server, /measuredRpoMinutes/);
+  assert.match(server, /Validación no destructiva del paquete SHA-256/);
+  assert.match(server, /Generar un nuevo respaldo V2 y repetir la verificación/);
+});

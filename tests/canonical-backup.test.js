@@ -43,3 +43,16 @@ test("la configuración ofrece descarga e historial V2", () => {
   assert.match(app, /function downloadCanonicalBackup/);
   assert.match(app, /function canonicalManifestsModal/);
 });
+
+test("la verificación de respaldo es no destructiva, auditable y valida controles críticos", () => {
+  assert.match(server, /async function verifyCanonicalBackupPackage/);
+  assert.match(server, /\/api\/admin\/canonical-backups\/verify/);
+  assert.match(server, /maxBytes: 50_000_000, maxNodes: 500_000/);
+  assert.match(server, /CANONICAL_BACKUP_VERIFIED/);
+  assert.match(server, /CANONICAL_BACKUP_REJECTED/);
+  for (const control of ["FORMAT_VALID", "MANIFEST_MATCH", "ORGANIZATION_MATCH", "SCHEMA_AVAILABLE", "DATASETS_DECLARED", "RECORD_COUNTS", "REQUIRED_DATASETS", "AUDIT_CHAIN"]) assert.match(server, new RegExp(control));
+  assert.match(server, /drill_type,environment,status,backup_manifest_id/);
+  assert.match(app, /data-verify-canonical-backup/);
+  assert.match(app, /function verifyCanonicalBackupFile/);
+  assert.match(app, /no modificó el inventario/);
+});
