@@ -6453,6 +6453,49 @@ async function handleHttpRequest(req, res, requestId) {
     return json(res, 200, { manifests: result.rows });
   }
 
+  const canonicalBackupDownloadRoute = url.pathname.match(/^\/api\/admin\/canonical-backups\/([0-9a-f-]+)\/download$/i);
+  if (canonicalBackupDownloadRoute && req.method === "GET") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede descargar respaldos V2." });
+    try {
+      const manifest = (await pool.query(`SELECT * FROM logistics_backup_manifests
+        WHERE id=$1 AND organization_id=$2`, [canonicalBackupDownloadRoute[1], logisticsOrganizationId])).rows[0];
+      if (!manifest) return json(res, 404, { error: "Respaldo V2 inexistente." });
+      const storagePath = String(manifest.metadata?.storagePath || "");
+      if (!storagePath || !storageConfigured()) return json(res, 404, { error: "Este respaldo no posee una copia archivada en Storage." });
+      const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
+      const stored = await fetchWithTimeout(endpoint, { headers: {
+        "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY
+      } }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
+      if (!stored.ok) throw new Error(`Storage respondió HTTP ${stored.status}.`);
+      const body = Buffer.from(await stored.arrayBuffer());
+      const actualSha256 = createHash("sha256").update(body).digest("hex");
+      if (!safeTokenEqual(actualSha256, manifest.payload_sha256)) {
+        await pool.query(`INSERT INTO logistics_audit_events
+          (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+          VALUES ($1,'CANONICAL_BACKUP_ARCHIVE_CORRUPT','backup_manifest',$2,$3,'WEB',$4::jsonb)`,
+        [logisticsOrganizationId, manifest.id, apiProfile.id,
+          asJson({ expectedSha256: manifest.payload_sha256, actualSha256 })]);
+        return json(res, 409, { error: "La copia archivada no supera la verificación SHA-256 y su descarga fue bloqueada." });
+      }
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'CANONICAL_BACKUP_ARCHIVE_DOWNLOADED','backup_manifest',$2,$3,'WEB',$4::jsonb)`,
+      [logisticsOrganizationId, manifest.id, apiProfile.id, asJson({ payloadSha256: actualSha256 })]);
+      const filename = `ICC_Logistica_V2_${new Date(manifest.generated_at).toISOString().replace(/[:.]/g, "-")}.json`;
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Length": body.length,
+        "X-Content-SHA256": actualSha256,
+        "Cache-Control": "no-store"
+      });
+      return res.end(body);
+    } catch (error) {
+      return json(res, error.status || 502, { error: error.message || "No se pudo recuperar el respaldo desde Storage." });
+    }
+  }
+
   if (url.pathname === "/api/admin/readiness" && req.method === "GET") {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede revisar la preparación productiva." });

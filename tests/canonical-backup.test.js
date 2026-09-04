@@ -75,3 +75,14 @@ test("cada exportación se archiva en Storage con ruta y huella verificables", (
   assert.match(app, /metadata\?\.storageArchived/);
   assert.match(app, /Custodia/);
 });
+
+test("la recuperación desde Storage verifica la huella antes de descargar", () => {
+  assert.match(server, /const canonicalBackupDownloadRoute/);
+  assert.match(server, /canonical-backups.*download/);
+  assert.match(server, /CANONICAL_BACKUP_ARCHIVE_CORRUPT/);
+  assert.match(server, /CANONICAL_BACKUP_ARCHIVE_DOWNLOADED/);
+  assert.match(server, /La copia archivada no supera la verificación SHA-256/);
+  assert.match(server, /"X-Content-SHA256": actualSha256/);
+  assert.match(app, /data-download-canonical-archive/);
+  assert.match(app, /function downloadCanonicalArchive/);
+});
