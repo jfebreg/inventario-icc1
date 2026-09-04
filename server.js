@@ -2890,8 +2890,9 @@ async function createCanonicalBackup(actorProfile) {
       outboxSloPolicies: "logistics_outbox_slo_policies"
     };
     for (const [name, table] of Object.entries(directTables)) {
+      const organizationPredicate = table === "logistics_organizations" ? "id=$1" : "organization_id=$1";
       const result = await client.query(`SELECT * FROM ${table}
-        WHERE organization_id=$1 ORDER BY 1`, [organizationId]);
+        WHERE ${organizationPredicate} ORDER BY 1`, [organizationId]);
       datasets[name] = result.rows;
     }
     const childQueries = {

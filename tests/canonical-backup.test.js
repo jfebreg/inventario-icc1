@@ -21,6 +21,11 @@ test("la exportación usa una fotografía transaccional consistente", () => {
   assert.match(server, /createHash\("sha256"\)\.update\(body\)/);
 });
 
+test("la organización raíz se filtra por su clave primaria", () => {
+  assert.match(server, /table === "logistics_organizations" \? "id=\$1" : "organization_id=\$1"/);
+  assert.doesNotMatch(server, /SELECT \* FROM logistics_organizations\s+WHERE organization_id=\$1/);
+});
+
 test("el paquete contiene operación, auditoría y referencias documentales", () => {
   for (const dataset of ["stockBalances", "stockMovements", "stockLedger", "assetUnits",
     "inspectionRuns", "documents", "fileObjects", "auditEvents", "assetCompliance",
