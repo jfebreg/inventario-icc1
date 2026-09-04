@@ -469,3 +469,4 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Administración puede modificar esos umbrales desde Configuración. El servidor valida rangos, aplica la evaluación inmediatamente y audita quién cambió la política.
 - La política y la bitácora de intentos tienen RLS activo; clientes anónimos o autenticados no pueden consultarlas directamente y deben pasar por la API autorizada.
 - Las brechas se asignan al administrador central. Si la tarea supera cuatro horas, se escala una sola vez; la recuperación posterior cierra todas las alertas abiertas del monitor.
+- El respaldo canónico incluye políticas, eventos, intentos de entrega e historial de automatizaciones. Cada paquete declara la versión del esquema y el inventario de conjuntos incluidos, sin copiar secretos ni binarios de Storage.

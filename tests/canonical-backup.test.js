@@ -17,12 +17,14 @@ test("la exportación usa una fotografía transaccional consistente", () => {
   assert.match(server, /BEGIN ISOLATION LEVEL REPEATABLE READ/);
   assert.match(server, /async function createCanonicalBackup/);
   assert.match(server, /ICC-LOGISTICS-BACKUP-1/);
+  assert.match(server, /schemaVersion/);
   assert.match(server, /createHash\("sha256"\)\.update\(body\)/);
 });
 
 test("el paquete contiene operación, auditoría y referencias documentales", () => {
   for (const dataset of ["stockBalances", "stockMovements", "stockLedger", "assetUnits",
-    "inspectionRuns", "documents", "fileObjects", "auditEvents", "assetCompliance"]) {
+    "inspectionRuns", "documents", "fileObjects", "auditEvents", "assetCompliance",
+    "outboxEvents", "outboxDeliveryAttempts", "outboxSloPolicies"]) {
     assert.match(server, new RegExp(`${dataset}:`));
   }
   assert.match(server, /filePayloadsExcluded: true/);

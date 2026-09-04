@@ -2878,7 +2878,11 @@ async function createCanonicalBackup(actorProfile) {
       kpiSnapshots: "logistics_kpi_snapshots",
       kpiTargets: "logistics_kpi_targets",
       scheduledJobs: "logistics_scheduled_jobs",
-      outboxEvents: "logistics_outbox_events"
+      scheduledJobEvents: "logistics_scheduled_job_events",
+      automationSloPolicies: "logistics_automation_slo_policies",
+      outboxEvents: "logistics_outbox_events",
+      outboxDeliveryAttempts: "logistics_outbox_delivery_attempts",
+      outboxSloPolicies: "logistics_outbox_slo_policies"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const result = await client.query(`SELECT * FROM ${table}
@@ -2929,8 +2933,11 @@ async function createCanonicalBackup(actorProfile) {
       WHERE organization_id=$1 ORDER BY id DESC LIMIT 1`, [organizationId]);
     const recordCounts = Object.fromEntries(Object.entries(datasets)
       .map(([name, rows]) => [name, rows.length]));
+    const schemaVersion = (await client.query(`SELECT version FROM logistics_schema_migrations
+      ORDER BY version DESC LIMIT 1`)).rows[0]?.version || null;
     const payload = {
       format: "ICC-LOGISTICS-BACKUP-1",
+      schemaVersion,
       generatedAt: new Date().toISOString(),
       organizationId,
       audit: {
@@ -2938,6 +2945,7 @@ async function createCanonicalBackup(actorProfile) {
         headHash: auditHead.rows[0]?.event_hash || null
       },
       recordCounts,
+      includedDatasets: Object.keys(datasets).sort(),
       datasets
     };
     const body = JSON.stringify(payload);
@@ -2948,7 +2956,9 @@ async function createCanonicalBackup(actorProfile) {
       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb) RETURNING *`,
     [organizationId, actorProfile.id, payloadSha256, payload.audit.headHash,
       payload.audit.chainValid, JSON.stringify(recordCounts),
-      JSON.stringify({ filePayloadsExcluded: true, storage: "Supabase Storage", bytes: Buffer.byteLength(body) })])).rows[0];
+      JSON.stringify({ filePayloadsExcluded: true, storage: "Supabase Storage",
+        schemaVersion, datasetCount: Object.keys(datasets).length,
+        bytes: Buffer.byteLength(body) })])).rows[0];
     await client.query(`INSERT INTO logistics_audit_events
       (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,
        source,after_data,metadata)
