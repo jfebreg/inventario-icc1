@@ -2300,7 +2300,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("070_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("071_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2956,6 +2956,23 @@ async function createCanonicalBackup(actorProfile) {
     };
     const body = JSON.stringify(payload);
     const payloadSha256 = createHash("sha256").update(body).digest("hex");
+    let storagePath = null;
+    if (storageConfigured()) {
+      const generatedKey = payload.generatedAt.replace(/[:.]/g, "-");
+      storagePath = `Respaldos_V2/${payload.generatedAt.slice(0, 10)}/ICC_Logistica_V2_${generatedKey}_${payloadSha256.slice(0, 12)}.json`;
+      const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
+      const archived = await fetchWithTimeout(endpoint, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY,
+          "Content-Type": "application/json",
+          "x-upsert": "false"
+        },
+        body
+      }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
+      if (!archived.ok) throw new Error(`No se pudo archivar el respaldo V2 en Storage: ${await archived.text()}`);
+    }
     const manifest = (await client.query(`INSERT INTO logistics_backup_manifests
       (organization_id,generated_by,payload_sha256,audit_head_hash,audit_chain_valid,
        record_counts,metadata)
@@ -2964,7 +2981,8 @@ async function createCanonicalBackup(actorProfile) {
       payload.audit.chainValid, JSON.stringify(recordCounts),
       JSON.stringify({ filePayloadsExcluded: true, storage: "Supabase Storage",
         schemaVersion, datasetCount: Object.keys(datasets).length,
-        bytes: Buffer.byteLength(body) })])).rows[0];
+        bytes: Buffer.byteLength(body), storagePath,
+        storageArchived: Boolean(storagePath) })])).rows[0];
     await client.query(`INSERT INTO logistics_audit_events
       (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,
        source,after_data,metadata)
@@ -3062,9 +3080,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("070_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("071_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("070_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("071_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
