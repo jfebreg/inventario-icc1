@@ -2920,7 +2920,7 @@ async function createCanonicalBackup(actorProfile) {
       workOrderParts: `SELECT child.* FROM logistics_work_order_parts child
         JOIN logistics_work_orders parent ON parent.id=child.work_order_id
         WHERE parent.organization_id=$1 ORDER BY child.work_order_id,child.id`,
-      fileObjects: `SELECT file.id,file.filename,file.mime_type,file.category,file.reference,
+      fileObjects: `SELECT file.id,file.filename,file.mime_type,file.category,file.ref AS reference,
           file.size_bytes,file.provider,file.storage_path,file.public_url,file.payload,file.created_at
         FROM inventory_file_objects file
         JOIN logistics_documents document ON document.file_object_id=file.id

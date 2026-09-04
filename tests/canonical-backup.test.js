@@ -26,6 +26,11 @@ test("la organización raíz se filtra por su clave primaria", () => {
   assert.doesNotMatch(server, /SELECT \* FROM logistics_organizations\s+WHERE organization_id=\$1/);
 });
 
+test("las referencias documentales usan la columna histórica real", () => {
+  assert.match(server, /file\.ref AS reference/);
+  assert.doesNotMatch(server, /file\.reference/);
+});
+
 test("el paquete contiene operación, auditoría y referencias documentales", () => {
   for (const dataset of ["stockBalances", "stockMovements", "stockLedger", "assetUnits",
     "inspectionRuns", "documents", "fileObjects", "auditEvents", "assetCompliance",
