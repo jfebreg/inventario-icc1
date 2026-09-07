@@ -21,6 +21,14 @@ test("el monitor abre y cierra una tarea sin alterar inventario", () => {
   assert.doesNotMatch(logistics, /BACKUP_RPO_DAILY_CHECK[\s\S]{0,2000}UPDATE logistics_stock_balances/);
 });
 
+test("el servidor genera y custodia automáticamente el respaldo vencido", () => {
+  assert.match(server, /async function runDueCanonicalBackupJobs/);
+  assert.match(server, /icc:canonical-backup-scheduler/);
+  assert.match(server, /await createCanonicalBackup\(admin\)/);
+  assert.match(server, /canonicalBackup = await runDueCanonicalBackupJobs/);
+  assert.match(logistics, /'BACKUP_RPO_DAILY_CHECK'/);
+});
+
 test("la preparación productiva exige la migración del monitor", () => {
   assert.match(server, /latestMigration\.startsWith\("071_"\)/);
 });

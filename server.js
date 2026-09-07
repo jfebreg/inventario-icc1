@@ -2796,12 +2796,13 @@ async function sweepScheduledLogisticsJobs() {
   try {
     const escalations = await escalateOverdueSchedulerFailures();
     const evidence = await runDueEvidenceVerificationJobs();
+    const canonicalBackup = await runDueCanonicalBackupJobs();
     const inspectionReportSlo = await evaluateInspectionReportAutomationSlo();
     const logistics = await runDueLogisticsJobs(pool);
     const inspectionReviews = await reviewInspectionWorkflowTasks(pool, logisticsOrganizationId);
     const inspectionReports = await sweepMissingInspectionReports(5);
     return { ...logistics, evidence, inspectionReportSlo, escalations: escalations.length,
-      inspectionReviews, inspectionReports };
+      canonicalBackup, inspectionReviews, inspectionReports };
   } finally {
     logisticsJobSweepRunning = false;
   }
@@ -2997,6 +2998,69 @@ async function createCanonicalBackup(actorProfile) {
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function runDueCanonicalBackupJobs() {
+  if (!pool || !logisticsReady || !storageConfigured()) return { skipped: true, processed: 0 };
+  const lockClient = await pool.connect();
+  let locked = false;
+  try {
+    locked = Boolean((await lockClient.query("SELECT pg_try_advisory_lock(hashtext('icc:canonical-backup-scheduler')) AS acquired")).rows[0]?.acquired);
+    if (!locked) return { skipped: true, reason: "scheduler_locked", processed: 0 };
+    const jobs = (await pool.query(`SELECT * FROM logistics_scheduled_jobs
+      WHERE enabled=TRUE AND job_code='BACKUP_RPO_DAILY_CHECK' AND next_run_at<=NOW()
+      ORDER BY next_run_at LIMIT 5`)).rows;
+    const results = [];
+    for (const job of jobs) {
+      const executionId = randomUUID();
+      const startedAt = Date.now();
+      await pool.query(`INSERT INTO logistics_scheduled_job_events
+        (execution_id,organization_id,scheduled_job_id,job_code,event_type,result)
+        VALUES ($1,$2,$3,$4,'STARTED','{}'::jsonb)`, [executionId, job.organization_id, job.id, job.job_code]);
+      await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='RUNNING',last_started_at=NOW(),
+        last_error=NULL,next_run_at=NOW()+INTERVAL '30 minutes',updated_at=NOW() WHERE id=$1`, [job.id]);
+      try {
+        const admin = (await pool.query(`SELECT * FROM inventory_user_profiles
+          WHERE admin=TRUE AND active=TRUE ORDER BY (LOWER(email)='jfebreg@msn.com') DESC,
+          activated_at NULLS LAST,created_at LIMIT 1`)).rows[0];
+        if (!admin) throw new Error("No existe un administrador activo para custodiar el respaldo.");
+        const backup = await createCanonicalBackup(admin);
+        const summary = { manifestId: backup.manifest.id, payloadSha256: backup.manifest.payload_sha256,
+          storagePath: backup.manifest.metadata?.storagePath || null };
+        await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='SUCCESS',last_completed_at=NOW(),
+          last_error=NULL,last_result=$2::jsonb,next_run_at=((((NOW() AT TIME ZONE timezone_name)::date+1)
+            +make_interval(hours=>local_hour)) AT TIME ZONE timezone_name),updated_at=NOW() WHERE id=$1`,
+        [job.id, asJson(summary)]);
+        await pool.query(`INSERT INTO logistics_scheduled_job_events
+          (execution_id,organization_id,scheduled_job_id,job_code,event_type,initiated_by,duration_ms,result)
+          VALUES ($1,$2,$3,$4,'SUCCESS',$5,$6,$7::jsonb)`, [executionId, job.organization_id,
+          job.id, job.job_code, admin.id, Date.now() - startedAt, asJson(summary)]);
+        await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
+          updated_at=NOW() WHERE id=$1 AND status<>'Resuelta'`, [`backup-rpo-${job.organization_id}`]);
+        results.push({ jobId: job.id, ok: true, ...summary });
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 2000);
+        await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='FAILED',last_completed_at=NOW(),
+          last_error=$2,next_run_at=NOW()+INTERVAL '4 hours',updated_at=NOW() WHERE id=$1`, [job.id, message]);
+        await pool.query(`INSERT INTO logistics_scheduled_job_events
+          (execution_id,organization_id,scheduled_job_id,job_code,event_type,duration_ms,result,error_detail)
+          VALUES ($1,$2,$3,$4,'FAILED',$5,'{}'::jsonb,$6)`, [executionId, job.organization_id,
+          job.id, job.job_code, Date.now() - startedAt, message]);
+        await pool.query(`INSERT INTO inventory_tasks
+          (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,due_at,payload,updated_at)
+          VALUES ($1,'BACKUP_RPO_BREACH','Falló el respaldo automático V2',$2,'Crítica','Pendiente',
+            'Bodega Central','scheduled_job',$3,NOW()+INTERVAL '4 hours',$4::jsonb,NOW())
+          ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,status='Pendiente',resolved_at=NULL,
+            due_at=EXCLUDED.due_at,payload=EXCLUDED.payload,updated_at=NOW()`,
+        [`backup-rpo-${job.organization_id}`, message, job.id, asJson({ executionId })]);
+        results.push({ jobId: job.id, ok: false, error: message });
+      }
+    }
+    return { skipped: false, processed: jobs.length, results };
+  } finally {
+    if (locked) await lockClient.query("SELECT pg_advisory_unlock(hashtext('icc:canonical-backup-scheduler'))").catch(() => {});
+    lockClient.release();
   }
 }
 
