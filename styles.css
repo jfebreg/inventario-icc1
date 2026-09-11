@@ -11,7 +11,28 @@
 .qr-panel{width:min(260px,100%);background:#fff;border:1px solid #cfd9d2;border-radius:10px;padding:14px;text-align:center;display:grid;gap:8px;place-items:center}.qr-panel small{max-width:100%;word-break:break-all;color:var(--muted);font-size:10px}.qr-image{display:block;width:190px;height:190px;object-fit:contain;background:#fff}.label-qr .qr-image{width:86px;height:86px}.qr-label{min-height:210px}.qr-label .label-content{align-items:start}
 .quick-actions-grid{grid-template-columns:repeat(2,minmax(220px,1fr));gap:14px}.quick-action{min-height:86px;font-size:18px;border-radius:13px}.quick-action.primary{background:#0c6a41}.quick-action.secondary{background:#1f7a50}.quick-action.neutral{background:#e5efe9;color:#145233}
 @media(max-width:700px){.quick-actions-grid{grid-template-columns:1fr}.quick-action{min-height:74px;font-size:17px}.scan-card{display:grid}.info-grid{grid-template-columns:1fr}}
- .modal-root:not(.open){display:none!important}
+.modal-root:not(.open){display:none!important}
+
+/* Resumen de continuidad y respaldos V2 */
+.modal:has(.compact-stats){width:min(1040px,100%)}
+.compact-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.compact-stats .stat{min-width:0;display:grid;align-content:start;gap:6px;padding:14px 15px;background:#f7faf8;border:1px solid var(--line);border-radius:11px}
+.compact-stats .stat span{display:block;color:var(--muted);font-size:12px;line-height:1.25}
+.compact-stats .stat strong{display:block;color:var(--ink);font-size:20px;line-height:1.1;overflow-wrap:anywhere}
+.compact-stats .stat small{display:block;color:var(--muted);font-size:11px;line-height:1.35}
+.modal:has(.compact-stats) .table-wrap table{min-width:820px}
+.modal:has(.compact-stats) .table-wrap td{line-height:1.3}
+.modal:has(.compact-stats) .access-box .link-button{display:inline-block;margin-top:8px}
+
+@media(max-width:760px){
+  .compact-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .compact-stats .stat{padding:12px}
+  .compact-stats .stat strong{font-size:18px}
+  .modal:has(.compact-stats) .modal-body{padding:16px}
+}
+@media(max-width:420px){
+  .compact-stats{grid-template-columns:1fr}
+}
 .settings-wide{margin-top:20px}.user-signature-row,.signature-only-row{gap:16px}.user-signature-row .actions,.signature-only-row input{flex:1;justify-content:flex-end}.user-signature-row input[type=file],.signature-only-row input[type=file]{max-width:520px;width:100%}.link-button.code{text-align:left}
 .auth-card{max-width:560px;margin:45px auto;padding:28px}.auth-actions{justify-content:space-between;align-items:center}.auth-separator{display:flex;align-items:center;gap:12px;margin:26px 0 18px;color:var(--muted);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.auth-separator:before,.auth-separator:after{content:"";height:1px;background:var(--line);flex:1}.heading-row.compact{margin-bottom:14px}.heading-row.compact .page-subtitle{margin-bottom:0}.checkbox-line{display:flex!important;grid-column:1/-1;align-items:center;grid-template-columns:20px 1fr!important;background:#f5f8f6;padding:12px;border-radius:9px}.checkbox-line input{width:18px;height:18px}.critical-task,.notification-row{display:flex;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid var(--line);align-items:center}.critical-task:last-child,.notification-row:last-child{border-bottom:0}.critical-task p,.notification-row p{margin:5px 0;color:var(--muted);font-size:13px}.critical-task.critical{border-left:4px solid var(--danger);padding-left:12px}.task-heading{display:flex;align-items:center;gap:9px}.task-priority{font-size:10px;text-transform:uppercase;font-weight:850;color:#8a4b00;background:#fff1d7;padding:4px 7px;border-radius:999px}.critical-task.critical .task-priority{color:#b42318;background:#fee4e2}.notification-row.read{opacity:.6}.notification-row small,.critical-task small{color:var(--muted)}
 @media(max-width:700px){.auth-card{margin:12px auto;padding:20px}.critical-task,.notification-row{align-items:flex-start;flex-direction:column}.critical-task .actions{width:100%;flex-wrap:wrap}.critical-task .actions .button{flex:1}.heading-row.compact{flex-direction:column}.heading-row.compact>.actions{width:100%;flex-wrap:wrap}}

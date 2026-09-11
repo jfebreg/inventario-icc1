@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [migration,server,app]=await Promise.all([
+const [migration,server,app,styles]=await Promise.all([
   readFile(new URL("../migrations/072_backup_retention_policy.sql",import.meta.url),"utf8"),
   readFile(new URL("../server.js",import.meta.url),"utf8"),
-  readFile(new URL("../app.js",import.meta.url),"utf8")
+  readFile(new URL("../app.js",import.meta.url),"utf8"),
+  readFile(new URL("../styles.css",import.meta.url),"utf8")
 ]);
 
 test("la retención nunca habilita borrado automático",()=>{
@@ -22,4 +23,10 @@ test("el historial permite configurar plazos comprensibles",()=>{
   assert.match(app,/backupRetentionPolicyModal/);
   assert.match(app,/Retención sin eliminación automática/);
   assert.match(app,/backupRetentionPolicyForm/);
+});
+test("el resumen de respaldo usa tarjetas responsivas",()=>{
+  assert.match(styles,/\.compact-stats\{display:grid/);
+  assert.match(styles,/grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/);
+  assert.match(styles,/@media\(max-width:760px\)/);
+  assert.match(styles,/@media\(max-width:420px\)/);
 });
