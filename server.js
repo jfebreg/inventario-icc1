@@ -469,6 +469,40 @@ function asJson(value) {
   return JSON.stringify(value ?? null);
 }
 
+function classifyBackupRetention(rows, policy = {}, now = new Date()) {
+  const dailyDays = Number(policy.daily_days || 30);
+  const monthlyMonths = Number(policy.monthly_months || 12);
+  const annualYears = Number(policy.annual_years || 7);
+  const selectedMonths = new Set();
+  const selectedYears = new Set();
+  return rows.map(row => {
+    const generated = new Date(row.generated_at);
+    let retentionClass = "REVIEW_MANUAL";
+    let retentionLabel = "Revisión manual";
+    if (Number.isFinite(generated.getTime())) {
+      const ageDays = Math.max(0, Math.floor((now.getTime() - generated.getTime()) / 86_400_000));
+      const monthAge = (now.getUTCFullYear() - generated.getUTCFullYear()) * 12
+        + now.getUTCMonth() - generated.getUTCMonth();
+      const yearAge = now.getUTCFullYear() - generated.getUTCFullYear();
+      const monthKey = `${generated.getUTCFullYear()}-${generated.getUTCMonth() + 1}`;
+      const yearKey = String(generated.getUTCFullYear());
+      if (ageDays <= dailyDays) {
+        retentionClass = "DAILY";
+        retentionLabel = "Diario";
+      } else if (monthAge >= 0 && monthAge < monthlyMonths && !selectedMonths.has(monthKey)) {
+        selectedMonths.add(monthKey);
+        retentionClass = "MONTHLY";
+        retentionLabel = "Mensual";
+      } else if (yearAge >= 0 && yearAge < annualYears && !selectedYears.has(yearKey)) {
+        selectedYears.add(yearKey);
+        retentionClass = "ANNUAL";
+        retentionLabel = "Anual";
+      }
+    }
+    return { ...row, retention_class: retentionClass, retention_label: retentionLabel };
+  });
+}
+
 function safeName(value) {
   return String(value || "archivo").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\w.-]+/g, "_").slice(0, 120);
 }
@@ -6569,7 +6603,7 @@ async function handleHttpRequest(req, res, requestId) {
     }
     const [result, jobResult, eventResult, alertsResult, policyResult] = await Promise.all([
       pool.query(`SELECT * FROM logistics_backup_manifests
-        WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 30`, [logisticsOrganizationId]),
+        WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 500`, [logisticsOrganizationId]),
       pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result
         FROM logistics_scheduled_jobs WHERE organization_id=$1 AND job_code='BACKUP_RPO_DAILY_CHECK' LIMIT 1`,
       [logisticsOrganizationId]),
@@ -6586,9 +6620,16 @@ async function handleHttpRequest(req, res, requestId) {
       pool.query(`SELECT * FROM logistics_backup_retention_policies WHERE organization_id=$1`,
       [logisticsOrganizationId])
     ]);
-    const latest = result.rows[0] || null;
+    const policy = policyResult.rows[0] || null;
+    const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
+    const retentionSummary = classifiedManifests.reduce((summary, manifest) => {
+      summary[manifest.retention_class] = (summary[manifest.retention_class] || 0) + 1;
+      return summary;
+    }, { DAILY: 0, MONTHLY: 0, ANNUAL: 0, REVIEW_MANUAL: 0 });
+    const latest = classifiedManifests[0] || null;
     const ageHours = latest ? Math.max(0, Math.floor((Date.now() - new Date(latest.generated_at).getTime()) / 3_600_000)) : null;
-    return json(res, 200, { manifests: result.rows, retentionPolicy: policyResult.rows[0] || null, backupHealth: {
+    return json(res, 200, { manifests: classifiedManifests.slice(0, 100), retentionPolicy: policy,
+      retentionSummary, backupHealth: {
       status: Number(alertsResult.rows[0]?.open || 0) > 0 ? "ALERT" : (latest ? "HEALTHY" : "PENDING"),
       ageHours, targetHours: 24, openAlerts: Number(alertsResult.rows[0]?.open || 0),
       schedule: jobResult.rows[0] || null, lastAutomaticVerification: eventResult.rows[0] || null
