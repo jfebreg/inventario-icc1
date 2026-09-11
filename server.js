@@ -479,6 +479,8 @@ function classifyBackupRetention(rows, policy = {}, now = new Date()) {
     const generated = new Date(row.generated_at);
     let retentionClass = "REVIEW_MANUAL";
     let retentionLabel = "Revisión manual";
+    let retentionDetail = "Fuera de las ventanas automáticas; requiere decisión administrativa.";
+    let retentionProtected = false;
     if (Number.isFinite(generated.getTime())) {
       const ageDays = Math.max(0, Math.floor((now.getTime() - generated.getTime()) / 86_400_000));
       const monthAge = (now.getUTCFullYear() - generated.getUTCFullYear()) * 12
@@ -488,18 +490,25 @@ function classifyBackupRetention(rows, policy = {}, now = new Date()) {
       const yearKey = String(generated.getUTCFullYear());
       if (ageDays <= dailyDays) {
         retentionClass = "DAILY";
-        retentionLabel = "Diario";
+        retentionLabel = "Diario · Protegido";
+        retentionDetail = `Protegido por la ventana diaria de ${dailyDays} días.`;
+        retentionProtected = true;
       } else if (monthAge >= 0 && monthAge < monthlyMonths && !selectedMonths.has(monthKey)) {
         selectedMonths.add(monthKey);
         retentionClass = "MONTHLY";
-        retentionLabel = "Mensual";
+        retentionLabel = "Mensual · Protegido";
+        retentionDetail = `Copia mensual protegida por ${monthlyMonths} meses.`;
+        retentionProtected = true;
       } else if (yearAge >= 0 && yearAge < annualYears && !selectedYears.has(yearKey)) {
         selectedYears.add(yearKey);
         retentionClass = "ANNUAL";
-        retentionLabel = "Anual";
+        retentionLabel = "Anual · Protegido";
+        retentionDetail = `Copia anual protegida por ${annualYears} años.`;
+        retentionProtected = true;
       }
     }
-    return { ...row, retention_class: retentionClass, retention_label: retentionLabel };
+    return { ...row, retention_class: retentionClass, retention_label: retentionLabel,
+      retention_detail: retentionDetail, retention_protected: retentionProtected };
   });
 }
 

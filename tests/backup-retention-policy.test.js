@@ -28,6 +28,9 @@ test("cada copia recibe una clase de conservación visible sin ser eliminada",()
   assert.match(server,/function classifyBackupRetention/);
   assert.match(server,/REVIEW_MANUAL/);
   assert.match(server,/retentionSummary/);
+  assert.match(server,/retention_protected: retentionProtected/);
+  assert.match(server,/requiere decisión administrativa/);
+  assert.match(server,/Diario · Protegido/);
   assert.match(app,/<th>Retención<\/th>/);
   assert.match(app,/retention_label/);
 });
