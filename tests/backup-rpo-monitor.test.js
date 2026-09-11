@@ -25,18 +25,24 @@ test("el monitor abre y cierra una tarea sin alterar inventario", () => {
 test("el servidor genera y custodia automáticamente el respaldo vencido", () => {
   assert.match(server, /async function runDueCanonicalBackupJobs/);
   assert.match(server, /icc:canonical-backup-scheduler/);
-  assert.match(server, /await createCanonicalBackup\(admin\)/);
+  assert.match(server, /await createCanonicalBackup\(admin, job\.organization_id\)/);
   assert.match(server, /canonicalBackup = await runDueCanonicalBackupJobs/);
   assert.match(logistics, /'BACKUP_RPO_DAILY_CHECK'/);
 });
 
 test("cada ejecución revisa integridad y disponibilidad de copias históricas", () => {
   assert.match(server, /async function verifyArchivedCanonicalBackups/);
-  assert.match(server, /await verifyArchivedCanonicalBackups\(admin, 5\)/);
+  assert.match(server, /await verifyArchivedCanonicalBackups\(admin, 5, job\.organization_id\)/);
   assert.match(server, /CANONICAL_BACKUP_ARCHIVE_INTEGRITY_FAILED/);
   assert.match(server, /CANONICAL_BACKUP_ARCHIVE_INTEGRITY_RECOVERED/);
   assert.match(server, /backup-archive-integrity-/);
   assert.match(server, /safeTokenEqual\(actualSha256, manifest\.payload_sha256\)/);
+});
+
+test("los respaldos automáticos quedan aislados por organización", () => {
+  assert.match(server, /createCanonicalBackup\(actorProfile, organizationId = logisticsOrganizationId\)/);
+  assert.match(server, /Respaldos_V2\/\$\{organizationId\}\//);
+  assert.match(server, /verifyArchivedCanonicalBackups\(actorProfile, limit = 5, organizationId = logisticsOrganizationId\)/);
 });
 
 test("el historial resume RPO, agenda, verificación y alertas", () => {

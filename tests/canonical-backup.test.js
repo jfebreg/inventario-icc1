@@ -68,7 +68,7 @@ test("la verificación de respaldo es no destructiva, auditable y valida control
 });
 
 test("cada exportación se archiva en Storage con ruta y huella verificables", () => {
-  assert.match(server, /Respaldos_V2\/\$\{payload\.generatedAt\.slice\(0, 10\)\}/);
+  assert.match(server, /Respaldos_V2\/\$\{organizationId\}\/\$\{payload\.generatedAt\.slice\(0, 10\)\}/);
   assert.match(server, /"x-upsert": "false"/);
   assert.match(server, /storageArchived: Boolean\(storagePath\)/);
   assert.match(server, /No se pudo archivar el respaldo V2 en Storage/);

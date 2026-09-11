@@ -2843,11 +2843,10 @@ function startLogisticsOutboxScheduler() {
   setInterval(run, 60_000).unref?.();
 }
 
-async function createCanonicalBackup(actorProfile) {
+async function createCanonicalBackup(actorProfile, organizationId = logisticsOrganizationId) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
-    const organizationId = logisticsOrganizationId;
     const datasets = {};
     const directTables = {
       organizations: "logistics_organizations",
@@ -2960,7 +2959,7 @@ async function createCanonicalBackup(actorProfile) {
     let storagePath = null;
     if (storageConfigured()) {
       const generatedKey = payload.generatedAt.replace(/[:.]/g, "-");
-      storagePath = `Respaldos_V2/${payload.generatedAt.slice(0, 10)}/ICC_Logistica_V2_${generatedKey}_${payloadSha256.slice(0, 12)}.json`;
+      storagePath = `Respaldos_V2/${organizationId}/${payload.generatedAt.slice(0, 10)}/ICC_Logistica_V2_${generatedKey}_${payloadSha256.slice(0, 12)}.json`;
       const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
       const archived = await fetchWithTimeout(endpoint, {
         method: "POST",
@@ -3025,8 +3024,8 @@ async function runDueCanonicalBackupJobs() {
           WHERE admin=TRUE AND active=TRUE ORDER BY (LOWER(email)='jfebreg@msn.com') DESC,
           activated_at NULLS LAST,created_at LIMIT 1`)).rows[0];
         if (!admin) throw new Error("No existe un administrador activo para custodiar el respaldo.");
-        const backup = await createCanonicalBackup(admin);
-        const archiveVerification = await verifyArchivedCanonicalBackups(admin, 5);
+        const backup = await createCanonicalBackup(admin, job.organization_id);
+        const archiveVerification = await verifyArchivedCanonicalBackups(admin, 5, job.organization_id);
         const summary = { manifestId: backup.manifest.id, payloadSha256: backup.manifest.payload_sha256,
           storagePath: backup.manifest.metadata?.storagePath || null, archiveVerification };
         await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='SUCCESS',last_completed_at=NOW(),
@@ -3065,12 +3064,12 @@ async function runDueCanonicalBackupJobs() {
   }
 }
 
-async function verifyArchivedCanonicalBackups(actorProfile, limit = 5) {
+async function verifyArchivedCanonicalBackups(actorProfile, limit = 5, organizationId = logisticsOrganizationId) {
   if (!storageConfigured()) return { checked: 0, valid: 0, failed: 0, results: [] };
   const boundedLimit = Math.max(1, Math.min(20, Number(limit) || 5));
   const manifests = (await pool.query(`SELECT * FROM logistics_backup_manifests
     WHERE organization_id=$1 AND COALESCE(metadata->>'storageArchived','false')='true'
-    ORDER BY generated_at DESC LIMIT $2`, [logisticsOrganizationId, boundedLimit])).rows;
+    ORDER BY generated_at DESC LIMIT $2`, [organizationId, boundedLimit])).rows;
   const results = [];
   for (const manifest of manifests) {
     const storagePath = String(manifest.metadata?.storagePath || "");
@@ -3103,7 +3102,7 @@ async function verifyArchivedCanonicalBackups(actorProfile, limit = 5) {
       if (task.rows[0]?.created) await pool.query(`INSERT INTO logistics_audit_events
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
         VALUES ($1,'CANONICAL_BACKUP_ARCHIVE_INTEGRITY_FAILED','backup_manifest',$2,$3,'SYSTEM',$4::jsonb)`,
-      [logisticsOrganizationId, manifest.id, actorProfile.id, asJson({ detail, actualSha256 })]);
+      [organizationId, manifest.id, actorProfile.id, asJson({ detail, actualSha256 })]);
     } else {
       const resolved = await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
         resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
@@ -3111,7 +3110,7 @@ async function verifyArchivedCanonicalBackups(actorProfile, limit = 5) {
       if (resolved.rowCount) await pool.query(`INSERT INTO logistics_audit_events
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
         VALUES ($1,'CANONICAL_BACKUP_ARCHIVE_INTEGRITY_RECOVERED','backup_manifest',$2,$3,'SYSTEM',$4::jsonb)`,
-      [logisticsOrganizationId, manifest.id, actorProfile.id, asJson({ actualSha256 })]);
+      [organizationId, manifest.id, actorProfile.id, asJson({ actualSha256 })]);
     }
     results.push({ manifestId: manifest.id, status, detail });
   }
