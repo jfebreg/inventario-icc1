@@ -29,6 +29,15 @@ test("el servidor genera y custodia automáticamente el respaldo vencido", () =>
   assert.match(logistics, /'BACKUP_RPO_DAILY_CHECK'/);
 });
 
+test("cada ejecución revisa integridad y disponibilidad de copias históricas", () => {
+  assert.match(server, /async function verifyArchivedCanonicalBackups/);
+  assert.match(server, /await verifyArchivedCanonicalBackups\(admin, 5\)/);
+  assert.match(server, /CANONICAL_BACKUP_ARCHIVE_INTEGRITY_FAILED/);
+  assert.match(server, /CANONICAL_BACKUP_ARCHIVE_INTEGRITY_RECOVERED/);
+  assert.match(server, /backup-archive-integrity-/);
+  assert.match(server, /safeTokenEqual\(actualSha256, manifest\.payload_sha256\)/);
+});
+
 test("la preparación productiva exige la migración del monitor", () => {
   assert.match(server, /latestMigration\.startsWith\("071_"\)/);
 });
