@@ -6567,9 +6567,30 @@ async function handleHttpRequest(req, res, requestId) {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
-    const result = await pool.query(`SELECT * FROM logistics_backup_manifests
-      WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 30`, [logisticsOrganizationId]);
-    return json(res, 200, { manifests: result.rows });
+    const [result, jobResult, eventResult, alertsResult] = await Promise.all([
+      pool.query(`SELECT * FROM logistics_backup_manifests
+        WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 30`, [logisticsOrganizationId]),
+      pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result
+        FROM logistics_scheduled_jobs WHERE organization_id=$1 AND job_code='BACKUP_RPO_DAILY_CHECK' LIMIT 1`,
+      [logisticsOrganizationId]),
+      pool.query(`SELECT occurred_at,duration_ms,result FROM logistics_scheduled_job_events
+        WHERE organization_id=$1 AND job_code='BACKUP_RPO_DAILY_CHECK' AND event_type='SUCCESS'
+        ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId]),
+      pool.query(`SELECT COUNT(*)::int AS open FROM inventory_tasks task
+        WHERE task.status<>'Resuelta' AND (
+          (task.task_type='BACKUP_RPO_BREACH' AND task.id=$2) OR
+          (task.task_type='BACKUP_ARCHIVE_INTEGRITY' AND EXISTS (
+            SELECT 1 FROM logistics_backup_manifests manifest
+            WHERE manifest.id::text=task.entity_id::text AND manifest.organization_id=$1)))`,
+      [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`])
+    ]);
+    const latest = result.rows[0] || null;
+    const ageHours = latest ? Math.max(0, Math.floor((Date.now() - new Date(latest.generated_at).getTime()) / 3_600_000)) : null;
+    return json(res, 200, { manifests: result.rows, backupHealth: {
+      status: Number(alertsResult.rows[0]?.open || 0) > 0 ? "ALERT" : (latest ? "HEALTHY" : "PENDING"),
+      ageHours, targetHours: 24, openAlerts: Number(alertsResult.rows[0]?.open || 0),
+      schedule: jobResult.rows[0] || null, lastAutomaticVerification: eventResult.rows[0] || null
+    } });
   }
 
   const canonicalBackupDownloadRoute = url.pathname.match(/^\/api\/admin\/canonical-backups\/([0-9a-f-]+)\/download$/i);
