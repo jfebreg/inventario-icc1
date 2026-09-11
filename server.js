@@ -2300,7 +2300,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("071_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("072_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2887,7 +2887,8 @@ async function createCanonicalBackup(actorProfile, organizationId = logisticsOrg
       automationSloPolicies: "logistics_automation_slo_policies",
       outboxEvents: "logistics_outbox_events",
       outboxDeliveryAttempts: "logistics_outbox_delivery_attempts",
-      outboxSloPolicies: "logistics_outbox_slo_policies"
+      outboxSloPolicies: "logistics_outbox_slo_policies",
+      backupRetentionPolicies: "logistics_backup_retention_policies"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const organizationPredicate = table === "logistics_organizations" ? "id=$1" : "organization_id=$1";
@@ -3198,9 +3199,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("071_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("072_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("071_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("072_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -6566,7 +6567,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
-    const [result, jobResult, eventResult, alertsResult] = await Promise.all([
+    const [result, jobResult, eventResult, alertsResult, policyResult] = await Promise.all([
       pool.query(`SELECT * FROM logistics_backup_manifests
         WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 30`, [logisticsOrganizationId]),
       pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result
@@ -6581,15 +6582,43 @@ async function handleHttpRequest(req, res, requestId) {
           (task.task_type='BACKUP_ARCHIVE_INTEGRITY' AND EXISTS (
             SELECT 1 FROM logistics_backup_manifests manifest
             WHERE manifest.id::text=task.entity_id::text AND manifest.organization_id=$1)))`,
-      [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`])
+      [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`]),
+      pool.query(`SELECT * FROM logistics_backup_retention_policies WHERE organization_id=$1`,
+      [logisticsOrganizationId])
     ]);
     const latest = result.rows[0] || null;
     const ageHours = latest ? Math.max(0, Math.floor((Date.now() - new Date(latest.generated_at).getTime()) / 3_600_000)) : null;
-    return json(res, 200, { manifests: result.rows, backupHealth: {
+    return json(res, 200, { manifests: result.rows, retentionPolicy: policyResult.rows[0] || null, backupHealth: {
       status: Number(alertsResult.rows[0]?.open || 0) > 0 ? "ALERT" : (latest ? "HEALTHY" : "PENDING"),
       ageHours, targetHours: 24, openAlerts: Number(alertsResult.rows[0]?.open || 0),
       schedule: jobResult.rows[0] || null, lastAutomaticVerification: eventResult.rows[0] || null
     } });
+  }
+
+  if (url.pathname === "/api/admin/canonical-backups/policy" && req.method === "PATCH") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede configurar retención." });
+    try {
+      const body = await readJson(req);
+      const dailyDays = Number(body.dailyDays), monthlyMonths = Number(body.monthlyMonths), annualYears = Number(body.annualYears);
+      if (!Number.isInteger(dailyDays) || dailyDays < 7 || dailyDays > 365 ||
+          !Number.isInteger(monthlyMonths) || monthlyMonths < 3 || monthlyMonths > 120 ||
+          !Number.isInteger(annualYears) || annualYears < 1 || annualYears > 30) {
+        throw new Error("La política de retención contiene plazos fuera de rango.");
+      }
+      const policy = (await pool.query(`INSERT INTO logistics_backup_retention_policies
+        (organization_id,daily_days,monthly_months,annual_years,automatic_deletion,updated_by)
+        VALUES ($1,$2,$3,$4,FALSE,$5) ON CONFLICT (organization_id) DO UPDATE SET
+          daily_days=EXCLUDED.daily_days,monthly_months=EXCLUDED.monthly_months,
+          annual_years=EXCLUDED.annual_years,automatic_deletion=FALSE,updated_by=EXCLUDED.updated_by,
+          updated_at=NOW() RETURNING *`, [logisticsOrganizationId, dailyDays, monthlyMonths, annualYears, apiProfile.id])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'BACKUP_RETENTION_POLICY_UPDATED','backup_retention_policy',$1,$2,'WEB',$3::jsonb)`,
+      [logisticsOrganizationId, apiProfile.id, asJson(policy)]);
+      return json(res, 200, { policy });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar la política de retención." });
+    }
   }
 
   const canonicalBackupDownloadRoute = url.pathname.match(/^\/api\/admin\/canonical-backups\/([0-9a-f-]+)\/download$/i);

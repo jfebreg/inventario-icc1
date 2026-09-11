@@ -54,6 +54,6 @@ test("el historial resume RPO, agenda, verificación y alertas", () => {
   assert.match(app, /Alertas abiertas/);
 });
 
-test("la preparación productiva exige la migración del monitor", () => {
-  assert.match(server, /latestMigration\.startsWith\("071_"\)/);
+test("la preparación productiva exige la versión vigente", () => {
+  assert.match(server, /latestMigration\.startsWith\("072_"\)/);
 });

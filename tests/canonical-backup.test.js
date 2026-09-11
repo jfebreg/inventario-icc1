@@ -34,7 +34,7 @@ test("las referencias documentales usan la columna histórica real", () => {
 test("el paquete contiene operación, auditoría y referencias documentales", () => {
   for (const dataset of ["stockBalances", "stockMovements", "stockLedger", "assetUnits",
     "inspectionRuns", "documents", "fileObjects", "auditEvents", "assetCompliance",
-    "outboxEvents", "outboxDeliveryAttempts", "outboxSloPolicies"]) {
+    "outboxEvents", "outboxDeliveryAttempts", "outboxSloPolicies", "backupRetentionPolicies"]) {
     assert.match(server, new RegExp(`${dataset}:`));
   }
   assert.match(server, /filePayloadsExcluded: true/);
