@@ -2343,7 +2343,7 @@ async function validateRelease(releaseId, actorProfileId) {
   add("DATABASE", "PASS", `PostgreSQL respondió en ${Date.now() - dbStarted} ms.`);
   const latestMigration = (await pool.query(`SELECT version FROM logistics_schema_migrations
     ORDER BY version DESC LIMIT 1`)).rows[0]?.version || "";
-  add("MIGRATIONS", latestMigration.startsWith("072_") ? "PASS" : "FAIL",
+  add("MIGRATIONS", latestMigration.startsWith("073_") ? "PASS" : "FAIL",
     `Última migración: ${latestMigration || "ninguna"}.`);
   const audit = await pool.query(`SELECT COUNT(*)::int AS errors
     FROM logistics_audit_chain_verification WHERE NOT content_valid OR NOT link_valid`);
@@ -2931,7 +2931,8 @@ async function createCanonicalBackup(actorProfile, organizationId = logisticsOrg
       outboxEvents: "logistics_outbox_events",
       outboxDeliveryAttempts: "logistics_outbox_delivery_attempts",
       outboxSloPolicies: "logistics_outbox_slo_policies",
-      backupRetentionPolicies: "logistics_backup_retention_policies"
+      backupRetentionPolicies: "logistics_backup_retention_policies",
+      backupRetentionReviews: "logistics_backup_retention_reviews"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const organizationPredicate = table === "logistics_organizations" ? "id=$1" : "organization_id=$1";
@@ -3242,9 +3243,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("072_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("073_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("072_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("073_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -6668,6 +6669,31 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, { policy });
     } catch (error) {
       return json(res, 400, { error: error.message || "No se pudo guardar la política de retención." });
+    }
+  }
+
+  const backupRetentionReviewRoute = url.pathname.match(/^\/api\/admin\/canonical-backups\/([0-9a-f-]+)\/retention-review$/i);
+  if (backupRetentionReviewRoute && req.method === "POST") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede revisar la conservación." });
+    try {
+      const body = await readJson(req);
+      const decision = String(body.decision || "").toUpperCase();
+      const reason = String(body.reason || "").trim();
+      if (!["KEEP", "ARCHIVE"].includes(decision)) throw new Error("Selecciona una decisión de conservación válida.");
+      if (reason.length < 10) throw new Error("El fundamento debe contener al menos 10 caracteres.");
+      const manifest = (await pool.query(`SELECT id FROM logistics_backup_manifests
+        WHERE id=$1 AND organization_id=$2`, [backupRetentionReviewRoute[1], logisticsOrganizationId])).rows[0];
+      if (!manifest) throw new Error("El respaldo no existe en esta organización.");
+      const review = (await pool.query(`INSERT INTO logistics_backup_retention_reviews
+        (organization_id,backup_manifest_id,decision,reason,reviewed_by) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [logisticsOrganizationId, manifest.id, decision, reason, apiProfile.id])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'BACKUP_RETENTION_REVIEWED','backup_manifest',$2,$3,'WEB',$4::jsonb)`,
+      [logisticsOrganizationId, manifest.id, apiProfile.id, asJson(review)]);
+      return json(res, 201, { review });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo registrar la revisión de conservación." });
     }
   }
 

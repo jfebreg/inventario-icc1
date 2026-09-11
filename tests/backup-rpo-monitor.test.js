@@ -55,5 +55,5 @@ test("el historial resume RPO, agenda, verificación y alertas", () => {
 });
 
 test("la preparación productiva exige la versión vigente", () => {
-  assert.match(server, /latestMigration\.startsWith\("072_"\)/);
+  assert.match(server, /latestMigration\.startsWith\("073_"\)/);
 });
