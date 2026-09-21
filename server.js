@@ -6612,8 +6612,19 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
     const [result, jobResult, eventResult, alertsResult, policyResult] = await Promise.all([
-      pool.query(`SELECT * FROM logistics_backup_manifests
-        WHERE organization_id=$1 ORDER BY generated_at DESC LIMIT 500`, [logisticsOrganizationId]),
+      pool.query(`SELECT manifest.*,
+          review.id AS retention_review_id,
+          review.decision AS retention_decision,
+          review.reason AS retention_reason,
+          review.reviewed_at AS retention_reviewed_at,
+          reviewer.name AS retention_reviewed_by_name
+        FROM logistics_backup_manifests manifest
+        LEFT JOIN logistics_backup_retention_reviews review
+          ON review.organization_id=manifest.organization_id
+         AND review.backup_manifest_id=manifest.id
+        LEFT JOIN inventory_user_profiles reviewer ON reviewer.id=review.reviewed_by
+        WHERE manifest.organization_id=$1
+        ORDER BY manifest.generated_at DESC LIMIT 500`, [logisticsOrganizationId]),
       pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result
         FROM logistics_scheduled_jobs WHERE organization_id=$1 AND job_code='BACKUP_RPO_DAILY_CHECK' LIMIT 1`,
       [logisticsOrganizationId]),
@@ -6684,6 +6695,10 @@ async function handleHttpRequest(req, res, requestId) {
       const manifest = (await pool.query(`SELECT id FROM logistics_backup_manifests
         WHERE id=$1 AND organization_id=$2`, [backupRetentionReviewRoute[1], logisticsOrganizationId])).rows[0];
       if (!manifest) throw new Error("El respaldo no existe en esta organización.");
+      const existingReview = (await pool.query(`SELECT id FROM logistics_backup_retention_reviews
+        WHERE organization_id=$1 AND backup_manifest_id=$2 LIMIT 1`,
+      [logisticsOrganizationId, manifest.id])).rows[0];
+      if (existingReview) throw new Error("Este respaldo ya posee una decisión de conservación inmutable.");
       const review = (await pool.query(`INSERT INTO logistics_backup_retention_reviews
         (organization_id,backup_manifest_id,decision,reason,reviewed_by) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [logisticsOrganizationId, manifest.id, decision, reason, apiProfile.id])).rows[0];
