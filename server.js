@@ -3163,6 +3163,75 @@ async function verifyArchivedCanonicalBackups(actorProfile, limit = 5, organizat
     failed: results.filter(x => x.status === "FAILED").length, results };
 }
 
+function validateCanonicalBackupReconstruction(payload) {
+  const datasets = payload?.datasets && typeof payload.datasets === "object" ? payload.datasets : {};
+  const rows = name => Array.isArray(datasets[name]) ? datasets[name] : [];
+  const keys = (name, field = "id") => new Set(rows(name).map(row => String(row?.[field] ?? "")).filter(Boolean));
+  const issues = [];
+  let checkedReferences = 0;
+  const addIssue = detail => { if (issues.length < 100) issues.push(detail); };
+  const ensureUnique = (name, field = "id") => {
+    const seen = new Set();
+    for (const row of rows(name)) {
+      const value = String(row?.[field] ?? "");
+      if (!value) { addIssue(`${name}.${field}: clave vacía`); continue; }
+      if (seen.has(value)) addIssue(`${name}.${field}: clave duplicada ${value}`);
+      seen.add(value);
+    }
+  };
+  const ensureReference = (child, field, parent, parentField = "id", optional = false) => {
+    const parents = keys(parent, parentField);
+    for (const row of rows(child)) {
+      const value = String(row?.[field] ?? "");
+      if (!value && optional) continue;
+      checkedReferences += 1;
+      if (!value || !parents.has(value)) addIssue(`${child}.${field}: referencia inexistente ${value || "vacía"}`);
+    }
+  };
+  const primaryKeys = {
+    organizations: "id", costCenters: "id", sites: "id", warehouses: "id", locations: "id",
+    itemFamilies: "id", items: "id", assetUnits: "id", lots: "id", stockMovements: "id",
+    stockLedger: "id", stockBalances: "balance_key", transferOrders: "id", transferLines: "id",
+    custodyAssignments: "id", documents: "id", inspectionTemplates: "id",
+    inspectionTemplateItems: "id", inspectionRuns: "id", inspectionAnswers: "id",
+    inspectionFindings: "id", inspectionApprovals: "id", workOrders: "id", workOrderParts: "id",
+    materialRequests: "id", materialRequestLines: "id", fileObjects: "id"
+  };
+  Object.entries(primaryKeys).forEach(([name, field]) => ensureUnique(name, field));
+  const relations = [
+    ["warehouses", "site_id", "sites", "id", true], ["locations", "warehouse_id", "warehouses"],
+    ["items", "family_id", "itemFamilies", "id", true], ["assetUnits", "item_id", "items"],
+    ["lots", "item_id", "items"], ["stockLedger", "movement_id", "stockMovements"],
+    ["stockLedger", "item_id", "items"], ["stockLedger", "asset_unit_id", "assetUnits", "id", true],
+    ["stockLedger", "lot_id", "lots", "id", true], ["stockLedger", "location_id", "locations"],
+    ["stockBalances", "item_id", "items"], ["stockBalances", "asset_unit_id", "assetUnits", "id", true],
+    ["stockBalances", "lot_id", "lots", "id", true], ["stockBalances", "location_id", "locations"],
+    ["transferOrders", "source_warehouse_id", "warehouses"], ["transferOrders", "destination_warehouse_id", "warehouses"],
+    ["transferOrders", "transit_location_id", "locations", "id", true], ["transferLines", "transfer_id", "transferOrders"],
+    ["transferLines", "item_id", "items"], ["transferLines", "asset_unit_id", "assetUnits", "id", true],
+    ["transferLines", "lot_id", "lots", "id", true], ["custodyAssignments", "item_id", "items"],
+    ["custodyAssignments", "asset_unit_id", "assetUnits", "id", true], ["custodyAssignments", "warehouse_id", "warehouses"],
+    ["documentLinks", "document_id", "documents"], ["inspectionTemplateItems", "template_version_id", "inspectionTemplates"],
+    ["inspectionRuns", "template_version_id", "inspectionTemplates"], ["inspectionRuns", "asset_unit_id", "assetUnits"],
+    ["inspectionRuns", "warehouse_id", "warehouses", "id", true], ["inspectionAnswers", "inspection_id", "inspectionRuns"],
+    ["inspectionAnswers", "template_item_id", "inspectionTemplateItems"], ["inspectionFindings", "inspection_id", "inspectionRuns"],
+    ["inspectionApprovals", "inspection_id", "inspectionRuns"], ["workOrderParts", "work_order_id", "workOrders"],
+    ["materialRequestLines", "request_id", "materialRequests"]
+  ];
+  relations.forEach(relation => ensureReference(...relation));
+  let scopedRows = 0;
+  for (const [name, datasetRows] of Object.entries(datasets)) {
+    if (!Array.isArray(datasetRows)) continue;
+    for (const row of datasetRows) {
+      if (!row || !("organization_id" in row)) continue;
+      scopedRows += 1;
+      if (String(row.organization_id) !== String(payload.organizationId)) addIssue(`${name}: registro fuera de la organización`);
+    }
+  }
+  return { valid: issues.length === 0, issues, checkedReferences, scopedRows,
+    reconstructedDatasets: Object.keys(datasets).filter(name => Array.isArray(datasets[name])).length };
+}
+
 async function verifyCanonicalBackupPackage(actorProfile, payload) {
   const startedAt = Date.now();
   const requiredDatasets = [
@@ -3187,6 +3256,7 @@ async function verifyCanonicalBackupPackage(actorProfile, payload) {
   const declaredCounts = payload?.recordCounts && typeof payload.recordCounts === "object" ? payload.recordCounts : {};
   const countDifferences = datasetNames.filter(name => !Array.isArray(datasets[name]) || Number(declaredCounts[name]) !== (Array.isArray(datasets[name]) ? datasets[name].length : -1));
   const missingRequired = requiredDatasets.filter(name => !Array.isArray(datasets[name]));
+  const reconstruction = validateCanonicalBackupReconstruction(payload);
   const checks = [
     { code: "FORMAT_VALID", label: "Formato de respaldo reconocido", status: payload?.format === "ICC-LOGISTICS-BACKUP-1" ? "PASS" : "FAIL" },
     { code: "MANIFEST_MATCH", label: "SHA-256 coincide con un manifiesto inmutable", status: manifest ? "PASS" : "FAIL", detail: payloadSha256 },
@@ -3195,6 +3265,8 @@ async function verifyCanonicalBackupPackage(actorProfile, payload) {
     { code: "DATASETS_DECLARED", label: "Índice de conjuntos de datos consistente", status: JSON.stringify(datasetNames) === JSON.stringify(declaredNames) ? "PASS" : "FAIL" },
     { code: "RECORD_COUNTS", label: "Conteos de registros consistentes", status: countDifferences.length === 0 ? "PASS" : "FAIL", detail: countDifferences.length ? `Diferencias: ${countDifferences.join(", ")}` : `${datasetNames.length} conjuntos verificados` },
     { code: "REQUIRED_DATASETS", label: "Datos operativos mínimos incluidos", status: missingRequired.length === 0 ? "PASS" : "FAIL", detail: missingRequired.length ? `Faltan: ${missingRequired.join(", ")}` : `${requiredDatasets.length} conjuntos críticos presentes` },
+    { code: "ISOLATED_RECONSTRUCTION", label: "Reconstrucción lógica aislada", status: reconstruction.valid ? "PASS" : "FAIL", detail: reconstruction.valid ? `${reconstruction.reconstructedDatasets} conjuntos y ${reconstruction.checkedReferences} relaciones reconstruidas en memoria` : reconstruction.issues.slice(0, 5).join("; ") },
+    { code: "ORGANIZATION_SCOPE", label: "Aislamiento de la organización", status: reconstruction.issues.some(issue => issue.includes("fuera de la organización")) ? "FAIL" : "PASS", detail: `${reconstruction.scopedRows} registros con alcance comprobado` },
     { code: "AUDIT_CHAIN", label: "Cadena de auditoría declarada íntegra", status: payload?.audit?.chainValid === true && Boolean(payload?.audit?.headHash) ? "PASS" : "FAIL" }
   ];
   const valid = checks.every(check => check.status === "PASS");
@@ -3221,9 +3293,11 @@ async function verifyCanonicalBackupPackage(actorProfile, payload) {
       VALUES ($1,$2,'recovery_drill',$3,$4,$5,'WEB',$6::jsonb,$7::jsonb)`,
     [logisticsOrganizationId, valid ? "CANONICAL_BACKUP_VERIFIED" : "CANONICAL_BACKUP_REJECTED",
       drill.id, actorProfile.id, `backup-verify:${drill.id}`, asJson({ valid, checks }),
-      asJson({ payloadSha256, schemaVersion: payload?.schemaVersion || null, manifestId: manifest?.id || null, filePayloadsExcluded: true })]);
+      asJson({ payloadSha256, schemaVersion: payload?.schemaVersion || null, manifestId: manifest?.id || null,
+        filePayloadsExcluded: true, isolatedReconstruction: reconstruction })]);
     await client.query("COMMIT");
-    return { valid, payloadSha256, manifestId: manifest?.id || null, schemaVersion: payload?.schemaVersion || null, checks, drill };
+    return { valid, payloadSha256, manifestId: manifest?.id || null, schemaVersion: payload?.schemaVersion || null,
+      checks, reconstruction, drill };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;

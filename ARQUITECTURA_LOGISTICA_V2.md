@@ -474,3 +474,4 @@ La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/ap
 - Después de cada respaldo diario se comprueban las cinco copias más recientes. Una ausencia o diferencia SHA-256 abre una tarea crítica; la recuperación posterior la cierra con evidencia de auditoría.
 - La generación, custodia y verificación reciben explícitamente la organización del trabajo programado; cada empresa conserva un prefijo independiente dentro de Storage.
 - Cada copia clasificada para revisión manual admite una sola decisión humana inmutable. El historial muestra la resolución, fundamento, responsable y fecha; una petición repetida se rechaza sin alterar ni eliminar el respaldo.
+- La prueba de recuperación reconstruye en memoria las claves y relaciones del paquete, comprueba duplicados, referencias huérfanas y aislamiento por organización. La ejecución sólo lee el archivo, registra evidencia RPO/RTO y nunca escribe sobre las tablas operativas.
