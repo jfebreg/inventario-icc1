@@ -3053,7 +3053,8 @@ async function runDueCanonicalBackupJobs() {
     locked = Boolean((await lockClient.query("SELECT pg_try_advisory_lock(hashtext('icc:canonical-backup-scheduler')) AS acquired")).rows[0]?.acquired);
     if (!locked) return { skipped: true, reason: "scheduler_locked", processed: 0 };
     const jobs = (await pool.query(`SELECT * FROM logistics_scheduled_jobs
-      WHERE enabled=TRUE AND job_code='BACKUP_RPO_DAILY_CHECK' AND next_run_at<=NOW()
+      WHERE enabled=TRUE AND job_code IN ('BACKUP_RPO_DAILY_CHECK','BACKUP_RECOVERY_WEEKLY_TEST')
+        AND next_run_at<=NOW()
       ORDER BY next_run_at LIMIT 5`)).rows;
     const results = [];
     for (const job of jobs) {
@@ -3069,13 +3070,39 @@ async function runDueCanonicalBackupJobs() {
           WHERE admin=TRUE AND active=TRUE ORDER BY (LOWER(email)='jfebreg@msn.com') DESC,
           activated_at NULLS LAST,created_at LIMIT 1`)).rows[0];
         if (!admin) throw new Error("No existe un administrador activo para custodiar el respaldo.");
-        const backup = await createCanonicalBackup(admin, job.organization_id);
-        const archiveVerification = await verifyArchivedCanonicalBackups(admin, 5, job.organization_id);
-        const summary = { manifestId: backup.manifest.id, payloadSha256: backup.manifest.payload_sha256,
-          storagePath: backup.manifest.metadata?.storagePath || null, archiveVerification };
+        let summary;
+        if (job.job_code === 'BACKUP_RECOVERY_WEEKLY_TEST') {
+          const manifest = (await pool.query(`SELECT * FROM logistics_backup_manifests
+            WHERE organization_id=$1 AND COALESCE(metadata->>'storageArchived','false')='true'
+            ORDER BY generated_at DESC LIMIT 1`, [job.organization_id])).rows[0];
+          if (!manifest) throw new Error("No existe un respaldo archivado para probar la recuperación.");
+          const storagePath = String(manifest.metadata?.storagePath || "");
+          const endpoint = `${supabaseBaseUrl()}/storage/v1/object/${encodeURIComponent(process.env.SUPABASE_BUCKET)}/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
+          const response = await fetchWithTimeout(endpoint, { headers: {
+            "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+            "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY
+          } }, { service: "Supabase Storage", timeoutMs: process.env.STORAGE_TIMEOUT_MS || 30_000 });
+          if (!response.ok) throw new Error(`No se pudo recuperar el respaldo: HTTP ${response.status}.`);
+          const body = Buffer.from(await response.arrayBuffer());
+          const actualSha256 = createHash("sha256").update(body).digest("hex");
+          if (!safeTokenEqual(actualSha256, manifest.payload_sha256)) throw new Error("La huella del respaldo archivado no coincide.");
+          let payload;
+          try { payload = JSON.parse(body.toString("utf8")); }
+          catch { throw new Error("El respaldo archivado no contiene JSON válido."); }
+          const verification = await verifyCanonicalBackupPackage(admin, payload, job.organization_id);
+          if (!verification.valid) throw new Error("La reconstrucción aislada detectó controles fallidos.");
+          summary = { manifestId: manifest.id, payloadSha256: actualSha256,
+            recoveryDrillId: verification.drill.id, reconstruction: verification.reconstruction };
+        } else {
+          const backup = await createCanonicalBackup(admin, job.organization_id);
+          const archiveVerification = await verifyArchivedCanonicalBackups(admin, 5, job.organization_id);
+          summary = { manifestId: backup.manifest.id, payloadSha256: backup.manifest.payload_sha256,
+            storagePath: backup.manifest.metadata?.storagePath || null, archiveVerification };
+        }
         await pool.query(`UPDATE logistics_scheduled_jobs SET last_status='SUCCESS',last_completed_at=NOW(),
-          last_error=NULL,last_result=$2::jsonb,next_run_at=((((NOW() AT TIME ZONE timezone_name)::date+1)
-            +make_interval(hours=>local_hour)) AT TIME ZONE timezone_name),updated_at=NOW() WHERE id=$1`,
+          last_error=NULL,last_result=$2::jsonb,next_run_at=((
+            ((NOW() AT TIME ZONE timezone_name)::date+period_days)+make_interval(hours=>local_hour)
+          ) AT TIME ZONE timezone_name),updated_at=NOW() WHERE id=$1`,
         [job.id, asJson(summary)]);
         await pool.query(`INSERT INTO logistics_scheduled_job_events
           (execution_id,organization_id,scheduled_job_id,job_code,event_type,initiated_by,duration_ms,result)
@@ -3232,7 +3259,7 @@ function validateCanonicalBackupReconstruction(payload) {
     reconstructedDatasets: Object.keys(datasets).filter(name => Array.isArray(datasets[name])).length };
 }
 
-async function verifyCanonicalBackupPackage(actorProfile, payload) {
+async function verifyCanonicalBackupPackage(actorProfile, payload, organizationId = logisticsOrganizationId) {
   const startedAt = Date.now();
   const requiredDatasets = [
     "organizations", "items", "assetUnits", "stockMovements", "stockLedger",
@@ -3246,7 +3273,7 @@ async function verifyCanonicalBackupPackage(actorProfile, payload) {
   const [manifestResult, schemaResult] = await Promise.all([
     pool.query(`SELECT * FROM logistics_backup_manifests
       WHERE organization_id=$1 AND payload_sha256=$2 ORDER BY generated_at DESC LIMIT 1`,
-    [logisticsOrganizationId, payloadSha256]),
+    [organizationId, payloadSha256]),
     pool.query(`SELECT version FROM logistics_schema_migrations WHERE version=$1 LIMIT 1`,
     [String(payload?.schemaVersion || "")])
   ]);
@@ -3260,7 +3287,7 @@ async function verifyCanonicalBackupPackage(actorProfile, payload) {
   const checks = [
     { code: "FORMAT_VALID", label: "Formato de respaldo reconocido", status: payload?.format === "ICC-LOGISTICS-BACKUP-1" ? "PASS" : "FAIL" },
     { code: "MANIFEST_MATCH", label: "SHA-256 coincide con un manifiesto inmutable", status: manifest ? "PASS" : "FAIL", detail: payloadSha256 },
-    { code: "ORGANIZATION_MATCH", label: "Respaldo perteneciente a la organización activa", status: payload?.organizationId === logisticsOrganizationId ? "PASS" : "FAIL" },
+    { code: "ORGANIZATION_MATCH", label: "Respaldo perteneciente a la organización activa", status: payload?.organizationId === organizationId ? "PASS" : "FAIL" },
     { code: "SCHEMA_AVAILABLE", label: "Versión de estructura disponible en producción", status: schemaResult.rows[0] ? "PASS" : "FAIL", detail: String(payload?.schemaVersion || "Sin versión") },
     { code: "DATASETS_DECLARED", label: "Índice de conjuntos de datos consistente", status: JSON.stringify(datasetNames) === JSON.stringify(declaredNames) ? "PASS" : "FAIL" },
     { code: "RECORD_COUNTS", label: "Conteos de registros consistentes", status: countDifferences.length === 0 ? "PASS" : "FAIL", detail: countDifferences.length ? `Diferencias: ${countDifferences.join(", ")}` : `${datasetNames.length} conjuntos verificados` },
@@ -3284,14 +3311,14 @@ async function verifyCanonicalBackupPackage(actorProfile, payload) {
        planned_at,started_at,completed_at,reviewed_at)
       VALUES ($1,$2,'EXPORT_VERIFY','production-read-only',$3,$4,1440,240,$5,$6,
         $7,$8::jsonb,$9,$10,$11,$11,NOW(),NOW(),NOW(),NOW()) RETURNING *`,
-    [logisticsOrganizationId, drillNumber, valid ? "PASSED" : "FAILED", manifest?.id || null,
+    [organizationId, drillNumber, valid ? "PASSED" : "FAILED", manifest?.id || null,
       measuredRpoMinutes, measuredRtoMinutes, `Validación no destructiva del paquete SHA-256 ${payloadSha256}`,
       asJson(checks), findings, valid ? null : "Generar un nuevo respaldo V2 y repetir la verificación antes de cualquier recuperación.", actorProfile.id])).rows[0];
     await client.query(`INSERT INTO logistics_audit_events
       (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,
        source,after_data,metadata)
       VALUES ($1,$2,'recovery_drill',$3,$4,$5,'WEB',$6::jsonb,$7::jsonb)`,
-    [logisticsOrganizationId, valid ? "CANONICAL_BACKUP_VERIFIED" : "CANONICAL_BACKUP_REJECTED",
+    [organizationId, valid ? "CANONICAL_BACKUP_VERIFIED" : "CANONICAL_BACKUP_REJECTED",
       drill.id, actorProfile.id, `backup-verify:${drill.id}`, asJson({ valid, checks }),
       asJson({ payloadSha256, schemaVersion: payload?.schemaVersion || null, manifestId: manifest?.id || null,
         filePayloadsExcluded: true, isolatedReconstruction: reconstruction })]);
@@ -6685,7 +6712,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
-    const [result, jobResult, eventResult, alertsResult, policyResult] = await Promise.all([
+    const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult, recoveryEventResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -6713,7 +6740,13 @@ async function handleHttpRequest(req, res, requestId) {
             WHERE manifest.id::text=task.entity_id::text AND manifest.organization_id=$1)))`,
       [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`]),
       pool.query(`SELECT * FROM logistics_backup_retention_policies WHERE organization_id=$1`,
-      [logisticsOrganizationId])
+      [logisticsOrganizationId]),
+      pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result
+        FROM logistics_scheduled_jobs WHERE organization_id=$1 AND job_code='BACKUP_RECOVERY_WEEKLY_TEST' LIMIT 1`,
+      [logisticsOrganizationId]),
+      pool.query(`SELECT occurred_at,duration_ms,result,error_detail,event_type
+        FROM logistics_scheduled_job_events WHERE organization_id=$1 AND job_code='BACKUP_RECOVERY_WEEKLY_TEST'
+          AND event_type IN ('SUCCESS','FAILED') ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -6727,7 +6760,9 @@ async function handleHttpRequest(req, res, requestId) {
       retentionSummary, backupHealth: {
       status: Number(alertsResult.rows[0]?.open || 0) > 0 ? "ALERT" : (latest ? "HEALTHY" : "PENDING"),
       ageHours, targetHours: 24, openAlerts: Number(alertsResult.rows[0]?.open || 0),
-      schedule: jobResult.rows[0] || null, lastAutomaticVerification: eventResult.rows[0] || null
+      schedule: jobResult.rows[0] || null, lastAutomaticVerification: eventResult.rows[0] || null,
+      recoverySchedule: recoveryJobResult.rows[0] || null,
+      lastRecoveryTest: recoveryEventResult.rows[0] || null
     } });
   }
 
