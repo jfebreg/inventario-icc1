@@ -122,7 +122,7 @@ test("cada cambio de objetivo conserva una versión inmutable y justificada",()=
   assert.match(server,/SELECT \* FROM logistics_backup_recovery_objectives[\s\S]*FOR UPDATE/);
   assert.match(server,/reason\.length < 10/);
   assert.match(server,/recoveryObjectiveHistory/);
-  assert.match(app,/Historial de objetivos RPO\/RTO/);
+  assert.match(app,/Historial de política de recuperación/);
   assert.match(app,/Motivo del cambio/);
 });
 
@@ -166,4 +166,12 @@ test("los umbrales de tendencia son configurables validados y auditados",()=>{
   assert.match(server,/La política de tendencia contiene límites incompatibles/);
   assert.match(app,/Pruebas consideradas/);
   assert.match(app,/Cumplimiento esperado/);
+});
+
+test("el historial presenta la política de tendencia anterior y nueva",()=>{
+  assert.match(app,/function recoveryTrendPolicySummary/);
+  assert.match(app,/previous_/);
+  assert.match(app,/Historial de política de recuperación/);
+  assert.match(app,/Cada versión conserva RPO, RTO, umbrales de tendencia/);
+  assert.match(app,/Nueva política/);
 });
