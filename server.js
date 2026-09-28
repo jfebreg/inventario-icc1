@@ -6863,7 +6863,7 @@ async function handleHttpRequest(req, res, requestId) {
     }
     const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult,
       recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult, recoveryObjectivePolicyResult,
-      recoveryObjectiveHistoryResult] = await Promise.all([
+      recoveryObjectiveHistoryResult, recoveryMetricTrendResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -6916,7 +6916,12 @@ async function handleHttpRequest(req, res, requestId) {
       pool.query(`SELECT history.*,profile.name AS changed_by_name
         FROM logistics_backup_recovery_objective_history history
         LEFT JOIN inventory_user_profiles profile ON profile.id=history.changed_by
-        WHERE history.organization_id=$1 ORDER BY history.changed_at DESC LIMIT 20`, [logisticsOrganizationId])
+        WHERE history.organization_id=$1 ORDER BY history.changed_at DESC LIMIT 20`, [logisticsOrganizationId]),
+      pool.query(`SELECT drill_number,completed_at,target_rpo_minutes,target_rto_minutes,
+          measured_rpo_minutes,measured_rto_minutes,
+          measured_rpo_minutes<=target_rpo_minutes AND measured_rto_minutes<=target_rto_minutes AS compliant
+        FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
+          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [logisticsOrganizationId])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -6926,6 +6931,25 @@ async function handleHttpRequest(req, res, requestId) {
     }, { DAILY: 0, MONTHLY: 0, ANNUAL: 0, REVIEW_MANUAL: 0 });
     const latest = classifiedManifests[0] || null;
     const ageHours = latest ? Math.max(0, Math.floor((Date.now() - new Date(latest.generated_at).getTime()) / 3_600_000)) : null;
+    const recoveryTrendRows = recoveryMetricTrendResult.rows;
+    const compliantRecoveries = recoveryTrendRows.filter(row => row.compliant).length;
+    let consecutiveRecoveryBreaches = 0;
+    for (const row of recoveryTrendRows) {
+      if (row.compliant) break;
+      consecutiveRecoveryBreaches += 1;
+    }
+    const recoveryTrend = {
+      sampleSize: recoveryTrendRows.length,
+      compliantCount: compliantRecoveries,
+      compliancePercent: recoveryTrendRows.length
+        ? Math.round((compliantRecoveries / recoveryTrendRows.length) * 1000) / 10 : null,
+      worstRpoMinutes: recoveryTrendRows.length
+        ? Math.max(...recoveryTrendRows.map(row => Number(row.measured_rpo_minutes || 0))) : null,
+      worstRtoMinutes: recoveryTrendRows.length
+        ? Math.max(...recoveryTrendRows.map(row => Number(row.measured_rto_minutes || 0))) : null,
+      consecutiveBreaches: consecutiveRecoveryBreaches,
+      results: recoveryTrendRows
+    };
     return json(res, 200, { manifests: classifiedManifests.slice(0, 100), retentionPolicy: policy,
       retentionSummary, backupHealth: {
       status: Number(alertsResult.rows[0]?.open || 0) > 0 ? "ALERT" : (latest ? "HEALTHY" : "PENDING"),
@@ -6936,7 +6960,8 @@ async function handleHttpRequest(req, res, requestId) {
       recoveryIncident: recoveryIncidentResult.rows[0] || null,
       recoveryMetrics: recoveryMetricsResult.rows[0] || null,
       recoveryObjectivePolicy: recoveryObjectivePolicyResult.rows[0] || null,
-      recoveryObjectiveHistory: recoveryObjectiveHistoryResult.rows
+      recoveryObjectiveHistory: recoveryObjectiveHistoryResult.rows,
+      recoveryTrend
     } });
   }
 

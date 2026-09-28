@@ -124,3 +124,13 @@ test("cada cambio de objetivo conserva una versión inmutable y justificada",()=
   assert.match(app,/Historial de objetivos RPO\/RTO/);
   assert.match(app,/Motivo del cambio/);
 });
+
+test("el historial resume tendencia y brechas consecutivas de recuperación",()=>{
+  assert.match(server,/ORDER BY completed_at DESC LIMIT 12/);
+  assert.match(server,/compliancePercent/);
+  assert.match(server,/worstRpoMinutes/);
+  assert.match(server,/worstRtoMinutes/);
+  assert.match(server,/consecutiveRecoveryBreaches/);
+  assert.match(app,/data-recovery-trend/);
+  assert.match(app,/Brechas seguidas/);
+});
