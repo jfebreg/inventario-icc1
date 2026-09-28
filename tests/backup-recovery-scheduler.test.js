@@ -82,3 +82,13 @@ test("la recuperación automática mide RPO y RTO contra objetivos formales",()=
   assert.match(app,/data-recovery-metrics/);
   assert.match(app,/Fuera de objetivo/);
 });
+
+test("una desviación RPO o RTO crea una alerta propia y luego se resuelve",()=>{
+  assert.match(server,/BACKUP_RECOVERY_OBJECTIVE_BREACH/);
+  assert.match(server,/measuredRpoMinutes <= targetRpoMinutes/);
+  assert.match(server,/measuredRtoMinutes <= targetRtoMinutes/);
+  assert.match(server,/Recuperación fuera del objetivo RPO\/RTO/);
+  assert.match(server,/BACKUP_RECOVERY_OBJECTIVE_BREACHED/);
+  assert.match(server,/BACKUP_RECOVERY_OBJECTIVE_RECOVERED/);
+  assert.match(server,/backup-recovery-objective-\$\{organizationId\}/);
+});

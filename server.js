@@ -3383,6 +3383,58 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
       drill.id, actorProfile.id, `backup-verify:${drill.id}`, asJson({ valid, checks }),
       asJson({ payloadSha256, schemaVersion: payload?.schemaVersion || null, manifestId: manifest?.id || null,
         filePayloadsExcluded: true, isolatedReconstruction: reconstruction })]);
+    const objectiveTaskId = `backup-recovery-objective-${organizationId}`;
+    const rpoCompliant = measuredRpoMinutes <= targetRpoMinutes;
+    const rtoCompliant = measuredRtoMinutes <= targetRtoMinutes;
+    const objectiveDetail = [
+      `RPO ${measuredRpoMinutes}/${targetRpoMinutes} min`,
+      `RTO ${measuredRtoMinutes}/${targetRtoMinutes} min`
+    ].join(" · ");
+    if (!rpoCompliant || !rtoCompliant) {
+      await client.query(`INSERT INTO inventory_tasks
+        (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,
+         entity_type,entity_id,due_at,payload,updated_at)
+        VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_BREACH','Recuperación fuera del objetivo RPO/RTO',$2,
+          'Crítica','Pendiente','Bodega Central',$3,'recovery_objective',$4,NOW()+INTERVAL '24 hours',$5::jsonb,NOW())
+        ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,status='Pendiente',resolved_at=NULL,
+          assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,due_at=EXCLUDED.due_at,
+          payload=EXCLUDED.payload,updated_at=NOW()`,
+      [objectiveTaskId, objectiveDetail, actorProfile.auth_user_id || null, organizationId,
+        asJson({ drillId: drill.id, rpoCompliant, rtoCompliant, measuredRpoMinutes,
+          measuredRtoMinutes, targetRpoMinutes, targetRtoMinutes })]);
+      await client.query(`INSERT INTO inventory_notifications
+        (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+        VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_OBJECTIVE_BREACH',$3,$4,'critical',
+          'recovery_objective',$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`,
+      [`notification-${objectiveTaskId}-${drill.id}`, actorProfile.auth_user_id || null,
+        'Recuperación fuera del objetivo RPO/RTO', objectiveDetail, organizationId,
+        asJson({ taskId: objectiveTaskId, drillId: drill.id, rpoCompliant, rtoCompliant })]);
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_BREACHED','recovery_objective',$1,$2,$3,'SYSTEM',$4::jsonb)`,
+      [organizationId, actorProfile.id, `backup-objective:${drill.id}`,
+        asJson({ drillId: drill.id, objectiveDetail, rpoCompliant, rtoCompliant })]);
+    } else {
+      const resolvedObjective = await client.query(`UPDATE inventory_tasks SET status='Resuelta',
+        resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+        WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [objectiveTaskId]);
+      if (resolvedObjective.rowCount) {
+        await client.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
+          WHERE entity_type='recovery_objective' AND entity_id=$1 AND read_at IS NULL`, [organizationId]);
+        await client.query(`INSERT INTO inventory_notifications
+          (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+          VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_OBJECTIVE_RECOVERED',$3,$4,'info',
+            'recovery_objective',$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`,
+        [`notification-${objectiveTaskId}-recovered-${drill.id}`, actorProfile.auth_user_id || null,
+          'Objetivos RPO/RTO restablecidos', objectiveDetail, organizationId,
+          asJson({ taskId: objectiveTaskId, drillId: drill.id })]);
+        await client.query(`INSERT INTO logistics_audit_events
+          (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+          VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_RECOVERED','recovery_objective',$1,$2,$3,'SYSTEM',$4::jsonb)`,
+        [organizationId, actorProfile.id, `backup-objective:${drill.id}`,
+          asJson({ drillId: drill.id, objectiveDetail })]);
+      }
+    }
     await client.query("COMMIT");
     return { valid, payloadSha256, manifestId: manifest?.id || null, schemaVersion: payload?.schemaVersion || null,
       checks, reconstruction, drill };
@@ -6813,13 +6865,14 @@ async function handleHttpRequest(req, res, requestId) {
         ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT COUNT(*)::int AS open FROM inventory_tasks task
         WHERE task.status<>'Resuelta' AND (
-          (task.task_type IN ('BACKUP_RPO_BREACH','BACKUP_RECOVERY_TEST_FAILED')
-            AND task.id IN ($2,$3)) OR
+          (task.task_type IN ('BACKUP_RPO_BREACH','BACKUP_RECOVERY_TEST_FAILED','BACKUP_RECOVERY_OBJECTIVE_BREACH')
+            AND task.id IN ($2,$3,$4)) OR
           (task.task_type='BACKUP_ARCHIVE_INTEGRITY' AND EXISTS (
             SELECT 1 FROM logistics_backup_manifests manifest
             WHERE manifest.id::text=task.entity_id::text AND manifest.organization_id=$1)))`,
       [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`,
-        `backup-recovery-${logisticsOrganizationId}`]),
+        `backup-recovery-${logisticsOrganizationId}`,
+        `backup-recovery-objective-${logisticsOrganizationId}`]),
       pool.query(`SELECT * FROM logistics_backup_retention_policies WHERE organization_id=$1`,
       [logisticsOrganizationId]),
       pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result
