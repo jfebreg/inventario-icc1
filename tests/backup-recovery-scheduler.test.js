@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [migration,server,app]=await Promise.all([
+const [migration,objectiveMigration,server,app]=await Promise.all([
   readFile(new URL("../migrations/075_backup_recovery_weekly_test.sql",import.meta.url),"utf8"),
+  readFile(new URL("../migrations/076_backup_recovery_objectives.sql",import.meta.url),"utf8"),
   readFile(new URL("../server.js",import.meta.url),"utf8"),
   readFile(new URL("../app.js",import.meta.url),"utf8")
 ]);
@@ -75,7 +76,7 @@ test("el administrador puede ejecutar inmediatamente la misma prueba desde Stora
 
 test("la recuperación automática mide RPO y RTO contra objetivos formales",()=>{
   assert.match(server,/objectiveResult/);
-  assert.match(server,/drill_type IN \('ISOLATED_RESTORE','TABLETOP'\)/);
+  assert.match(server,/SELECT target_rpo_minutes,target_rto_minutes FROM logistics_backup_recovery_objectives/);
   assert.match(server,/targetRpoMinutes, targetRtoMinutes, measuredRpoMinutes, measuredRtoMinutes/);
   assert.match(server,/measured_rpo_minutes<=target_rpo_minutes AS rpo_compliant/);
   assert.match(server,/recoveryMetrics/);
@@ -91,4 +92,23 @@ test("una desviación RPO o RTO crea una alerta propia y luego se resuelve",()=>
   assert.match(server,/BACKUP_RECOVERY_OBJECTIVE_BREACHED/);
   assert.match(server,/BACKUP_RECOVERY_OBJECTIVE_RECOVERED/);
   assert.match(server,/backup-recovery-objective-\$\{organizationId\}/);
+});
+
+test("la desviación persistente se escala y bloquea preparación productiva",()=>{
+  assert.match(server,/OR task_type='BACKUP_RECOVERY_OBJECTIVE_BREACH'/);
+  assert.match(server,/BACKUP_RECOVERY_OBJECTIVE_ESCALATED/);
+  assert.match(server,/Escalamiento: objetivo RPO\/RTO aún incumplido/);
+  assert.match(server,/"backupRecoveryObjective"/);
+  assert.match(server,/objectiveStatus = !recoveryObjective \? "WARN"/);
+  assert.match(server,/rpoWithinTarget && rtoWithinTarget \? "PASS" : "FAIL"/);
+});
+
+test("la organización configura objetivos RPO y RTO explícitos",()=>{
+  assert.match(objectiveMigration,/CREATE TABLE IF NOT EXISTS logistics_backup_recovery_objectives/);
+  assert.match(objectiveMigration,/target_rpo_minutes INTEGER NOT NULL DEFAULT 1440/);
+  assert.match(objectiveMigration,/ENABLE ROW LEVEL SECURITY/);
+  assert.match(server,/BACKUP_RECOVERY_OBJECTIVE_UPDATED/);
+  assert.match(server,/logistics_backup_recovery_objectives/);
+  assert.match(app,/Configurar objetivo/);
+  assert.match(app,/backupRecoveryObjectiveForm/);
 });

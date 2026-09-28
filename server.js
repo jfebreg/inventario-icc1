@@ -2729,7 +2729,8 @@ async function escalateOverdueSchedulerFailures() {
   const escalated = (await pool.query(`UPDATE inventory_tasks SET
       payload=jsonb_set(COALESCE(payload,'{}'::jsonb),'{escalatedAt}',to_jsonb(NOW()),TRUE),
       priority='Crítica',updated_at=NOW()
-    WHERE (task_type='SCHEDULER_FAILURE' OR task_type='BACKUP_RECOVERY_TEST_FAILED')
+    WHERE (task_type='SCHEDULER_FAILURE' OR task_type='BACKUP_RECOVERY_TEST_FAILED'
+      OR task_type='BACKUP_RECOVERY_OBJECTIVE_BREACH')
       AND status<>'Resuelta' AND due_at<=NOW()
       AND COALESCE(payload->>'escalatedAt','')=''
     RETURNING id,task_type,title,detail,entity_id,payload`)).rows;
@@ -2738,9 +2739,11 @@ async function escalateOverdueSchedulerFailures() {
     activated_at NULLS LAST,created_at LIMIT 1`)).rows[0] || {} : {};
   for (const task of escalated) {
     const recoveryEscalation = task.task_type === 'BACKUP_RECOVERY_TEST_FAILED';
-    const notificationType = recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED' : 'SCHEDULER_ESCALATION';
-    const title = recoveryEscalation
-      ? 'Escalamiento: recuperación de respaldos no restablecida'
+    const objectiveEscalation = task.task_type === 'BACKUP_RECOVERY_OBJECTIVE_BREACH';
+    const notificationType = recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
+      : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED' : 'SCHEDULER_ESCALATION';
+    const title = recoveryEscalation ? 'Escalamiento: recuperación de respaldos no restablecida'
+      : objectiveEscalation ? 'Escalamiento: objetivo RPO/RTO aún incumplido'
       : `Plazo vencido: ${task.title}`;
     await pool.query(`INSERT INTO inventory_notifications
       (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
@@ -2752,7 +2755,8 @@ async function escalateOverdueSchedulerFailures() {
     await pool.query(`INSERT INTO logistics_audit_events
       (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
       VALUES ($1,$2,'scheduled_job',$3,$4,'SYSTEM',$5::jsonb)`,
-    [logisticsOrganizationId, recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',
+    [logisticsOrganizationId, recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
+      : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',
       task.entity_id, administrator.id || null,
       asJson({ taskId: task.id, escalatedAt: task.payload?.escalatedAt, detail: task.detail })]);
   }
@@ -2947,7 +2951,8 @@ async function createCanonicalBackup(actorProfile, organizationId = logisticsOrg
       outboxDeliveryAttempts: "logistics_outbox_delivery_attempts",
       outboxSloPolicies: "logistics_outbox_slo_policies",
       backupRetentionPolicies: "logistics_backup_retention_policies",
-      backupRetentionReviews: "logistics_backup_retention_reviews"
+      backupRetentionReviews: "logistics_backup_retention_reviews",
+      backupRecoveryObjectives: "logistics_backup_recovery_objectives"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const organizationPredicate = table === "logistics_organizations" ? "id=$1" : "organization_id=$1";
@@ -3331,9 +3336,8 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
     [organizationId, payloadSha256]),
     pool.query(`SELECT version FROM logistics_schema_migrations WHERE version=$1 LIMIT 1`,
     [String(payload?.schemaVersion || "")]),
-    pool.query(`SELECT target_rpo_minutes,target_rto_minutes FROM logistics_recovery_drills
-      WHERE organization_id=$1 AND drill_type IN ('ISOLATED_RESTORE','TABLETOP')
-      ORDER BY created_at DESC LIMIT 1`, [organizationId])
+    pool.query(`SELECT target_rpo_minutes,target_rto_minutes FROM logistics_backup_recovery_objectives
+      WHERE organization_id=$1 LIMIT 1`, [organizationId])
   ]);
   const manifest = manifestResult.rows[0] || null;
   const datasetNames = Object.keys(datasets).sort();
@@ -3457,9 +3461,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("075_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("076_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("075_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("076_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -3527,6 +3531,20 @@ async function productionReadiness() {
       : recoveryOverdue ? "La prueba semanal está atrasada."
       : `Última prueba correcta ${new Date(recoverySchedule.last_completed_at).toLocaleString("es-CL")}.`,
     recoveryStatus === "PASS" ? "" : "Revisar la agenda y ejecutar una recuperación aislada desde el historial de respaldos.");
+
+  const recoveryObjective = (await pool.query(`SELECT target_rpo_minutes,target_rto_minutes,
+      measured_rpo_minutes,measured_rto_minutes,completed_at
+    FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
+      AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`, [logisticsOrganizationId])).rows[0];
+  const rpoWithinTarget = recoveryObjective
+    ? Number(recoveryObjective.measured_rpo_minutes) <= Number(recoveryObjective.target_rpo_minutes) : null;
+  const rtoWithinTarget = recoveryObjective
+    ? Number(recoveryObjective.measured_rto_minutes) <= Number(recoveryObjective.target_rto_minutes) : null;
+  const objectiveStatus = !recoveryObjective ? "WARN" : (rpoWithinTarget && rtoWithinTarget ? "PASS" : "FAIL");
+  add("backupRecoveryObjective", "Cumplimiento RPO/RTO", objectiveStatus,
+    !recoveryObjective ? "Aún no existe una medición automática."
+      : `RPO ${recoveryObjective.measured_rpo_minutes}/${recoveryObjective.target_rpo_minutes} min · RTO ${recoveryObjective.measured_rto_minutes}/${recoveryObjective.target_rto_minutes} min.`,
+    objectiveStatus === "PASS" ? "" : "Ejecutar una prueba inmediata y corregir la antigüedad o duración de la recuperación.");
 
   const documents = await pool.query(`SELECT COUNT(*)::int AS missing
     FROM logistics_documents WHERE status='ACTIVE' AND (sha256 IS NULL OR sha256='')`);
@@ -6843,7 +6861,7 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
     const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult,
-      recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult] = await Promise.all([
+      recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult, recoveryObjectivePolicyResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -6890,7 +6908,9 @@ async function handleHttpRequest(req, res, requestId) {
           measured_rpo_minutes<=target_rpo_minutes AS rpo_compliant,
           measured_rto_minutes<=target_rto_minutes AS rto_compliant
         FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
-          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`, [logisticsOrganizationId])
+          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`, [logisticsOrganizationId]),
+      pool.query(`SELECT target_rpo_minutes,target_rto_minutes,updated_at
+        FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`, [logisticsOrganizationId])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -6908,8 +6928,37 @@ async function handleHttpRequest(req, res, requestId) {
       recoverySchedule: recoveryJobResult.rows[0] || null,
       lastRecoveryTest: recoveryEventResult.rows[0] || null,
       recoveryIncident: recoveryIncidentResult.rows[0] || null,
-      recoveryMetrics: recoveryMetricsResult.rows[0] || null
+      recoveryMetrics: recoveryMetricsResult.rows[0] || null,
+      recoveryObjectivePolicy: recoveryObjectivePolicyResult.rows[0] || null
     } });
+  }
+
+  if (url.pathname === "/api/admin/canonical-backups/recovery-objective" && req.method === "PATCH") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede configurar RPO y RTO." });
+    try {
+      const body = await readJson(req);
+      const targetRpoMinutes = Number(body.targetRpoMinutes);
+      const targetRtoMinutes = Number(body.targetRtoMinutes);
+      if (!Number.isInteger(targetRpoMinutes) || targetRpoMinutes < 5 || targetRpoMinutes > 10080) {
+        throw new Error("El RPO debe estar entre 5 y 10.080 minutos.");
+      }
+      if (!Number.isInteger(targetRtoMinutes) || targetRtoMinutes < 1 || targetRtoMinutes > 1440) {
+        throw new Error("El RTO debe estar entre 1 y 1.440 minutos.");
+      }
+      const policy = (await pool.query(`INSERT INTO logistics_backup_recovery_objectives
+        (organization_id,target_rpo_minutes,target_rto_minutes,updated_by)
+        VALUES ($1,$2,$3,$4) ON CONFLICT (organization_id) DO UPDATE SET
+        target_rpo_minutes=EXCLUDED.target_rpo_minutes,target_rto_minutes=EXCLUDED.target_rto_minutes,
+        updated_by=EXCLUDED.updated_by,updated_at=NOW() RETURNING *`,
+      [logisticsOrganizationId, targetRpoMinutes, targetRtoMinutes, apiProfile.id])).rows[0];
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_UPDATED','recovery_objective',$1,$2,'WEB',$3::jsonb)`,
+      [logisticsOrganizationId, apiProfile.id, asJson(policy)]);
+      return json(res, 200, { policy });
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo guardar el objetivo de recuperación." });
+    }
   }
 
   if (url.pathname === "/api/admin/canonical-backups/policy" && req.method === "PATCH") {
