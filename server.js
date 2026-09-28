@@ -3547,6 +3547,28 @@ async function productionReadiness() {
       : `RPO ${recoveryObjective.measured_rpo_minutes}/${recoveryObjective.target_rpo_minutes} min · RTO ${recoveryObjective.measured_rto_minutes}/${recoveryObjective.target_rto_minutes} min.`,
     objectiveStatus === "PASS" ? "" : "Ejecutar una prueba inmediata y corregir la antigüedad o duración de la recuperación.");
 
+  const readinessTrendRows = (await pool.query(`SELECT
+      measured_rpo_minutes<=target_rpo_minutes AND measured_rto_minutes<=target_rto_minutes AS compliant
+    FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
+      AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [logisticsOrganizationId])).rows;
+  const readinessCompliant = readinessTrendRows.filter(row => row.compliant).length;
+  const readinessCompliancePercent = readinessTrendRows.length
+    ? Math.round((readinessCompliant / readinessTrendRows.length) * 1000) / 10 : null;
+  let readinessConsecutiveBreaches = 0;
+  for (const row of readinessTrendRows) {
+    if (row.compliant) break;
+    readinessConsecutiveBreaches += 1;
+  }
+  const trendHasSample = readinessTrendRows.length >= 3;
+  const recoveryTrendStatus = !trendHasSample ? "PASS"
+    : (readinessCompliancePercent < 80 || readinessConsecutiveBreaches >= 2 ? "FAIL"
+      : readinessCompliancePercent < 95 ? "WARN" : "PASS");
+  add("backupRecoveryTrend", "Tendencia de recuperación", recoveryTrendStatus,
+    !readinessTrendRows.length ? "Sin pruebas históricas; se iniciará la línea base."
+      : !trendHasSample ? `${readinessCompliant}/${readinessTrendRows.length} pruebas cumplen; línea base en formación.`
+      : `${readinessCompliancePercent}% de cumplimiento en ${readinessTrendRows.length} pruebas · ${readinessConsecutiveBreaches} brecha(s) consecutiva(s).`,
+    recoveryTrendStatus === "PASS" ? "" : "Revisar causas recurrentes y ejecutar acciones correctivas antes del paso a producción.");
+
   const documents = await pool.query(`SELECT COUNT(*)::int AS missing
     FROM logistics_documents WHERE status='ACTIVE' AND (sha256 IS NULL OR sha256='')`);
   add("documents", "Integridad documental", Number(documents.rows[0]?.missing || 0) ? "WARN" : "PASS",
