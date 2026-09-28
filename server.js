@@ -2730,7 +2730,8 @@ async function escalateOverdueSchedulerFailures() {
       payload=jsonb_set(COALESCE(payload,'{}'::jsonb),'{escalatedAt}',to_jsonb(NOW()),TRUE),
       priority='Crítica',updated_at=NOW()
     WHERE (task_type='SCHEDULER_FAILURE' OR task_type='BACKUP_RECOVERY_TEST_FAILED'
-      OR task_type='BACKUP_RECOVERY_OBJECTIVE_BREACH')
+      OR task_type='BACKUP_RECOVERY_OBJECTIVE_BREACH'
+      OR task_type='BACKUP_RECOVERY_TREND_BREACH')
       AND status<>'Resuelta' AND due_at<=NOW()
       AND COALESCE(payload->>'escalatedAt','')=''
     RETURNING id,task_type,title,detail,entity_id,payload`)).rows;
@@ -2740,11 +2741,14 @@ async function escalateOverdueSchedulerFailures() {
   for (const task of escalated) {
     const recoveryEscalation = task.task_type === 'BACKUP_RECOVERY_TEST_FAILED';
     const objectiveEscalation = task.task_type === 'BACKUP_RECOVERY_OBJECTIVE_BREACH';
+    const trendEscalation = task.task_type === 'BACKUP_RECOVERY_TREND_BREACH';
     const notificationType = recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
-      : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED' : 'SCHEDULER_ESCALATION';
+      : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED'
+        : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED' : 'SCHEDULER_ESCALATION';
     const title = recoveryEscalation ? 'Escalamiento: recuperación de respaldos no restablecida'
       : objectiveEscalation ? 'Escalamiento: objetivo RPO/RTO aún incumplido'
-      : `Plazo vencido: ${task.title}`;
+        : trendEscalation ? 'Escalamiento: tendencia de recuperación aún degradada'
+          : `Plazo vencido: ${task.title}`;
     await pool.query(`INSERT INTO inventory_notifications
       (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
       VALUES ($1,$2,'Bodega Central',$3,$4,$5,'critical',
@@ -2756,7 +2760,8 @@ async function escalateOverdueSchedulerFailures() {
       (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
       VALUES ($1,$2,'scheduled_job',$3,$4,'SYSTEM',$5::jsonb)`,
     [logisticsOrganizationId, recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
-      : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',
+      : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED'
+        : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',
       task.entity_id, administrator.id || null,
       asJson({ taskId: task.id, escalatedAt: task.payload?.escalatedAt, detail: task.detail })]);
   }
@@ -3438,6 +3443,72 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
           VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_RECOVERED','recovery_objective',$1,$2,$3,'SYSTEM',$4::jsonb)`,
         [organizationId, actorProfile.id, `backup-objective:${drill.id}`,
           asJson({ drillId: drill.id, objectiveDetail })]);
+      }
+    }
+    const trendRows = (await client.query(`SELECT drill_number,completed_at,
+        measured_rpo_minutes<=target_rpo_minutes AND measured_rto_minutes<=target_rto_minutes AS compliant
+      FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
+        AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [organizationId])).rows;
+    const trendSampleSize = trendRows.length;
+    const trendCompliantCount = trendRows.filter(row => row.compliant).length;
+    const trendCompliancePercent = trendSampleSize
+      ? Math.round((trendCompliantCount / trendSampleSize) * 1000) / 10 : null;
+    let trendConsecutiveBreaches = 0;
+    for (const row of trendRows) {
+      if (row.compliant) break;
+      trendConsecutiveBreaches += 1;
+    }
+    const trendTaskId = `backup-recovery-trend-${organizationId}`;
+    const trendHasBreach = trendSampleSize >= 3 && trendCompliancePercent < 95;
+    const trendCritical = trendCompliancePercent < 80 || trendConsecutiveBreaches >= 2;
+    const trendDetail = `${trendCompliancePercent}% de cumplimiento en ${trendSampleSize} pruebas · ${trendConsecutiveBreaches} brecha(s) consecutiva(s)`;
+    if (trendHasBreach) {
+      await client.query(`INSERT INTO inventory_tasks
+        (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,
+         entity_type,entity_id,due_at,payload,updated_at)
+        VALUES ($1,'BACKUP_RECOVERY_TREND_BREACH','Mejorar tendencia de recuperación RPO/RTO',$2,
+          $3,'Pendiente','Bodega Central',$4,'recovery_trend',$5,
+          NOW()+CASE WHEN $6::boolean THEN INTERVAL '24 hours' ELSE INTERVAL '7 days' END,$7::jsonb,NOW())
+        ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,priority=EXCLUDED.priority,
+          status='Pendiente',resolved_at=NULL,assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,
+          due_at=EXCLUDED.due_at,payload=EXCLUDED.payload,updated_at=NOW()` ,
+      [trendTaskId, trendDetail, trendCritical ? 'Crítica' : 'Alta', actorProfile.auth_user_id || null,
+        organizationId, trendCritical, asJson({ drillId: drill.id, sampleSize: trendSampleSize,
+          compliantCount: trendCompliantCount, compliancePercent: trendCompliancePercent,
+          consecutiveBreaches: trendConsecutiveBreaches })]);
+      await client.query(`INSERT INTO inventory_notifications
+        (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+        VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_TREND_BREACH',$3,$4,$5,
+          'recovery_trend',$6,$7::jsonb) ON CONFLICT (id) DO NOTHING`,
+      [`notification-${trendTaskId}-${drill.id}`, actorProfile.auth_user_id || null,
+        'Tendencia de recuperación degradada', trendDetail, trendCritical ? 'critical' : 'warning',
+        organizationId, asJson({ taskId: trendTaskId, drillId: drill.id,
+          compliancePercent: trendCompliancePercent, consecutiveBreaches: trendConsecutiveBreaches })]);
+      await client.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'BACKUP_RECOVERY_TREND_BREACHED','recovery_trend',$1,$2,$3,'SYSTEM',$4::jsonb)`,
+      [organizationId, actorProfile.id, `backup-trend:${drill.id}`,
+        asJson({ drillId: drill.id, sampleSize: trendSampleSize,
+          compliancePercent: trendCompliancePercent, consecutiveBreaches: trendConsecutiveBreaches })]);
+    } else if (trendSampleSize >= 3) {
+      const resolvedTrend = await client.query(`UPDATE inventory_tasks SET status='Resuelta',
+        resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+        WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [trendTaskId]);
+      if (resolvedTrend.rowCount) {
+        await client.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
+          WHERE entity_type='recovery_trend' AND entity_id=$1 AND read_at IS NULL`, [organizationId]);
+        await client.query(`INSERT INTO inventory_notifications
+          (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+          VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_TREND_RECOVERED',$3,$4,'info',
+            'recovery_trend',$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`,
+        [`notification-${trendTaskId}-recovered-${drill.id}`, actorProfile.auth_user_id || null,
+          'Tendencia de recuperación restablecida', trendDetail, organizationId,
+          asJson({ taskId: trendTaskId, drillId: drill.id, compliancePercent: trendCompliancePercent })]);
+        await client.query(`INSERT INTO logistics_audit_events
+          (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+          VALUES ($1,'BACKUP_RECOVERY_TREND_RECOVERED','recovery_trend',$1,$2,$3,'SYSTEM',$4::jsonb)`,
+        [organizationId, actorProfile.id, `backup-trend:${drill.id}`,
+          asJson({ drillId: drill.id, compliancePercent: trendCompliancePercent })]);
       }
     }
     await client.query("COMMIT");
@@ -6907,14 +6978,15 @@ async function handleHttpRequest(req, res, requestId) {
         ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT COUNT(*)::int AS open FROM inventory_tasks task
         WHERE task.status<>'Resuelta' AND (
-          (task.task_type IN ('BACKUP_RPO_BREACH','BACKUP_RECOVERY_TEST_FAILED','BACKUP_RECOVERY_OBJECTIVE_BREACH')
-            AND task.id IN ($2,$3,$4)) OR
+          (task.task_type IN ('BACKUP_RPO_BREACH','BACKUP_RECOVERY_TEST_FAILED','BACKUP_RECOVERY_OBJECTIVE_BREACH','BACKUP_RECOVERY_TREND_BREACH')
+            AND task.id IN ($2,$3,$4,$5)) OR
           (task.task_type='BACKUP_ARCHIVE_INTEGRITY' AND EXISTS (
             SELECT 1 FROM logistics_backup_manifests manifest
             WHERE manifest.id::text=task.entity_id::text AND manifest.organization_id=$1)))`,
       [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`,
         `backup-recovery-${logisticsOrganizationId}`,
-        `backup-recovery-objective-${logisticsOrganizationId}`]),
+        `backup-recovery-objective-${logisticsOrganizationId}`,
+        `backup-recovery-trend-${logisticsOrganizationId}`]),
       pool.query(`SELECT * FROM logistics_backup_retention_policies WHERE organization_id=$1`,
       [logisticsOrganizationId]),
       pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result

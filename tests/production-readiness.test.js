@@ -8,7 +8,7 @@ const app = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 test("el diagnóstico cubre dependencias críticas de producción", () => {
   assert.match(server, /async function productionReadiness/);
   for (const check of ["database", "migrations", "auth", "storage", "audit",
-    "backup", "backupRecovery", "backupRecoveryObjective", "documents", "rls", "criticalTasks", "openai", "scheduler", "evidenceAutomation", "inspectionReportAutomation", "inspectionReportSlo", "outbox", "outboxWebhook", "cutover", "accessReview"]) {
+    "backup", "backupRecovery", "backupRecoveryObjective", "backupRecoveryTrend", "documents", "rls", "criticalTasks", "openai", "scheduler", "evidenceAutomation", "inspectionReportAutomation", "inspectionReportSlo", "outbox", "outboxWebhook", "cutover", "accessReview"]) {
     assert.match(server, new RegExp(`"${check}"`));
   }
 });
@@ -45,4 +45,13 @@ test("la preparación productiva detecta una agenda de informes ausente detenida
   assert.match(server, /inspectionReportSchedule\.last_status === "FAILED"/);
   assert.match(server, /Integridad automática de informes finales/);
   assert.match(server, /La verificación automática está detenida/);
+});
+
+test("la preparación productiva considera la tendencia reciente de recuperación", () => {
+  assert.match(server, /"backupRecoveryTrend"/);
+  assert.match(server, /readinessTrendRows\.length >= 3/);
+  assert.match(server, /readinessCompliancePercent < 80/);
+  assert.match(server, /readinessConsecutiveBreaches >= 2/);
+  assert.match(server, /readinessCompliancePercent < 95/);
+  assert.match(server, /línea base en formación/);
 });
