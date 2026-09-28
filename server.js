@@ -2729,17 +2729,32 @@ async function escalateOverdueSchedulerFailures() {
   const escalated = (await pool.query(`UPDATE inventory_tasks SET
       payload=jsonb_set(COALESCE(payload,'{}'::jsonb),'{escalatedAt}',to_jsonb(NOW()),TRUE),
       priority='Crítica',updated_at=NOW()
-    WHERE task_type='SCHEDULER_FAILURE' AND status<>'Resuelta' AND due_at<=NOW()
+    WHERE (task_type='SCHEDULER_FAILURE' OR task_type='BACKUP_RECOVERY_TEST_FAILED')
+      AND status<>'Resuelta' AND due_at<=NOW()
       AND COALESCE(payload->>'escalatedAt','')=''
-    RETURNING id,title,detail,entity_id,payload`)).rows;
+    RETURNING id,task_type,title,detail,entity_id,payload`)).rows;
+  const administrator = escalated.length ? (await pool.query(`SELECT id,auth_user_id FROM inventory_user_profiles
+    WHERE admin=TRUE AND active=TRUE ORDER BY (LOWER(email)='jfebreg@msn.com') DESC,
+    activated_at NULLS LAST,created_at LIMIT 1`)).rows[0] || {} : {};
   for (const task of escalated) {
+    const recoveryEscalation = task.task_type === 'BACKUP_RECOVERY_TEST_FAILED';
+    const notificationType = recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED' : 'SCHEDULER_ESCALATION';
+    const title = recoveryEscalation
+      ? 'Escalamiento: recuperación de respaldos no restablecida'
+      : `Plazo vencido: ${task.title}`;
     await pool.query(`INSERT INTO inventory_notifications
-      (id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
-      VALUES ($1,'Bodega Central','SCHEDULER_ESCALATION',$2,$3,'critical',
-        'scheduled_job',$4,$5::jsonb) ON CONFLICT (id) DO NOTHING`,
+      (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+      VALUES ($1,$2,'Bodega Central',$3,$4,$5,'critical',
+        'scheduled_job',$6,$7::jsonb) ON CONFLICT (id) DO NOTHING`,
     [`notification-escalation-${task.id}-${Date.now()}`,
-      `Plazo vencido: ${task.title}`, task.detail, task.entity_id,
+      administrator.auth_user_id || null, notificationType, title, task.detail, task.entity_id,
       asJson({ taskId: task.id, escalatedAt: task.payload?.escalatedAt })]);
+    await pool.query(`INSERT INTO logistics_audit_events
+      (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+      VALUES ($1,$2,'scheduled_job',$3,$4,'SYSTEM',$5::jsonb)`,
+    [logisticsOrganizationId, recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',
+      task.entity_id, administrator.id || null,
+      asJson({ taskId: task.id, escalatedAt: task.payload?.escalatedAt, detail: task.detail })]);
   }
   return escalated;
 }
@@ -3110,8 +3125,25 @@ async function runDueCanonicalBackupJobs() {
           job.id, job.job_code, admin.id, Date.now() - startedAt, asJson(summary)]);
         const taskId = job.job_code === 'BACKUP_RECOVERY_WEEKLY_TEST'
           ? `backup-recovery-${job.organization_id}` : `backup-rpo-${job.organization_id}`;
-        await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
-          updated_at=NOW() WHERE id=$1 AND status<>'Resuelta'`, [taskId]);
+        const resolvedTask = await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
+          updated_at=NOW() WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [taskId]);
+        if (resolvedTask.rowCount && job.job_code === 'BACKUP_RECOVERY_WEEKLY_TEST') {
+          await pool.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
+            WHERE entity_type='scheduled_job' AND entity_id=$1 AND notification_type='BACKUP_RECOVERY_TEST_FAILED'
+              AND read_at IS NULL`, [String(job.id)]);
+          await pool.query(`INSERT INTO inventory_notifications
+            (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+            VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_TEST_RECOVERED',$3,$4,'info','scheduled_job',$5,$6::jsonb)
+            ON CONFLICT (id) DO NOTHING`,
+          [`notification-${taskId}-recovered-${executionId}`, admin.auth_user_id || null,
+            'Prueba de recuperación restablecida', 'La reconstrucción aislada semanal volvió a completarse correctamente.',
+            String(job.id), asJson({ taskId, executionId, recoveryDrillId: summary.recoveryDrillId })]);
+          await pool.query(`INSERT INTO logistics_audit_events
+            (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+            VALUES ($1,'BACKUP_RECOVERY_TEST_RECOVERED','scheduled_job',$2,$3,$4,'SYSTEM',$5::jsonb)`,
+          [job.organization_id, job.id, admin.id, `backup-recovery:${executionId}`,
+            asJson({ taskId, executionId, recoveryDrillId: summary.recoveryDrillId })]);
+        }
         results.push({ jobId: job.id, ok: true, ...summary });
       } catch (error) {
         const message = String(error?.message || error).slice(0, 2000);
@@ -3125,6 +3157,9 @@ async function runDueCanonicalBackupJobs() {
         const taskId = recoveryFailure ? `backup-recovery-${job.organization_id}` : `backup-rpo-${job.organization_id}`;
         const taskType = recoveryFailure ? 'BACKUP_RECOVERY_TEST_FAILED' : 'BACKUP_RPO_BREACH';
         const taskTitle = recoveryFailure ? 'Falló la prueba semanal de recuperación V2' : 'Falló el respaldo automático V2';
+        const incidentOwner = (await pool.query(`SELECT id,auth_user_id FROM inventory_user_profiles
+          WHERE admin=TRUE AND active=TRUE ORDER BY (LOWER(email)='jfebreg@msn.com') DESC,
+          activated_at NULLS LAST,created_at LIMIT 1`)).rows[0] || {};
         await pool.query(`INSERT INTO inventory_tasks
           (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,due_at,payload,updated_at)
           VALUES ($1,$2,$3,$4,'Crítica','Pendiente',
@@ -3133,6 +3168,19 @@ async function runDueCanonicalBackupJobs() {
             task_type=EXCLUDED.task_type,title=EXCLUDED.title,due_at=EXCLUDED.due_at,
             payload=EXCLUDED.payload,updated_at=NOW()`,
         [taskId, taskType, taskTitle, message, job.id, asJson({ executionId, jobCode: job.job_code })]);
+        if (recoveryFailure) {
+          await pool.query(`INSERT INTO inventory_notifications
+            (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+            VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_TEST_FAILED',$3,$4,'critical','scheduled_job',$5,$6::jsonb)
+            ON CONFLICT (id) DO NOTHING`,
+          [`notification-${taskId}-${executionId}`, incidentOwner.auth_user_id || null, taskTitle, message,
+            String(job.id), asJson({ taskId, executionId, jobCode: job.job_code })]);
+          await pool.query(`INSERT INTO logistics_audit_events
+            (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+            VALUES ($1,'BACKUP_RECOVERY_TEST_FAILED','scheduled_job',$2,$3,$4,'SYSTEM',$5::jsonb)`,
+          [job.organization_id, job.id, incidentOwner.id || null, `backup-recovery:${executionId}`,
+            asJson({ taskId, executionId, error: message })]);
+        }
         results.push({ jobId: job.id, ok: false, error: message });
       }
     }

@@ -35,6 +35,23 @@ test("una falla de recuperación crea una tarea crítica propia y el éxito la r
   assert.match(server,/jobCode: job\.job_code/);
 });
 
+test("el incidente notifica en tiempo real y conserva su transición en auditoría",()=>{
+  assert.match(server,/notification-\$\{taskId\}-\$\{executionId\}/);
+  assert.match(server,/BACKUP_RECOVERY_TEST_FAILED','scheduled_job/);
+  assert.match(server,/BACKUP_RECOVERY_TEST_RECOVERED/);
+  assert.match(server,/notification-\$\{taskId\}-recovered-\$\{executionId\}/);
+  assert.match(server,/correlation_id,source,after_data/);
+  assert.match(server,/UPDATE inventory_notifications SET read_at=COALESCE\(read_at,NOW\(\)\)/);
+});
+
+test("una recuperación no restablecida se escala una sola vez",()=>{
+  assert.match(server,/task_type='SCHEDULER_FAILURE' OR task_type='BACKUP_RECOVERY_TEST_FAILED'/);
+  assert.match(server,/BACKUP_RECOVERY_TEST_ESCALATED/);
+  assert.match(server,/Escalamiento: recuperación de respaldos no restablecida/);
+  assert.match(server,/administrator\.auth_user_id/);
+  assert.match(server,/recoveryEscalation \? 'BACKUP_RECOVERY_TEST_ESCALATED'/);
+});
+
 test("la preparación productiva detecta recuperación ausente detenida fallida o atrasada",()=>{
   assert.match(server,/"backupRecovery"/);
   assert.match(server,/recoverySchedule\.last_status === "FAILED"/);
