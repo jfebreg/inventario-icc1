@@ -21,7 +21,7 @@ test("distingue bloqueos, advertencias y ambiente listo", () => {
 });
 
 test("verifica migración, RLS, auditoría y antigüedad del respaldo", () => {
-  assert.match(server, /latestMigration\.startsWith\("077_"\)/);
+  assert.match(server, /latestMigration\.startsWith\("078_"\)/);
   assert.match(server, /logistics_audit_chain_verification/);
   assert.match(server, /relation\.relrowsecurity/);
   assert.match(server, /backupAge > 7/);
@@ -49,9 +49,16 @@ test("la preparación productiva detecta una agenda de informes ausente detenida
 
 test("la preparación productiva considera la tendencia reciente de recuperación", () => {
   assert.match(server, /"backupRecoveryTrend"/);
-  assert.match(server, /readinessTrendRows\.length >= 3/);
-  assert.match(server, /readinessCompliancePercent < 80/);
-  assert.match(server, /readinessConsecutiveBreaches >= 2/);
-  assert.match(server, /readinessCompliancePercent < 95/);
+  assert.match(server, /readinessTrendRows\.length >= Number\(readinessTrendPolicy\.trend_min_samples/);
+  assert.match(server, /readinessCompliancePercent < Number\(readinessTrendPolicy\.trend_critical_percent/);
+  assert.match(server, /readinessConsecutiveBreaches >= Number\(readinessTrendPolicy\.trend_consecutive_breach_limit/);
+  assert.match(server, /readinessCompliancePercent < Number\(readinessTrendPolicy\.trend_target_percent/);
   assert.match(server, /línea base en formación/);
+});
+
+test("la preparación productiva respeta la política configurable de tendencia", () => {
+  assert.match(server, /readinessTrendPolicy/);
+  assert.match(server, /readinessTrendPolicy\.trend_min_samples/);
+  assert.match(server, /readinessTrendPolicy\.trend_critical_percent/);
+  assert.match(server, /readinessTrendPolicy\.trend_target_percent/);
 });

@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [migration,objectiveMigration,objectiveHistoryMigration,server,app]=await Promise.all([
+const [migration,objectiveMigration,objectiveHistoryMigration,trendPolicyMigration,server,app]=await Promise.all([
   readFile(new URL("../migrations/075_backup_recovery_weekly_test.sql",import.meta.url),"utf8"),
   readFile(new URL("../migrations/076_backup_recovery_objectives.sql",import.meta.url),"utf8"),
   readFile(new URL("../migrations/077_backup_recovery_objective_history.sql",import.meta.url),"utf8"),
+  readFile(new URL("../migrations/078_backup_recovery_trend_policy.sql",import.meta.url),"utf8"),
   readFile(new URL("../server.js",import.meta.url),"utf8"),
   readFile(new URL("../app.js",import.meta.url),"utf8")
 ]);
@@ -77,7 +78,7 @@ test("el administrador puede ejecutar inmediatamente la misma prueba desde Stora
 
 test("la recuperación automática mide RPO y RTO contra objetivos formales",()=>{
   assert.match(server,/objectiveResult/);
-  assert.match(server,/SELECT target_rpo_minutes,target_rto_minutes FROM logistics_backup_recovery_objectives/);
+  assert.match(server,/SELECT target_rpo_minutes,target_rto_minutes,trend_window_size,trend_min_samples/);
   assert.match(server,/targetRpoMinutes, targetRtoMinutes, measuredRpoMinutes, measuredRtoMinutes/);
   assert.match(server,/measured_rpo_minutes<=target_rpo_minutes AS rpo_compliant/);
   assert.match(server,/recoveryMetrics/);
@@ -126,7 +127,7 @@ test("cada cambio de objetivo conserva una versión inmutable y justificada",()=
 });
 
 test("el historial resume tendencia y brechas consecutivas de recuperación",()=>{
-  assert.match(server,/ORDER BY completed_at DESC LIMIT 12/);
+  assert.match(server,/ORDER BY completed_at DESC LIMIT 52/);
   assert.match(server,/compliancePercent/);
   assert.match(server,/worstRpoMinutes/);
   assert.match(server,/worstRtoMinutes/);
@@ -137,8 +138,8 @@ test("el historial resume tendencia y brechas consecutivas de recuperación",()=
 
 test("una tendencia degradada genera acción correctiva escalable y se cierra al recuperarse",()=>{
   assert.match(server,/BACKUP_RECOVERY_TREND_BREACH/);
-  assert.match(server,/trendSampleSize >= 3 && trendCompliancePercent < 95/);
-  assert.match(server,/trendCompliancePercent < 80 \|\| trendConsecutiveBreaches >= 2/);
+  assert.match(server,/trendSampleSize >= trendMinSamples && trendCompliancePercent < trendTargetPercent/);
+  assert.match(server,/trendCompliancePercent < trendCriticalPercent/);
   assert.match(server,/Mejorar tendencia de recuperación RPO\/RTO/);
   assert.match(server,/BACKUP_RECOVERY_TREND_BREACHED/);
   assert.match(server,/BACKUP_RECOVERY_TREND_RECOVERED/);
@@ -153,4 +154,16 @@ test("el historial muestra responsable prioridad y plazo de la acción de tenden
   assert.match(app,/Acción correctiva escalada/);
   assert.match(app,/Responsable:/);
   assert.match(app,/Plazo:/);
+});
+
+test("los umbrales de tendencia son configurables validados y auditados",()=>{
+  assert.match(trendPolicyMigration,/trend_window_size INTEGER NOT NULL DEFAULT 12/);
+  assert.match(trendPolicyMigration,/trend_target_percent INTEGER NOT NULL DEFAULT 95/);
+  assert.match(trendPolicyMigration,/trend_critical_percent < trend_target_percent/);
+  assert.match(server,/trendSampleSize >= trendMinSamples/);
+  assert.match(server,/trendCompliancePercent < trendTargetPercent/);
+  assert.match(server,/trendConsecutiveBreaches >= trendConsecutiveBreachLimit/);
+  assert.match(server,/La política de tendencia contiene límites incompatibles/);
+  assert.match(app,/Pruebas consideradas/);
+  assert.match(app,/Cumplimiento esperado/);
 });

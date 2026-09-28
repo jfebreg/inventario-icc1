@@ -3342,7 +3342,9 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
     [organizationId, payloadSha256]),
     pool.query(`SELECT version FROM logistics_schema_migrations WHERE version=$1 LIMIT 1`,
     [String(payload?.schemaVersion || "")]),
-    pool.query(`SELECT target_rpo_minutes,target_rto_minutes FROM logistics_backup_recovery_objectives
+    pool.query(`SELECT target_rpo_minutes,target_rto_minutes,trend_window_size,trend_min_samples,
+        trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit
+      FROM logistics_backup_recovery_objectives
       WHERE organization_id=$1 LIMIT 1`, [organizationId])
   ]);
   const manifest = manifestResult.rows[0] || null;
@@ -3369,6 +3371,11 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
   const measuredRtoMinutes = Math.max(0, Math.ceil((Date.now() - startedAt) / 60_000));
   const targetRpoMinutes = Number(objectiveResult.rows[0]?.target_rpo_minutes || 1440);
   const targetRtoMinutes = Number(objectiveResult.rows[0]?.target_rto_minutes || 240);
+  const trendWindowSize = Number(objectiveResult.rows[0]?.trend_window_size || 12);
+  const trendMinSamples = Number(objectiveResult.rows[0]?.trend_min_samples || 3);
+  const trendTargetPercent = Number(objectiveResult.rows[0]?.trend_target_percent || 95);
+  const trendCriticalPercent = Number(objectiveResult.rows[0]?.trend_critical_percent || 80);
+  const trendConsecutiveBreachLimit = Number(objectiveResult.rows[0]?.trend_consecutive_breach_limit || 2);
   const drillNumber = `DR-${new Date().toISOString().replace(/\D/g, "").slice(0, 17)}`;
   const findings = valid ? "Paquete íntegro y apto para una restauración controlada en ambiente aislado." : checks.filter(check => check.status === "FAIL").map(check => check.label).join("; ");
   const client = await pool.connect();
@@ -3448,7 +3455,8 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
     const trendRows = (await client.query(`SELECT drill_number,completed_at,
         measured_rpo_minutes<=target_rpo_minutes AND measured_rto_minutes<=target_rto_minutes AS compliant
       FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
-        AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [organizationId])).rows;
+        AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT $2`,
+    [organizationId, trendWindowSize])).rows;
     const trendSampleSize = trendRows.length;
     const trendCompliantCount = trendRows.filter(row => row.compliant).length;
     const trendCompliancePercent = trendSampleSize
@@ -3459,8 +3467,9 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
       trendConsecutiveBreaches += 1;
     }
     const trendTaskId = `backup-recovery-trend-${organizationId}`;
-    const trendHasBreach = trendSampleSize >= 3 && trendCompliancePercent < 95;
-    const trendCritical = trendCompliancePercent < 80 || trendConsecutiveBreaches >= 2;
+    const trendHasBreach = trendSampleSize >= trendMinSamples && trendCompliancePercent < trendTargetPercent;
+    const trendCritical = trendCompliancePercent < trendCriticalPercent
+      || trendConsecutiveBreaches >= trendConsecutiveBreachLimit;
     const trendDetail = `${trendCompliancePercent}% de cumplimiento en ${trendSampleSize} pruebas · ${trendConsecutiveBreaches} brecha(s) consecutiva(s)`;
     if (trendHasBreach) {
       await client.query(`INSERT INTO inventory_tasks
@@ -3475,7 +3484,8 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
       [trendTaskId, trendDetail, trendCritical ? 'Crítica' : 'Alta', actorProfile.auth_user_id || null,
         organizationId, trendCritical, asJson({ drillId: drill.id, sampleSize: trendSampleSize,
           compliantCount: trendCompliantCount, compliancePercent: trendCompliancePercent,
-          consecutiveBreaches: trendConsecutiveBreaches })]);
+          consecutiveBreaches: trendConsecutiveBreaches, trendWindowSize, trendMinSamples,
+          trendTargetPercent, trendCriticalPercent, trendConsecutiveBreachLimit })]);
       await client.query(`INSERT INTO inventory_notifications
         (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
         VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_TREND_BREACH',$3,$4,$5,
@@ -3490,7 +3500,7 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
       [organizationId, actorProfile.id, `backup-trend:${drill.id}`,
         asJson({ drillId: drill.id, sampleSize: trendSampleSize,
           compliancePercent: trendCompliancePercent, consecutiveBreaches: trendConsecutiveBreaches })]);
-    } else if (trendSampleSize >= 3) {
+    } else if (trendSampleSize >= trendMinSamples) {
       const resolvedTrend = await client.query(`UPDATE inventory_tasks SET status='Resuelta',
         resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
         WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [trendTaskId]);
@@ -3533,9 +3543,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("077_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("078_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("077_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("078_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -3618,10 +3628,16 @@ async function productionReadiness() {
       : `RPO ${recoveryObjective.measured_rpo_minutes}/${recoveryObjective.target_rpo_minutes} min · RTO ${recoveryObjective.measured_rto_minutes}/${recoveryObjective.target_rto_minutes} min.`,
     objectiveStatus === "PASS" ? "" : "Ejecutar una prueba inmediata y corregir la antigüedad o duración de la recuperación.");
 
+  const readinessTrendPolicy = (await pool.query(`SELECT trend_window_size,trend_min_samples,
+      trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit
+    FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`,
+  [logisticsOrganizationId])).rows[0] || {};
+  const readinessTrendWindow = Number(readinessTrendPolicy.trend_window_size || 12);
   const readinessTrendRows = (await pool.query(`SELECT
       measured_rpo_minutes<=target_rpo_minutes AND measured_rto_minutes<=target_rto_minutes AS compliant
     FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
-      AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [logisticsOrganizationId])).rows;
+      AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT $2`,
+  [logisticsOrganizationId, readinessTrendWindow])).rows;
   const readinessCompliant = readinessTrendRows.filter(row => row.compliant).length;
   const readinessCompliancePercent = readinessTrendRows.length
     ? Math.round((readinessCompliant / readinessTrendRows.length) * 1000) / 10 : null;
@@ -3630,10 +3646,11 @@ async function productionReadiness() {
     if (row.compliant) break;
     readinessConsecutiveBreaches += 1;
   }
-  const trendHasSample = readinessTrendRows.length >= 3;
+  const trendHasSample = readinessTrendRows.length >= Number(readinessTrendPolicy.trend_min_samples || 3);
   const recoveryTrendStatus = !trendHasSample ? "PASS"
-    : (readinessCompliancePercent < 80 || readinessConsecutiveBreaches >= 2 ? "FAIL"
-      : readinessCompliancePercent < 95 ? "WARN" : "PASS");
+    : (readinessCompliancePercent < Number(readinessTrendPolicy.trend_critical_percent || 80)
+      || readinessConsecutiveBreaches >= Number(readinessTrendPolicy.trend_consecutive_breach_limit || 2) ? "FAIL"
+      : readinessCompliancePercent < Number(readinessTrendPolicy.trend_target_percent || 95) ? "WARN" : "PASS");
   add("backupRecoveryTrend", "Tendencia de recuperación", recoveryTrendStatus,
     !readinessTrendRows.length ? "Sin pruebas históricas; se iniciará la línea base."
       : !trendHasSample ? `${readinessCompliant}/${readinessTrendRows.length} pruebas cumplen; línea base en formación.`
@@ -7005,7 +7022,8 @@ async function handleHttpRequest(req, res, requestId) {
           measured_rto_minutes<=target_rto_minutes AS rto_compliant
         FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
           AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`, [logisticsOrganizationId]),
-      pool.query(`SELECT target_rpo_minutes,target_rto_minutes,updated_at
+      pool.query(`SELECT target_rpo_minutes,target_rto_minutes,trend_window_size,trend_min_samples,
+          trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,updated_at
         FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT history.*,profile.name AS changed_by_name
         FROM logistics_backup_recovery_objective_history history
@@ -7015,7 +7033,7 @@ async function handleHttpRequest(req, res, requestId) {
           measured_rpo_minutes,measured_rto_minutes,
           measured_rpo_minutes<=target_rpo_minutes AND measured_rto_minutes<=target_rto_minutes AS compliant
         FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
-          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [logisticsOrganizationId]),
+          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 52`, [logisticsOrganizationId]),
       pool.query(`SELECT task.id,task.status,task.priority,task.detail,task.due_at,task.updated_at,
           task.payload->>'escalatedAt' AS escalated_at,profile.name AS assignee_name
         FROM inventory_tasks task
@@ -7031,7 +7049,8 @@ async function handleHttpRequest(req, res, requestId) {
     }, { DAILY: 0, MONTHLY: 0, ANNUAL: 0, REVIEW_MANUAL: 0 });
     const latest = classifiedManifests[0] || null;
     const ageHours = latest ? Math.max(0, Math.floor((Date.now() - new Date(latest.generated_at).getTime()) / 3_600_000)) : null;
-    const recoveryTrendRows = recoveryMetricTrendResult.rows;
+    const trendPolicy = recoveryObjectivePolicyResult.rows[0] || {};
+    const recoveryTrendRows = recoveryMetricTrendResult.rows.slice(0, Number(trendPolicy.trend_window_size || 12));
     const compliantRecoveries = recoveryTrendRows.filter(row => row.compliant).length;
     let consecutiveRecoveryBreaches = 0;
     for (const row of recoveryTrendRows) {
@@ -7048,6 +7067,10 @@ async function handleHttpRequest(req, res, requestId) {
       worstRtoMinutes: recoveryTrendRows.length
         ? Math.max(...recoveryTrendRows.map(row => Number(row.measured_rto_minutes || 0))) : null,
       consecutiveBreaches: consecutiveRecoveryBreaches,
+      targetPercent: Number(trendPolicy.trend_target_percent || 95),
+      minimumSamples: Number(trendPolicy.trend_min_samples || 3),
+      criticalPercent: Number(trendPolicy.trend_critical_percent || 80),
+      consecutiveBreachLimit: Number(trendPolicy.trend_consecutive_breach_limit || 2),
       results: recoveryTrendRows
     };
     return json(res, 200, { manifests: classifiedManifests.slice(0, 100), retentionPolicy: policy,
@@ -7073,6 +7096,11 @@ async function handleHttpRequest(req, res, requestId) {
       const body = await readJson(req);
       const targetRpoMinutes = Number(body.targetRpoMinutes);
       const targetRtoMinutes = Number(body.targetRtoMinutes);
+      const trendWindowSize = Number(body.trendWindowSize ?? 12);
+      const trendMinSamples = Number(body.trendMinSamples ?? 3);
+      const trendTargetPercent = Number(body.trendTargetPercent ?? 95);
+      const trendCriticalPercent = Number(body.trendCriticalPercent ?? 80);
+      const trendConsecutiveBreachLimit = Number(body.trendConsecutiveBreachLimit ?? 2);
       const reason = String(body.reason || "").trim();
       if (!Number.isInteger(targetRpoMinutes) || targetRpoMinutes < 5 || targetRpoMinutes > 10080) {
         throw new Error("El RPO debe estar entre 5 y 10.080 minutos.");
@@ -7080,22 +7108,44 @@ async function handleHttpRequest(req, res, requestId) {
       if (!Number.isInteger(targetRtoMinutes) || targetRtoMinutes < 1 || targetRtoMinutes > 1440) {
         throw new Error("El RTO debe estar entre 1 y 1.440 minutos.");
       }
+      if (!Number.isInteger(trendWindowSize) || trendWindowSize < 3 || trendWindowSize > 52
+        || !Number.isInteger(trendMinSamples) || trendMinSamples < 3 || trendMinSamples > trendWindowSize
+        || !Number.isInteger(trendTargetPercent) || trendTargetPercent < 50 || trendTargetPercent > 100
+        || !Number.isInteger(trendCriticalPercent) || trendCriticalPercent < 0
+        || trendCriticalPercent >= trendTargetPercent
+        || !Number.isInteger(trendConsecutiveBreachLimit) || trendConsecutiveBreachLimit < 1
+        || trendConsecutiveBreachLimit > trendWindowSize) {
+        throw new Error("La política de tendencia contiene límites incompatibles.");
+      }
       if (reason.length < 10) throw new Error("Indica un motivo de al menos 10 caracteres.");
       await client.query("BEGIN");
       const before = (await client.query(`SELECT * FROM logistics_backup_recovery_objectives
         WHERE organization_id=$1 FOR UPDATE`, [logisticsOrganizationId])).rows[0] || null;
       const policy = (await client.query(`INSERT INTO logistics_backup_recovery_objectives
-        (organization_id,target_rpo_minutes,target_rto_minutes,updated_by)
-        VALUES ($1,$2,$3,$4) ON CONFLICT (organization_id) DO UPDATE SET
+        (organization_id,target_rpo_minutes,target_rto_minutes,trend_window_size,trend_min_samples,
+         trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,updated_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (organization_id) DO UPDATE SET
         target_rpo_minutes=EXCLUDED.target_rpo_minutes,target_rto_minutes=EXCLUDED.target_rto_minutes,
+        trend_window_size=EXCLUDED.trend_window_size,trend_min_samples=EXCLUDED.trend_min_samples,
+        trend_target_percent=EXCLUDED.trend_target_percent,
+        trend_critical_percent=EXCLUDED.trend_critical_percent,
+        trend_consecutive_breach_limit=EXCLUDED.trend_consecutive_breach_limit,
         updated_by=EXCLUDED.updated_by,updated_at=NOW() RETURNING *`,
-      [logisticsOrganizationId, targetRpoMinutes, targetRtoMinutes, apiProfile.id])).rows[0];
+      [logisticsOrganizationId, targetRpoMinutes, targetRtoMinutes, trendWindowSize, trendMinSamples,
+        trendTargetPercent, trendCriticalPercent, trendConsecutiveBreachLimit, apiProfile.id])).rows[0];
       await client.query(`INSERT INTO logistics_backup_recovery_objective_history
         (organization_id,previous_rpo_minutes,previous_rto_minutes,target_rpo_minutes,
-         target_rto_minutes,reason,changed_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)`, [logisticsOrganizationId,
+         target_rto_minutes,previous_trend_window_size,previous_trend_min_samples,
+         previous_trend_target_percent,previous_trend_critical_percent,
+         previous_trend_consecutive_breach_limit,trend_window_size,trend_min_samples,
+         trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,reason,changed_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, [logisticsOrganizationId,
         before?.target_rpo_minutes || null, before?.target_rto_minutes || null,
-        targetRpoMinutes, targetRtoMinutes, reason, apiProfile.id]);
+        targetRpoMinutes, targetRtoMinutes, before?.trend_window_size || null,
+        before?.trend_min_samples || null, before?.trend_target_percent || null,
+        before?.trend_critical_percent || null, before?.trend_consecutive_breach_limit || null,
+        trendWindowSize, trendMinSamples, trendTargetPercent, trendCriticalPercent,
+        trendConsecutiveBreachLimit, reason, apiProfile.id]);
       await client.query(`INSERT INTO logistics_audit_events
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
         VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_UPDATED','recovery_objective',$1,$2,'WEB',$3::jsonb)`,
