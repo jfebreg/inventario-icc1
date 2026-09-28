@@ -27,3 +27,17 @@ test("el historial muestra resultado y próxima prueba de recuperación",()=>{
   assert.match(app,/Prueba semanal de recuperación/);
   assert.match(app,/recoverySchedule/);
 });
+
+test("una falla de recuperación crea una tarea crítica propia y el éxito la resuelve",()=>{
+  assert.match(server,/BACKUP_RECOVERY_TEST_FAILED/);
+  assert.match(server,/backup-recovery-\$\{job\.organization_id\}/);
+  assert.match(server,/Falló la prueba semanal de recuperación V2/);
+  assert.match(server,/jobCode: job\.job_code/);
+});
+
+test("la preparación productiva detecta recuperación ausente detenida fallida o atrasada",()=>{
+  assert.match(server,/"backupRecovery"/);
+  assert.match(server,/recoverySchedule\.last_status === "FAILED"/);
+  assert.match(server,/La prueba automática está detenida/);
+  assert.match(server,/La prueba semanal está atrasada/);
+});

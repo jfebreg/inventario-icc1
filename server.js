@@ -3108,8 +3108,10 @@ async function runDueCanonicalBackupJobs() {
           (execution_id,organization_id,scheduled_job_id,job_code,event_type,initiated_by,duration_ms,result)
           VALUES ($1,$2,$3,$4,'SUCCESS',$5,$6,$7::jsonb)`, [executionId, job.organization_id,
           job.id, job.job_code, admin.id, Date.now() - startedAt, asJson(summary)]);
+        const taskId = job.job_code === 'BACKUP_RECOVERY_WEEKLY_TEST'
+          ? `backup-recovery-${job.organization_id}` : `backup-rpo-${job.organization_id}`;
         await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
-          updated_at=NOW() WHERE id=$1 AND status<>'Resuelta'`, [`backup-rpo-${job.organization_id}`]);
+          updated_at=NOW() WHERE id=$1 AND status<>'Resuelta'`, [taskId]);
         results.push({ jobId: job.id, ok: true, ...summary });
       } catch (error) {
         const message = String(error?.message || error).slice(0, 2000);
@@ -3119,13 +3121,18 @@ async function runDueCanonicalBackupJobs() {
           (execution_id,organization_id,scheduled_job_id,job_code,event_type,duration_ms,result,error_detail)
           VALUES ($1,$2,$3,$4,'FAILED',$5,'{}'::jsonb,$6)`, [executionId, job.organization_id,
           job.id, job.job_code, Date.now() - startedAt, message]);
+        const recoveryFailure = job.job_code === 'BACKUP_RECOVERY_WEEKLY_TEST';
+        const taskId = recoveryFailure ? `backup-recovery-${job.organization_id}` : `backup-rpo-${job.organization_id}`;
+        const taskType = recoveryFailure ? 'BACKUP_RECOVERY_TEST_FAILED' : 'BACKUP_RPO_BREACH';
+        const taskTitle = recoveryFailure ? 'Falló la prueba semanal de recuperación V2' : 'Falló el respaldo automático V2';
         await pool.query(`INSERT INTO inventory_tasks
           (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,due_at,payload,updated_at)
-          VALUES ($1,'BACKUP_RPO_BREACH','Falló el respaldo automático V2',$2,'Crítica','Pendiente',
-            'Bodega Central','scheduled_job',$3,NOW()+INTERVAL '4 hours',$4::jsonb,NOW())
+          VALUES ($1,$2,$3,$4,'Crítica','Pendiente',
+            'Bodega Central','scheduled_job',$5,NOW()+INTERVAL '4 hours',$6::jsonb,NOW())
           ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,status='Pendiente',resolved_at=NULL,
-            due_at=EXCLUDED.due_at,payload=EXCLUDED.payload,updated_at=NOW()`,
-        [`backup-rpo-${job.organization_id}`, message, job.id, asJson({ executionId })]);
+            task_type=EXCLUDED.task_type,title=EXCLUDED.title,due_at=EXCLUDED.due_at,
+            payload=EXCLUDED.payload,updated_at=NOW()`,
+        [taskId, taskType, taskTitle, message, job.id, asJson({ executionId, jobCode: job.job_code })]);
         results.push({ jobId: job.id, ok: false, error: message });
       }
     }
@@ -3344,9 +3351,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("073_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("075_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("073_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("075_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -3397,6 +3404,23 @@ async function productionReadiness() {
     backupAge === null || backupAge > 7 || !backup.rows[0]?.audit_chain_valid ? "WARN" : "PASS",
     backupAge === null ? "Nunca se ha exportado." : `Último respaldo hace ${backupAge} día(s) · SHA-256 ${backup.rows[0].payload_sha256.slice(0, 12)}…`,
     "Generar y guardar un respaldo V2 fuera de Render.");
+
+  const recoverySchedule = (await pool.query(`SELECT enabled,next_run_at,last_completed_at,last_status,last_error
+    FROM logistics_scheduled_jobs WHERE organization_id=$1 AND job_code='BACKUP_RECOVERY_WEEKLY_TEST' LIMIT 1`,
+  [logisticsOrganizationId])).rows[0];
+  const recoveryOverdue = recoverySchedule?.next_run_at
+    && new Date(recoverySchedule.next_run_at).getTime() < Date.now() - 60 * 60 * 1000;
+  const recoveryNeverRun = !recoverySchedule?.last_completed_at;
+  const recoveryStatus = !recoverySchedule || !recoverySchedule.enabled || recoverySchedule.last_status === "FAILED"
+    ? "FAIL" : (recoveryOverdue || recoveryNeverRun ? "WARN" : "PASS");
+  add("backupRecovery", "Prueba semanal de recuperación", recoveryStatus,
+    !recoverySchedule ? "La agenda semanal no existe."
+      : !recoverySchedule.enabled ? "La prueba automática está detenida."
+      : recoverySchedule.last_status === "FAILED" ? `Última prueba fallida: ${recoverySchedule.last_error || "sin detalle"}.`
+      : recoveryNeverRun ? `Primera prueba pendiente · próxima ejecución ${new Date(recoverySchedule.next_run_at).toLocaleString("es-CL")}.`
+      : recoveryOverdue ? "La prueba semanal está atrasada."
+      : `Última prueba correcta ${new Date(recoverySchedule.last_completed_at).toLocaleString("es-CL")}.`,
+    recoveryStatus === "PASS" ? "" : "Revisar la agenda y ejecutar una recuperación aislada desde el historial de respaldos.");
 
   const documents = await pool.query(`SELECT COUNT(*)::int AS missing
     FROM logistics_documents WHERE status='ACTIVE' AND (sha256 IS NULL OR sha256='')`);
@@ -6734,11 +6758,13 @@ async function handleHttpRequest(req, res, requestId) {
         ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT COUNT(*)::int AS open FROM inventory_tasks task
         WHERE task.status<>'Resuelta' AND (
-          (task.task_type='BACKUP_RPO_BREACH' AND task.id=$2) OR
+          (task.task_type IN ('BACKUP_RPO_BREACH','BACKUP_RECOVERY_TEST_FAILED')
+            AND task.id IN ($2,$3)) OR
           (task.task_type='BACKUP_ARCHIVE_INTEGRITY' AND EXISTS (
             SELECT 1 FROM logistics_backup_manifests manifest
             WHERE manifest.id::text=task.entity_id::text AND manifest.organization_id=$1)))`,
-      [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`]),
+      [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`,
+        `backup-recovery-${logisticsOrganizationId}`]),
       pool.query(`SELECT * FROM logistics_backup_retention_policies WHERE organization_id=$1`,
       [logisticsOrganizationId]),
       pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result
