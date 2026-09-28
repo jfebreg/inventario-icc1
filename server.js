@@ -3325,12 +3325,15 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
   const includedDatasets = Array.isArray(payload?.includedDatasets) ? payload.includedDatasets : [];
   const body = JSON.stringify(payload);
   const payloadSha256 = createHash("sha256").update(body).digest("hex");
-  const [manifestResult, schemaResult] = await Promise.all([
+  const [manifestResult, schemaResult, objectiveResult] = await Promise.all([
     pool.query(`SELECT * FROM logistics_backup_manifests
       WHERE organization_id=$1 AND payload_sha256=$2 ORDER BY generated_at DESC LIMIT 1`,
     [organizationId, payloadSha256]),
     pool.query(`SELECT version FROM logistics_schema_migrations WHERE version=$1 LIMIT 1`,
-    [String(payload?.schemaVersion || "")])
+    [String(payload?.schemaVersion || "")]),
+    pool.query(`SELECT target_rpo_minutes,target_rto_minutes FROM logistics_recovery_drills
+      WHERE organization_id=$1 AND drill_type IN ('ISOLATED_RESTORE','TABLETOP')
+      ORDER BY created_at DESC LIMIT 1`, [organizationId])
   ]);
   const manifest = manifestResult.rows[0] || null;
   const datasetNames = Object.keys(datasets).sort();
@@ -3354,6 +3357,8 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
   const valid = checks.every(check => check.status === "PASS");
   const measuredRpoMinutes = Number.isFinite(Date.parse(payload?.generatedAt)) ? Math.max(0, Math.ceil((Date.now() - Date.parse(payload.generatedAt)) / 60_000)) : 0;
   const measuredRtoMinutes = Math.max(0, Math.ceil((Date.now() - startedAt) / 60_000));
+  const targetRpoMinutes = Number(objectiveResult.rows[0]?.target_rpo_minutes || 1440);
+  const targetRtoMinutes = Number(objectiveResult.rows[0]?.target_rto_minutes || 240);
   const drillNumber = `DR-${new Date().toISOString().replace(/\D/g, "").slice(0, 17)}`;
   const findings = valid ? "Paquete íntegro y apto para una restauración controlada en ambiente aislado." : checks.filter(check => check.status === "FAIL").map(check => check.label).join("; ");
   const client = await pool.connect();
@@ -3364,10 +3369,11 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
        target_rpo_minutes,target_rto_minutes,measured_rpo_minutes,measured_rto_minutes,
        scope,checklist,findings,corrective_actions,owner_profile_id,reviewed_by,
        planned_at,started_at,completed_at,reviewed_at)
-      VALUES ($1,$2,'EXPORT_VERIFY','production-read-only',$3,$4,1440,240,$5,$6,
-        $7,$8::jsonb,$9,$10,$11,$11,NOW(),NOW(),NOW(),NOW()) RETURNING *`,
+      VALUES ($1,$2,'EXPORT_VERIFY','production-read-only',$3,$4,$5,$6,$7,$8,
+        $9,$10::jsonb,$11,$12,$13,$13,NOW(),NOW(),NOW(),NOW()) RETURNING *`,
     [organizationId, drillNumber, valid ? "PASSED" : "FAILED", manifest?.id || null,
-      measuredRpoMinutes, measuredRtoMinutes, `Validación no destructiva del paquete SHA-256 ${payloadSha256}`,
+      targetRpoMinutes, targetRtoMinutes, measuredRpoMinutes, measuredRtoMinutes,
+      `Validación no destructiva del paquete SHA-256 ${payloadSha256}`,
       asJson(checks), findings, valid ? null : "Generar un nuevo respaldo V2 y repetir la verificación antes de cualquier recuperación.", actorProfile.id])).rows[0];
     await client.query(`INSERT INTO logistics_audit_events
       (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,
@@ -6785,7 +6791,7 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
     const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult,
-      recoveryEventResult, recoveryIncidentResult] = await Promise.all([
+      recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -6825,7 +6831,13 @@ async function handleHttpRequest(req, res, requestId) {
       pool.query(`SELECT id,status,priority,detail,due_at,updated_at,
           payload->>'escalatedAt' AS escalated_at
         FROM inventory_tasks WHERE id=$1 AND task_type='BACKUP_RECOVERY_TEST_FAILED'
-          AND status<>'Resuelta' LIMIT 1`, [`backup-recovery-${logisticsOrganizationId}`])
+          AND status<>'Resuelta' LIMIT 1`, [`backup-recovery-${logisticsOrganizationId}`]),
+      pool.query(`SELECT drill_number,status,target_rpo_minutes,target_rto_minutes,
+          measured_rpo_minutes,measured_rto_minutes,completed_at,
+          measured_rpo_minutes<=target_rpo_minutes AS rpo_compliant,
+          measured_rto_minutes<=target_rto_minutes AS rto_compliant
+        FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
+          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`, [logisticsOrganizationId])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -6842,7 +6854,8 @@ async function handleHttpRequest(req, res, requestId) {
       schedule: jobResult.rows[0] || null, lastAutomaticVerification: eventResult.rows[0] || null,
       recoverySchedule: recoveryJobResult.rows[0] || null,
       lastRecoveryTest: recoveryEventResult.rows[0] || null,
-      recoveryIncident: recoveryIncidentResult.rows[0] || null
+      recoveryIncident: recoveryIncidentResult.rows[0] || null,
+      recoveryMetrics: recoveryMetricsResult.rows[0] || null
     } });
   }
 

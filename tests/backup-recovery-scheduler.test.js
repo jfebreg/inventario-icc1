@@ -72,3 +72,13 @@ test("el administrador puede ejecutar inmediatamente la misma prueba desde Stora
   assert.match(app,/Probar recuperación ahora/);
   assert.match(app,/Probando desde Storage/);
 });
+
+test("la recuperación automática mide RPO y RTO contra objetivos formales",()=>{
+  assert.match(server,/objectiveResult/);
+  assert.match(server,/drill_type IN \('ISOLATED_RESTORE','TABLETOP'\)/);
+  assert.match(server,/targetRpoMinutes, targetRtoMinutes, measuredRpoMinutes, measuredRtoMinutes/);
+  assert.match(server,/measured_rpo_minutes<=target_rpo_minutes AS rpo_compliant/);
+  assert.match(server,/recoveryMetrics/);
+  assert.match(app,/data-recovery-metrics/);
+  assert.match(app,/Fuera de objetivo/);
+});
