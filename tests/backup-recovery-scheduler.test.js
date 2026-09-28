@@ -134,3 +134,23 @@ test("el historial resume tendencia y brechas consecutivas de recuperación",()=
   assert.match(app,/data-recovery-trend/);
   assert.match(app,/Brechas seguidas/);
 });
+
+test("una tendencia degradada genera acción correctiva escalable y se cierra al recuperarse",()=>{
+  assert.match(server,/BACKUP_RECOVERY_TREND_BREACH/);
+  assert.match(server,/trendSampleSize >= 3 && trendCompliancePercent < 95/);
+  assert.match(server,/trendCompliancePercent < 80 \|\| trendConsecutiveBreaches >= 2/);
+  assert.match(server,/Mejorar tendencia de recuperación RPO\/RTO/);
+  assert.match(server,/BACKUP_RECOVERY_TREND_BREACHED/);
+  assert.match(server,/BACKUP_RECOVERY_TREND_RECOVERED/);
+  assert.match(server,/BACKUP_RECOVERY_TREND_ESCALATED/);
+  assert.match(server,/backup-recovery-trend-\$\{organizationId\}/);
+});
+
+test("el historial muestra responsable prioridad y plazo de la acción de tendencia",()=>{
+  assert.match(server,/recoveryTrendAction/);
+  assert.match(server,/profile\.name AS assignee_name/);
+  assert.match(app,/data-recovery-trend-action/);
+  assert.match(app,/Acción correctiva escalada/);
+  assert.match(app,/Responsable:/);
+  assert.match(app,/Plazo:/);
+});

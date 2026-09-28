@@ -6956,7 +6956,7 @@ async function handleHttpRequest(req, res, requestId) {
     }
     const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult,
       recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult, recoveryObjectivePolicyResult,
-      recoveryObjectiveHistoryResult, recoveryMetricTrendResult] = await Promise.all([
+      recoveryObjectiveHistoryResult, recoveryMetricTrendResult, recoveryTrendActionResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -7015,7 +7015,13 @@ async function handleHttpRequest(req, res, requestId) {
           measured_rpo_minutes,measured_rto_minutes,
           measured_rpo_minutes<=target_rpo_minutes AND measured_rto_minutes<=target_rto_minutes AS compliant
         FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
-          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [logisticsOrganizationId])
+          AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 12`, [logisticsOrganizationId]),
+      pool.query(`SELECT task.id,task.status,task.priority,task.detail,task.due_at,task.updated_at,
+          task.payload->>'escalatedAt' AS escalated_at,profile.name AS assignee_name
+        FROM inventory_tasks task
+        LEFT JOIN inventory_user_profiles profile ON profile.auth_user_id=task.assignee_auth_user_id
+        WHERE task.id=$1 AND task.task_type='BACKUP_RECOVERY_TREND_BREACH'
+          AND task.status<>'Resuelta' LIMIT 1`, [`backup-recovery-trend-${logisticsOrganizationId}`])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -7055,6 +7061,7 @@ async function handleHttpRequest(req, res, requestId) {
       recoveryMetrics: recoveryMetricsResult.rows[0] || null,
       recoveryObjectivePolicy: recoveryObjectivePolicyResult.rows[0] || null,
       recoveryObjectiveHistory: recoveryObjectiveHistoryResult.rows,
+      recoveryTrendAction: recoveryTrendActionResult.rows[0] || null,
       recoveryTrend
     } });
   }
