@@ -2952,7 +2952,8 @@ async function createCanonicalBackup(actorProfile, organizationId = logisticsOrg
       outboxSloPolicies: "logistics_outbox_slo_policies",
       backupRetentionPolicies: "logistics_backup_retention_policies",
       backupRetentionReviews: "logistics_backup_retention_reviews",
-      backupRecoveryObjectives: "logistics_backup_recovery_objectives"
+      backupRecoveryObjectives: "logistics_backup_recovery_objectives",
+      backupRecoveryObjectiveHistory: "logistics_backup_recovery_objective_history"
     };
     for (const [name, table] of Object.entries(directTables)) {
       const organizationPredicate = table === "logistics_organizations" ? "id=$1" : "organization_id=$1";
@@ -3461,9 +3462,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("076_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("077_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("076_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("077_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -6861,7 +6862,8 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
     const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult,
-      recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult, recoveryObjectivePolicyResult] = await Promise.all([
+      recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult, recoveryObjectivePolicyResult,
+      recoveryObjectiveHistoryResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -6910,7 +6912,11 @@ async function handleHttpRequest(req, res, requestId) {
         FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
           AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT target_rpo_minutes,target_rto_minutes,updated_at
-        FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`, [logisticsOrganizationId])
+        FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`, [logisticsOrganizationId]),
+      pool.query(`SELECT history.*,profile.name AS changed_by_name
+        FROM logistics_backup_recovery_objective_history history
+        LEFT JOIN inventory_user_profiles profile ON profile.id=history.changed_by
+        WHERE history.organization_id=$1 ORDER BY history.changed_at DESC LIMIT 20`, [logisticsOrganizationId])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -6929,35 +6935,52 @@ async function handleHttpRequest(req, res, requestId) {
       lastRecoveryTest: recoveryEventResult.rows[0] || null,
       recoveryIncident: recoveryIncidentResult.rows[0] || null,
       recoveryMetrics: recoveryMetricsResult.rows[0] || null,
-      recoveryObjectivePolicy: recoveryObjectivePolicyResult.rows[0] || null
+      recoveryObjectivePolicy: recoveryObjectivePolicyResult.rows[0] || null,
+      recoveryObjectiveHistory: recoveryObjectiveHistoryResult.rows
     } });
   }
 
   if (url.pathname === "/api/admin/canonical-backups/recovery-objective" && req.method === "PATCH") {
     if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede configurar RPO y RTO." });
+    const client = await pool.connect();
     try {
       const body = await readJson(req);
       const targetRpoMinutes = Number(body.targetRpoMinutes);
       const targetRtoMinutes = Number(body.targetRtoMinutes);
+      const reason = String(body.reason || "").trim();
       if (!Number.isInteger(targetRpoMinutes) || targetRpoMinutes < 5 || targetRpoMinutes > 10080) {
         throw new Error("El RPO debe estar entre 5 y 10.080 minutos.");
       }
       if (!Number.isInteger(targetRtoMinutes) || targetRtoMinutes < 1 || targetRtoMinutes > 1440) {
         throw new Error("El RTO debe estar entre 1 y 1.440 minutos.");
       }
-      const policy = (await pool.query(`INSERT INTO logistics_backup_recovery_objectives
+      if (reason.length < 10) throw new Error("Indica un motivo de al menos 10 caracteres.");
+      await client.query("BEGIN");
+      const before = (await client.query(`SELECT * FROM logistics_backup_recovery_objectives
+        WHERE organization_id=$1 FOR UPDATE`, [logisticsOrganizationId])).rows[0] || null;
+      const policy = (await client.query(`INSERT INTO logistics_backup_recovery_objectives
         (organization_id,target_rpo_minutes,target_rto_minutes,updated_by)
         VALUES ($1,$2,$3,$4) ON CONFLICT (organization_id) DO UPDATE SET
         target_rpo_minutes=EXCLUDED.target_rpo_minutes,target_rto_minutes=EXCLUDED.target_rto_minutes,
         updated_by=EXCLUDED.updated_by,updated_at=NOW() RETURNING *`,
       [logisticsOrganizationId, targetRpoMinutes, targetRtoMinutes, apiProfile.id])).rows[0];
-      await pool.query(`INSERT INTO logistics_audit_events
+      await client.query(`INSERT INTO logistics_backup_recovery_objective_history
+        (organization_id,previous_rpo_minutes,previous_rto_minutes,target_rpo_minutes,
+         target_rto_minutes,reason,changed_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)`, [logisticsOrganizationId,
+        before?.target_rpo_minutes || null, before?.target_rto_minutes || null,
+        targetRpoMinutes, targetRtoMinutes, reason, apiProfile.id]);
+      await client.query(`INSERT INTO logistics_audit_events
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
         VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_UPDATED','recovery_objective',$1,$2,'WEB',$3::jsonb)`,
-      [logisticsOrganizationId, apiProfile.id, asJson(policy)]);
+      [logisticsOrganizationId, apiProfile.id, asJson({ before, after: policy, reason })]);
+      await client.query("COMMIT");
       return json(res, 200, { policy });
     } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
       return json(res, 400, { error: error.message || "No se pudo guardar el objetivo de recuperación." });
+    } finally {
+      client.release();
     }
   }
 

@@ -2,9 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [migration,objectiveMigration,server,app]=await Promise.all([
+const [migration,objectiveMigration,objectiveHistoryMigration,server,app]=await Promise.all([
   readFile(new URL("../migrations/075_backup_recovery_weekly_test.sql",import.meta.url),"utf8"),
   readFile(new URL("../migrations/076_backup_recovery_objectives.sql",import.meta.url),"utf8"),
+  readFile(new URL("../migrations/077_backup_recovery_objective_history.sql",import.meta.url),"utf8"),
   readFile(new URL("../server.js",import.meta.url),"utf8"),
   readFile(new URL("../app.js",import.meta.url),"utf8")
 ]);
@@ -111,4 +112,15 @@ test("la organización configura objetivos RPO y RTO explícitos",()=>{
   assert.match(server,/logistics_backup_recovery_objectives/);
   assert.match(app,/Configurar objetivo/);
   assert.match(app,/backupRecoveryObjectiveForm/);
+});
+
+test("cada cambio de objetivo conserva una versión inmutable y justificada",()=>{
+  assert.match(objectiveHistoryMigration,/logistics_backup_recovery_objective_history/);
+  assert.match(objectiveHistoryMigration,/BEFORE UPDATE OR DELETE/);
+  assert.match(objectiveHistoryMigration,/previous_rpo_minutes/);
+  assert.match(server,/SELECT \* FROM logistics_backup_recovery_objectives[\s\S]*FOR UPDATE/);
+  assert.match(server,/reason\.length < 10/);
+  assert.match(server,/recoveryObjectiveHistory/);
+  assert.match(app,/Historial de objetivos RPO\/RTO/);
+  assert.match(app,/Motivo del cambio/);
 });
