@@ -26,6 +26,10 @@ test("el historial muestra resultado y próxima prueba de recuperación",()=>{
   assert.match(server,/lastRecoveryTest/);
   assert.match(app,/Prueba semanal de recuperación/);
   assert.match(app,/recoverySchedule/);
+  assert.match(server,/recoveryIncident/);
+  assert.match(app,/Incidente escalado/);
+  assert.match(app,/Incidente abierto/);
+  assert.match(app,/Requiere atención del administrador central/);
 });
 
 test("una falla de recuperación crea una tarea crítica propia y el éxito la resuelve",()=>{
@@ -57,4 +61,14 @@ test("la preparación productiva detecta recuperación ausente detenida fallida 
   assert.match(server,/recoverySchedule\.last_status === "FAILED"/);
   assert.match(server,/La prueba automática está detenida/);
   assert.match(server,/La prueba semanal está atrasada/);
+});
+
+test("el administrador puede ejecutar inmediatamente la misma prueba desde Storage",()=>{
+  assert.match(server,/\/api\/admin\/canonical-backups\/recovery-test/);
+  assert.match(server,/BACKUP_RECOVERY_TEST_REQUESTED/);
+  assert.match(server,/UPDATE logistics_scheduled_jobs SET next_run_at=NOW\(\)/);
+  assert.match(server,/await runDueCanonicalBackupJobs\(\)/);
+  assert.match(app,/data-run-backup-recovery/);
+  assert.match(app,/Probar recuperación ahora/);
+  assert.match(app,/Probando desde Storage/);
 });

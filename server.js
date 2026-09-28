@@ -6784,7 +6784,8 @@ async function handleHttpRequest(req, res, requestId) {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
     }
-    const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult, recoveryEventResult] = await Promise.all([
+    const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult,
+      recoveryEventResult, recoveryIncidentResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -6820,7 +6821,11 @@ async function handleHttpRequest(req, res, requestId) {
       [logisticsOrganizationId]),
       pool.query(`SELECT occurred_at,duration_ms,result,error_detail,event_type
         FROM logistics_scheduled_job_events WHERE organization_id=$1 AND job_code='BACKUP_RECOVERY_WEEKLY_TEST'
-          AND event_type IN ('SUCCESS','FAILED') ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId])
+          AND event_type IN ('SUCCESS','FAILED') ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId]),
+      pool.query(`SELECT id,status,priority,detail,due_at,updated_at,
+          payload->>'escalatedAt' AS escalated_at
+        FROM inventory_tasks WHERE id=$1 AND task_type='BACKUP_RECOVERY_TEST_FAILED'
+          AND status<>'Resuelta' LIMIT 1`, [`backup-recovery-${logisticsOrganizationId}`])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -6836,7 +6841,8 @@ async function handleHttpRequest(req, res, requestId) {
       ageHours, targetHours: 24, openAlerts: Number(alertsResult.rows[0]?.open || 0),
       schedule: jobResult.rows[0] || null, lastAutomaticVerification: eventResult.rows[0] || null,
       recoverySchedule: recoveryJobResult.rows[0] || null,
-      lastRecoveryTest: recoveryEventResult.rows[0] || null
+      lastRecoveryTest: recoveryEventResult.rows[0] || null,
+      recoveryIncident: recoveryIncidentResult.rows[0] || null
     } });
   }
 
@@ -6946,6 +6952,31 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, await productionReadiness());
     } catch (error) {
       return json(res, 503, { error: error.message || "No se pudo completar el diagnóstico productivo." });
+    }
+  }
+
+  if (url.pathname === "/api/admin/canonical-backups/recovery-test" && req.method === "POST") {
+    if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede ejecutar la recuperación aislada." });
+    if (!storageConfigured()) return json(res, 503, { error: "Supabase Storage no está configurado." });
+    try {
+      const job = (await pool.query(`SELECT id,enabled FROM logistics_scheduled_jobs
+        WHERE organization_id=$1 AND job_code='BACKUP_RECOVERY_WEEKLY_TEST' LIMIT 1`,
+      [logisticsOrganizationId])).rows[0];
+      if (!job) return json(res, 409, { error: "La agenda semanal de recuperación todavía no existe." });
+      if (!job.enabled) return json(res, 409, { error: "La agenda semanal de recuperación está detenida." });
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+        VALUES ($1,'BACKUP_RECOVERY_TEST_REQUESTED','scheduled_job',$2,$3,'WEB',$4::jsonb)`,
+      [logisticsOrganizationId, job.id, apiProfile.id, asJson({ requestedAt: new Date().toISOString() })]);
+      await pool.query(`UPDATE logistics_scheduled_jobs SET next_run_at=NOW(),updated_at=NOW() WHERE id=$1`, [job.id]);
+      const execution = await runDueCanonicalBackupJobs();
+      if (execution.skipped) return json(res, 409, { error: "La automatización está ocupada. Intenta nuevamente en unos segundos." });
+      const result = execution.results?.find(item => String(item.jobId) === String(job.id));
+      if (!result) return json(res, 409, { error: "La prueba quedó programada y será ejecutada por el siguiente barrido." });
+      if (!result.ok) return json(res, 502, { error: result.error || "La recuperación aislada detectó un problema.", result });
+      return json(res, 200, { ok: true, result });
+    } catch (error) {
+      return json(res, error.status || 500, { error: error.message || "No se pudo ejecutar la recuperación aislada." });
     }
   }
 
