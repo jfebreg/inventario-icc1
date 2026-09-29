@@ -7137,6 +7137,7 @@ async function handleHttpRequest(req, res, requestId) {
   if (url.pathname === "/api/admin/canonical-backups/recovery-objective" && req.method === "PATCH") {
     if (!apiProfile?.admin) return json(res, 403, { error: "Sólo el administrador puede configurar RPO y RTO." });
     const client = await pool.connect();
+    let conflictEvidence = null;
     try {
       const body = await readJson(req);
       const targetRpoMinutes = Number(body.targetRpoMinutes);
@@ -7146,6 +7147,7 @@ async function handleHttpRequest(req, res, requestId) {
       const trendTargetPercent = Number(body.trendTargetPercent ?? 95);
       const trendCriticalPercent = Number(body.trendCriticalPercent ?? 80);
       const trendConsecutiveBreachLimit = Number(body.trendConsecutiveBreachLimit ?? 2);
+      const expectedPolicyUpdatedAt = String(body.policyUpdatedAt || "").trim();
       const reason = String(body.reason || "").trim();
       if (!Number.isInteger(targetRpoMinutes) || targetRpoMinutes < 5 || targetRpoMinutes > 10080) {
         throw new Error("El RPO debe estar entre 5 y 10.080 minutos.");
@@ -7166,6 +7168,14 @@ async function handleHttpRequest(req, res, requestId) {
       await client.query("BEGIN");
       const before = (await client.query(`SELECT * FROM logistics_backup_recovery_objectives
         WHERE organization_id=$1 FOR UPDATE`, [logisticsOrganizationId])).rows[0] || null;
+      if (before && expectedPolicyUpdatedAt
+        && new Date(before.updated_at).getTime() !== new Date(expectedPolicyUpdatedAt).getTime()) {
+        conflictEvidence = { expectedPolicyUpdatedAt,
+          currentPolicyUpdatedAt: new Date(before.updated_at).toISOString() };
+        const conflict = new Error("La política cambió mientras estaba abierta. Recarga los datos antes de guardar.");
+        conflict.statusCode = 409;
+        throw conflict;
+      }
       const policy = (await client.query(`INSERT INTO logistics_backup_recovery_objectives
         (organization_id,target_rpo_minutes,target_rto_minutes,trend_window_size,trend_min_samples,
          trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,updated_by)
@@ -7199,7 +7209,14 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 200, { policy });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
-      return json(res, 400, { error: error.message || "No se pudo guardar el objetivo de recuperación." });
+      if (conflictEvidence) {
+        await pool.query(`INSERT INTO logistics_audit_events
+          (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+          VALUES ($1,'BACKUP_RECOVERY_POLICY_UPDATE_CONFLICT','recovery_objective',$1,$2,'WEB',$3::jsonb)`,
+        [logisticsOrganizationId, apiProfile.id, asJson(conflictEvidence)]).catch(() => {});
+      }
+      return json(res, error.statusCode || 400,
+        { error: error.message || "No se pudo guardar el objetivo de recuperación." });
     } finally {
       client.release();
     }

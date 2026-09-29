@@ -193,3 +193,13 @@ test("el historial de política se exporta como evidencia verificable",()=>{
   assert.match(app,/data-export-recovery-policy/);
   assert.match(app,/Evidencia exportada · SHA-256/);
 });
+
+test("la actualización evita sobrescribir una política modificada por otro administrador",()=>{
+  assert.match(server,/expectedPolicyUpdatedAt/);
+  assert.match(server,/SELECT \* FROM logistics_backup_recovery_objectives[\s\S]*FOR UPDATE/);
+  assert.match(server,/La política cambió mientras estaba abierta/);
+  assert.match(server,/conflict\.statusCode = 409/);
+  assert.match(server,/BACKUP_RECOVERY_POLICY_UPDATE_CONFLICT/);
+  assert.match(app,/form\.dataset\.policyUpdatedAt=updatedAt/);
+  assert.match(app,/policyUpdatedAt:e\.target\.dataset\.policyUpdatedAt/);
+});
