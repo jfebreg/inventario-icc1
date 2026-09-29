@@ -217,3 +217,12 @@ test("la política vencida genera revisión anual y se cierra al ratificarla",()
   assert.match(app,/Revisión anual:/);
   assert.match(app,/Vigente hasta/);
 });
+
+test("la revisión anual vencida afecta salud se escala y bloquea preparación",()=>{
+  assert.match(server,/OR task_type='BACKUP_RECOVERY_POLICY_REVIEW'/);
+  assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW_ESCALATED/);
+  assert.match(server,/Escalamiento: revisión anual de recuperación vencida/);
+  assert.match(server,/"backupRecoveryPolicyReview"/);
+  assert.match(server,/policyReviewDaysOverdue > 30 \? "FAIL"/);
+  assert.match(server,/backup-recovery-policy-review-\$\{logisticsOrganizationId\}/);
+});

@@ -2731,7 +2731,8 @@ async function escalateOverdueSchedulerFailures() {
       priority='Crítica',updated_at=NOW()
     WHERE (task_type='SCHEDULER_FAILURE' OR task_type='BACKUP_RECOVERY_TEST_FAILED'
       OR task_type='BACKUP_RECOVERY_OBJECTIVE_BREACH'
-      OR task_type='BACKUP_RECOVERY_TREND_BREACH')
+      OR task_type='BACKUP_RECOVERY_TREND_BREACH'
+      OR task_type='BACKUP_RECOVERY_POLICY_REVIEW')
       AND status<>'Resuelta' AND due_at<=NOW()
       AND COALESCE(payload->>'escalatedAt','')=''
     RETURNING id,task_type,title,detail,entity_id,payload`)).rows;
@@ -2742,13 +2743,16 @@ async function escalateOverdueSchedulerFailures() {
     const recoveryEscalation = task.task_type === 'BACKUP_RECOVERY_TEST_FAILED';
     const objectiveEscalation = task.task_type === 'BACKUP_RECOVERY_OBJECTIVE_BREACH';
     const trendEscalation = task.task_type === 'BACKUP_RECOVERY_TREND_BREACH';
+    const policyReviewEscalation = task.task_type === 'BACKUP_RECOVERY_POLICY_REVIEW';
     const notificationType = recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
       : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED'
-        : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED' : 'SCHEDULER_ESCALATION';
+        : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED'
+          : policyReviewEscalation ? 'BACKUP_RECOVERY_POLICY_REVIEW_ESCALATED' : 'SCHEDULER_ESCALATION';
     const title = recoveryEscalation ? 'Escalamiento: recuperación de respaldos no restablecida'
       : objectiveEscalation ? 'Escalamiento: objetivo RPO/RTO aún incumplido'
         : trendEscalation ? 'Escalamiento: tendencia de recuperación aún degradada'
-          : `Plazo vencido: ${task.title}`;
+          : policyReviewEscalation ? 'Escalamiento: revisión anual de recuperación vencida'
+            : `Plazo vencido: ${task.title}`;
     await pool.query(`INSERT INTO inventory_notifications
       (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
       VALUES ($1,$2,'Bodega Central',$3,$4,$5,'critical',
@@ -2761,7 +2765,8 @@ async function escalateOverdueSchedulerFailures() {
       VALUES ($1,$2,'scheduled_job',$3,$4,'SYSTEM',$5::jsonb)`,
     [logisticsOrganizationId, recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
       : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED'
-        : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',
+        : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED'
+          : policyReviewEscalation ? 'BACKUP_RECOVERY_POLICY_REVIEW_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',
       task.entity_id, administrator.id || null,
       asJson({ taskId: task.id, escalatedAt: task.payload?.escalatedAt, detail: task.detail })]);
   }
@@ -3690,7 +3695,7 @@ async function productionReadiness() {
     objectiveStatus === "PASS" ? "" : "Ejecutar una prueba inmediata y corregir la antigüedad o duración de la recuperación.");
 
   const readinessTrendPolicy = (await pool.query(`SELECT trend_window_size,trend_min_samples,
-      trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit
+      trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,updated_at
     FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`,
   [logisticsOrganizationId])).rows[0] || {};
   const readinessTrendWindow = Number(readinessTrendPolicy.trend_window_size || 12);
@@ -3717,6 +3722,18 @@ async function productionReadiness() {
       : !trendHasSample ? `${readinessCompliant}/${readinessTrendRows.length} pruebas cumplen; línea base en formación.`
       : `${readinessCompliancePercent}% de cumplimiento en ${readinessTrendRows.length} pruebas · ${readinessConsecutiveBreaches} brecha(s) consecutiva(s).`,
     recoveryTrendStatus === "PASS" ? "" : "Revisar causas recurrentes y ejecutar acciones correctivas antes del paso a producción.");
+
+  const policyReviewDueAt = readinessTrendPolicy.updated_at
+    ? new Date(new Date(readinessTrendPolicy.updated_at).getTime() + 365 * 86400000) : null;
+  const policyReviewDaysOverdue = policyReviewDueAt
+    ? Math.max(0, Math.floor((Date.now() - policyReviewDueAt.getTime()) / 86400000)) : null;
+  const policyReviewStatus = !policyReviewDueAt ? "FAIL"
+    : policyReviewDaysOverdue > 30 ? "FAIL" : policyReviewDaysOverdue > 0 ? "WARN" : "PASS";
+  add("backupRecoveryPolicyReview", "Revisión anual de recuperación", policyReviewStatus,
+    !policyReviewDueAt ? "La política no tiene una fecha de vigencia verificable."
+      : policyReviewDaysOverdue > 0 ? `Revisión vencida hace ${policyReviewDaysOverdue} día(s).`
+        : `Vigente hasta ${policyReviewDueAt.toLocaleDateString("es-CL")}.`,
+    policyReviewStatus === "PASS" ? "" : "Revisar y guardar nuevamente la política con un fundamento actualizado.");
 
   const documents = await pool.query(`SELECT COUNT(*)::int AS missing
     FROM logistics_documents WHERE status='ACTIVE' AND (sha256 IS NULL OR sha256='')`);
@@ -7101,15 +7118,16 @@ async function handleHttpRequest(req, res, requestId) {
         ORDER BY occurred_at DESC LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT COUNT(*)::int AS open FROM inventory_tasks task
         WHERE task.status<>'Resuelta' AND (
-          (task.task_type IN ('BACKUP_RPO_BREACH','BACKUP_RECOVERY_TEST_FAILED','BACKUP_RECOVERY_OBJECTIVE_BREACH','BACKUP_RECOVERY_TREND_BREACH')
-            AND task.id IN ($2,$3,$4,$5)) OR
+          (task.task_type IN ('BACKUP_RPO_BREACH','BACKUP_RECOVERY_TEST_FAILED','BACKUP_RECOVERY_OBJECTIVE_BREACH','BACKUP_RECOVERY_TREND_BREACH','BACKUP_RECOVERY_POLICY_REVIEW')
+            AND task.id IN ($2,$3,$4,$5,$6)) OR
           (task.task_type='BACKUP_ARCHIVE_INTEGRITY' AND EXISTS (
             SELECT 1 FROM logistics_backup_manifests manifest
             WHERE manifest.id::text=task.entity_id::text AND manifest.organization_id=$1)))`,
       [logisticsOrganizationId, `backup-rpo-${logisticsOrganizationId}`,
         `backup-recovery-${logisticsOrganizationId}`,
         `backup-recovery-objective-${logisticsOrganizationId}`,
-        `backup-recovery-trend-${logisticsOrganizationId}`]),
+        `backup-recovery-trend-${logisticsOrganizationId}`,
+        `backup-recovery-policy-review-${logisticsOrganizationId}`]),
       pool.query(`SELECT * FROM logistics_backup_retention_policies WHERE organization_id=$1`,
       [logisticsOrganizationId]),
       pool.query(`SELECT enabled,next_run_at,last_started_at,last_completed_at,last_status,last_error,last_result

@@ -8,7 +8,7 @@ const app = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 test("el diagnóstico cubre dependencias críticas de producción", () => {
   assert.match(server, /async function productionReadiness/);
   for (const check of ["database", "migrations", "auth", "storage", "audit",
-    "backup", "backupRecovery", "backupRecoveryObjective", "backupRecoveryTrend", "documents", "rls", "criticalTasks", "openai", "scheduler", "evidenceAutomation", "inspectionReportAutomation", "inspectionReportSlo", "outbox", "outboxWebhook", "cutover", "accessReview"]) {
+    "backup", "backupRecovery", "backupRecoveryObjective", "backupRecoveryTrend", "backupRecoveryPolicyReview", "documents", "rls", "criticalTasks", "openai", "scheduler", "evidenceAutomation", "inspectionReportAutomation", "inspectionReportSlo", "outbox", "outboxWebhook", "cutover", "accessReview"]) {
     assert.match(server, new RegExp(`"${check}"`));
   }
 });
