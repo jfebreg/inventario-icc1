@@ -209,14 +209,30 @@ test("la política vencida genera revisión anual y se cierra al ratificarla",()
   assert.match(server,/async function reviewBackupRecoveryPolicyValidity/);
   assert.match(server,/updated_at\+\(review_interval_days\*INTERVAL '1 day'\) AS review_due_at/);
   assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW/);
-  assert.match(server,/Revisar política anual de recuperación/);
+  assert.match(server,/Revisar política periódica de recuperación/);
   assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW_DUE/);
   assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEWED/);
-  assert.match(server,/NOW\(\)\+INTERVAL '30 days'/);
+  assert.match(server,/\$5::timestamptz\+INTERVAL '30 days'/);
   assert.match(server,/backupRecoveryPolicyReview = await reviewBackupRecoveryPolicyValidity/);
   assert.match(app,/data-recovery-policy-review/);
   assert.match(app,/Revisión periódica:/);
   assert.match(app,/Vigente hasta/);
+  assert.match(server,/review_interval_days,updated_at/);
+  assert.match(server,/recoveryPolicyReviewAction/);
+  assert.match(server,/task_type='BACKUP_RECOVERY_POLICY_REVIEW'/);
+  assert.match(server,/task\.payload->>'reviewDueAt' AS review_due_at/);
+  assert.match(app,/data-recovery-policy-review-action/);
+  assert.match(app,/Responsable:/);
+  assert.match(app,/Fecha de revisión:/);
+  assert.match(app,/Plazo de escalamiento:/);
+});
+
+test("la revisión avisa treinta días antes y vuelve a notificar al vencer",()=>{
+  assert.match(server,/const dueSoon = reviewDueAtMs <= Date\.now\(\) \+ 30 \* 86400000/);
+  assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW_UPCOMING/);
+  assert.match(server,/overdueNotifiedAt/);
+  assert.match(server,/notification-\$\{taskId\}-overdue/);
+  assert.match(server,/status: overdue \? "OVERDUE" : "UPCOMING"/);
 });
 
 test("la periodicidad de revisión es configurable y se conserva como evidencia",()=>{

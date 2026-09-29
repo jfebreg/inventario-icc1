@@ -2867,36 +2867,64 @@ async function reviewBackupRecoveryPolicyValidity() {
   [logisticsOrganizationId])).rows[0];
   if (!policy) return { status: "MISSING" };
   const taskId = `backup-recovery-policy-review-${logisticsOrganizationId}`;
-  const overdue = new Date(policy.review_due_at).getTime() <= Date.now();
+  const reviewDueAtMs = new Date(policy.review_due_at).getTime();
+  const overdue = reviewDueAtMs <= Date.now();
+  const dueSoon = reviewDueAtMs <= Date.now() + 30 * 86400000;
   const administrator = (await pool.query(`SELECT id,auth_user_id FROM inventory_user_profiles
     WHERE admin=TRUE AND active=TRUE ORDER BY (LOWER(email)='jfebreg@msn.com') DESC,
     activated_at NULLS LAST,created_at LIMIT 1`)).rows[0] || {};
-  if (overdue) {
-    const detail = `La política RPO/RTO y tendencia requiere ratificación anual. Última actualización: ${new Date(policy.updated_at).toISOString()}.`;
+  if (dueSoon) {
+    const detail = `La política RPO/RTO y tendencia requiere revisión antes del ${new Date(policy.review_due_at).toISOString()}. Última actualización: ${new Date(policy.updated_at).toISOString()}.`;
     const inserted = await pool.query(`INSERT INTO inventory_tasks
       (id,task_type,title,detail,priority,status,center_name,assignee_auth_user_id,
        entity_type,entity_id,due_at,payload,updated_at)
-      VALUES ($1,'BACKUP_RECOVERY_POLICY_REVIEW','Revisar política anual de recuperación',$2,
-        'Alta','Pendiente','Bodega Central',$3,'recovery_policy',$4,NOW()+INTERVAL '30 days',$5::jsonb,NOW())
+      VALUES ($1,'BACKUP_RECOVERY_POLICY_REVIEW','Revisar política periódica de recuperación',$2,
+        'Alta','Pendiente','Bodega Central',$3,'recovery_policy',$4,$5::timestamptz+INTERVAL '30 days',$6::jsonb,NOW())
       ON CONFLICT (id) DO NOTHING RETURNING id`,
-    [taskId, detail, administrator.auth_user_id || null, logisticsOrganizationId,
+    [taskId, detail, administrator.auth_user_id || null, logisticsOrganizationId, policy.review_due_at,
       asJson({ policyUpdatedAt: policy.updated_at, reviewDueAt: policy.review_due_at,
         reviewIntervalDays: policy.review_interval_days })]);
     if (inserted.rowCount) {
       await pool.query(`INSERT INTO inventory_notifications
         (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
-        VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_POLICY_REVIEW_DUE',$3,$4,'warning',
-          'recovery_policy',$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`,
+        VALUES ($1,$2,'Bodega Central',$3,$4,$5,$6,
+          'recovery_policy',$7,$8::jsonb) ON CONFLICT (id) DO NOTHING`,
       [`notification-${taskId}`, administrator.auth_user_id || null,
-        'Revisión anual de recuperación pendiente', detail, logisticsOrganizationId,
+        overdue ? 'BACKUP_RECOVERY_POLICY_REVIEW_DUE' : 'BACKUP_RECOVERY_POLICY_REVIEW_UPCOMING',
+        overdue ? 'Revisión de recuperación vencida' : 'Próxima revisión de recuperación',
+        detail, overdue ? 'warning' : 'info', logisticsOrganizationId,
         asJson({ taskId, reviewDueAt: policy.review_due_at })]);
       await pool.query(`INSERT INTO logistics_audit_events
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
-        VALUES ($1,'BACKUP_RECOVERY_POLICY_REVIEW_DUE','recovery_policy',$1,$2,'SYSTEM',$3::jsonb)`,
-      [logisticsOrganizationId, administrator.id || null,
+        VALUES ($1,$2,'recovery_policy',$1,$3,'SYSTEM',$4::jsonb)`,
+      [logisticsOrganizationId,
+        overdue ? 'BACKUP_RECOVERY_POLICY_REVIEW_DUE' : 'BACKUP_RECOVERY_POLICY_REVIEW_UPCOMING',
+        administrator.id || null,
         asJson({ taskId, policyUpdatedAt: policy.updated_at, reviewDueAt: policy.review_due_at })]);
     }
-    return { status: "OVERDUE", created: Boolean(inserted.rowCount), reviewDueAt: policy.review_due_at };
+    if (!inserted.rowCount && overdue) {
+      const overdueTransition = await pool.query(`UPDATE inventory_tasks SET
+          payload=jsonb_set(COALESCE(payload,'{}'::jsonb),'{overdueNotifiedAt}',to_jsonb(NOW()),TRUE),
+          updated_at=NOW()
+        WHERE id=$1 AND status<>'Resuelta' AND COALESCE(payload->>'overdueNotifiedAt','')=''
+        RETURNING id`, [taskId]);
+      if (overdueTransition.rowCount) {
+        await pool.query(`INSERT INTO inventory_notifications
+          (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+          VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_POLICY_REVIEW_DUE',$3,$4,'warning',
+            'recovery_policy',$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`,
+        [`notification-${taskId}-overdue`, administrator.auth_user_id || null,
+          'Revisión de recuperación vencida', detail, logisticsOrganizationId,
+          asJson({ taskId, reviewDueAt: policy.review_due_at })]);
+        await pool.query(`INSERT INTO logistics_audit_events
+          (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+          VALUES ($1,'BACKUP_RECOVERY_POLICY_REVIEW_DUE','recovery_policy',$1,$2,'SYSTEM',$3::jsonb)`,
+        [logisticsOrganizationId, administrator.id || null,
+          asJson({ taskId, policyUpdatedAt: policy.updated_at, reviewDueAt: policy.review_due_at })]);
+      }
+    }
+    return { status: overdue ? "OVERDUE" : "UPCOMING", created: Boolean(inserted.rowCount),
+      reviewDueAt: policy.review_due_at };
   }
   const resolved = await pool.query(`UPDATE inventory_tasks SET status='Resuelta',
       resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
@@ -7101,7 +7129,8 @@ async function handleHttpRequest(req, res, requestId) {
     }
     const [result, jobResult, eventResult, alertsResult, policyResult, recoveryJobResult,
       recoveryEventResult, recoveryIncidentResult, recoveryMetricsResult, recoveryObjectivePolicyResult,
-      recoveryObjectiveHistoryResult, recoveryMetricTrendResult, recoveryTrendActionResult] = await Promise.all([
+      recoveryObjectiveHistoryResult, recoveryMetricTrendResult, recoveryTrendActionResult,
+      recoveryPolicyReviewActionResult] = await Promise.all([
       pool.query(`SELECT manifest.*,
           review.id AS retention_review_id,
           review.decision AS retention_decision,
@@ -7152,7 +7181,8 @@ async function handleHttpRequest(req, res, requestId) {
         FROM logistics_recovery_drills WHERE organization_id=$1 AND drill_type='EXPORT_VERIFY'
           AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT target_rpo_minutes,target_rto_minutes,trend_window_size,trend_min_samples,
-          trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,updated_at
+          trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,
+          review_interval_days,updated_at
         FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`, [logisticsOrganizationId]),
       pool.query(`SELECT history.*,profile.name AS changed_by_name
         FROM logistics_backup_recovery_objective_history history
@@ -7168,7 +7198,15 @@ async function handleHttpRequest(req, res, requestId) {
         FROM inventory_tasks task
         LEFT JOIN inventory_user_profiles profile ON profile.auth_user_id=task.assignee_auth_user_id
         WHERE task.id=$1 AND task.task_type='BACKUP_RECOVERY_TREND_BREACH'
-          AND task.status<>'Resuelta' LIMIT 1`, [`backup-recovery-trend-${logisticsOrganizationId}`])
+          AND task.status<>'Resuelta' LIMIT 1`, [`backup-recovery-trend-${logisticsOrganizationId}`]),
+      pool.query(`SELECT task.id,task.status,task.priority,task.detail,task.due_at,task.updated_at,
+          task.payload->>'escalatedAt' AS escalated_at,
+          task.payload->>'reviewDueAt' AS review_due_at,
+          profile.name AS assignee_name
+        FROM inventory_tasks task
+        LEFT JOIN inventory_user_profiles profile ON profile.auth_user_id=task.assignee_auth_user_id
+        WHERE task.id=$1 AND task.task_type='BACKUP_RECOVERY_POLICY_REVIEW'
+          AND task.status<>'Resuelta' LIMIT 1`, [`backup-recovery-policy-review-${logisticsOrganizationId}`])
     ]);
     const policy = policyResult.rows[0] || null;
     const classifiedManifests = classifyBackupRetention(result.rows, policy || {});
@@ -7214,6 +7252,7 @@ async function handleHttpRequest(req, res, requestId) {
       recoveryObjectivePolicy: recoveryObjectivePolicyResult.rows[0] || null,
       recoveryObjectiveHistory: recoveryObjectiveHistoryResult.rows,
       recoveryTrendAction: recoveryTrendActionResult.rows[0] || null,
+      recoveryPolicyReviewAction: recoveryPolicyReviewActionResult.rows[0] || null,
       recoveryTrend
     } });
   }
