@@ -175,3 +175,21 @@ test("el historial presenta la política de tendencia anterior y nueva",()=>{
   assert.match(app,/Cada versión conserva RPO, RTO, umbrales de tendencia/);
   assert.match(app,/Nueva política/);
 });
+
+test("el historial reutiliza una sola consulta durante cada apertura",()=>{
+  assert.match(app,/let canonicalBackupsPayloadPromise=null/);
+  assert.match(app,/function canonicalBackupsPayload\(refresh=false\)/);
+  assert.match(app,/canonicalBackupsPayloadPromise=null;await canonicalManifestsModalWithRecoveryTrend/);
+  assert.match(app,/payload=await canonicalBackupsPayload\(\),health=payload\.backupHealth/);
+  assert.match(app,/payload=await canonicalBackupsPayload\(\),action=payload\.backupHealth/);
+});
+
+test("el historial de política se exporta como evidencia verificable",()=>{
+  assert.match(server,/recovery-objective\/history\.csv/);
+  assert.match(server,/BACKUP_RECOVERY_POLICY_HISTORY_EXPORTED/);
+  assert.match(server,/Politica_Recuperacion_/);
+  assert.match(server,/X-Content-SHA256/);
+  assert.match(server,/\^\[=\+\\-@\]/);
+  assert.match(app,/data-export-recovery-policy/);
+  assert.match(app,/Evidencia exportada · SHA-256/);
+});

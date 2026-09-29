@@ -6967,6 +6967,51 @@ async function handleHttpRequest(req, res, requestId) {
     return json(res, 200, { versions: versions.rows });
   }
 
+  if (url.pathname === "/api/admin/canonical-backups/recovery-objective/history.csv" && req.method === "GET") {
+    if (!apiProfile?.admin) {
+      return json(res, 403, { error: "Sólo el administrador puede exportar la política de recuperación." });
+    }
+    try {
+      const rows = (await pool.query(`SELECT history.*,profile.name AS changed_by_name
+        FROM logistics_backup_recovery_objective_history history
+        LEFT JOIN inventory_user_profiles profile ON profile.id=history.changed_by
+        WHERE history.organization_id=$1 ORDER BY history.changed_at DESC`,
+      [logisticsOrganizationId])).rows;
+      const csvCell = value => {
+        let text = String(value ?? "");
+        if (/^[=+\-@]/.test(text)) text = `'${text}`;
+        return `"${text.replaceAll('"', '""')}"`;
+      };
+      const csvRows = [["fecha", "responsable", "motivo", "rpo_anterior_min", "rto_anterior_min",
+        "ventana_anterior", "muestra_anterior", "meta_anterior_pct", "critico_anterior_pct",
+        "brechas_anteriores", "rpo_nuevo_min", "rto_nuevo_min", "ventana_nueva", "muestra_nueva",
+        "meta_nueva_pct", "critico_nuevo_pct", "brechas_nuevas"]];
+      rows.forEach(row => csvRows.push([new Date(row.changed_at).toISOString(),
+        row.changed_by_name || "Migración del sistema", row.reason,
+        row.previous_rpo_minutes, row.previous_rto_minutes, row.previous_trend_window_size,
+        row.previous_trend_min_samples, row.previous_trend_target_percent,
+        row.previous_trend_critical_percent, row.previous_trend_consecutive_breach_limit,
+        row.target_rpo_minutes, row.target_rto_minutes, row.trend_window_size,
+        row.trend_min_samples, row.trend_target_percent, row.trend_critical_percent,
+        row.trend_consecutive_breach_limit]));
+      const body = Buffer.from(`\uFEFF${csvRows.map(row => row.map(csvCell).join(';')).join('\r\n')}\r\n`, "utf8");
+      const sha256 = createHash("sha256").update(body).digest("hex");
+      const exportId = `recovery-policy-export-${Date.now()}`;
+      await pool.query(`INSERT INTO logistics_audit_events
+        (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+        VALUES ($1,'BACKUP_RECOVERY_POLICY_HISTORY_EXPORTED','recovery_policy_export',$2,$3,$2,'WEB',$4::jsonb)`,
+      [logisticsOrganizationId, exportId, apiProfile.id, asJson({ count: rows.length, sha256 })]);
+      const date = new Date().toISOString().slice(0, 10);
+      res.writeHead(200, { "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="Politica_Recuperacion_${date}.csv"`,
+        "Content-Length": String(body.length), "X-Content-SHA256": sha256,
+        "Cache-Control": "no-store" });
+      return res.end(body);
+    } catch (error) {
+      return json(res, 400, { error: error.message || "No se pudo exportar la política de recuperación." });
+    }
+  }
+
   if (url.pathname === "/api/admin/canonical-backups" && req.method === "GET") {
     if (!apiProfile?.admin) {
       return json(res, 403, { error: "Sólo el administrador puede consultar respaldos V2." });
