@@ -2861,8 +2861,8 @@ async function evaluateInspectionReportAutomationSlo() {
 }
 
 async function reviewBackupRecoveryPolicyValidity() {
-  const policy = (await pool.query(`SELECT organization_id,updated_at,
-      updated_at+INTERVAL '365 days' AS review_due_at
+  const policy = (await pool.query(`SELECT organization_id,updated_at,review_interval_days,
+      updated_at+(review_interval_days*INTERVAL '1 day') AS review_due_at
     FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`,
   [logisticsOrganizationId])).rows[0];
   if (!policy) return { status: "MISSING" };
@@ -2880,7 +2880,8 @@ async function reviewBackupRecoveryPolicyValidity() {
         'Alta','Pendiente','Bodega Central',$3,'recovery_policy',$4,NOW()+INTERVAL '30 days',$5::jsonb,NOW())
       ON CONFLICT (id) DO NOTHING RETURNING id`,
     [taskId, detail, administrator.auth_user_id || null, logisticsOrganizationId,
-      asJson({ policyUpdatedAt: policy.updated_at, reviewDueAt: policy.review_due_at, reviewIntervalDays: 365 })]);
+      asJson({ policyUpdatedAt: policy.updated_at, reviewDueAt: policy.review_due_at,
+        reviewIntervalDays: policy.review_interval_days })]);
     if (inserted.rowCount) {
       await pool.query(`INSERT INTO inventory_notifications
         (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
@@ -3609,9 +3610,9 @@ async function productionReadiness() {
   const migrations = await pool.query(`SELECT version,applied_at FROM logistics_schema_migrations
     ORDER BY version DESC`);
   const latestMigration = migrations.rows[0]?.version || "";
-  add("migrations", "Migraciones del modelo", latestMigration.startsWith("078_") ? "PASS" : "FAIL",
+  add("migrations", "Migraciones del modelo", latestMigration.startsWith("079_") ? "PASS" : "FAIL",
     `${migrations.rowCount} aplicadas · última: ${latestMigration || "ninguna"}.`,
-    latestMigration.startsWith("078_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
+    latestMigration.startsWith("079_") ? "" : "Publicar la versión más reciente y revisar los logs de Render.");
 
   const settings = await authSettings();
   add("auth", "Autenticación Supabase", authConfigured() && settings.migration_complete ? "PASS" : "FAIL",
@@ -3695,7 +3696,8 @@ async function productionReadiness() {
     objectiveStatus === "PASS" ? "" : "Ejecutar una prueba inmediata y corregir la antigüedad o duración de la recuperación.");
 
   const readinessTrendPolicy = (await pool.query(`SELECT trend_window_size,trend_min_samples,
-      trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,updated_at
+      trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,
+      review_interval_days,updated_at
     FROM logistics_backup_recovery_objectives WHERE organization_id=$1 LIMIT 1`,
   [logisticsOrganizationId])).rows[0] || {};
   const readinessTrendWindow = Number(readinessTrendPolicy.trend_window_size || 12);
@@ -3724,7 +3726,8 @@ async function productionReadiness() {
     recoveryTrendStatus === "PASS" ? "" : "Revisar causas recurrentes y ejecutar acciones correctivas antes del paso a producción.");
 
   const policyReviewDueAt = readinessTrendPolicy.updated_at
-    ? new Date(new Date(readinessTrendPolicy.updated_at).getTime() + 365 * 86400000) : null;
+    ? new Date(new Date(readinessTrendPolicy.updated_at).getTime()
+      + Number(readinessTrendPolicy.review_interval_days || 365) * 86400000) : null;
   const policyReviewDaysOverdue = policyReviewDueAt
     ? Math.max(0, Math.floor((Date.now() - policyReviewDueAt.getTime()) / 86400000)) : null;
   const policyReviewStatus = !policyReviewDueAt ? "FAIL"
@@ -7063,7 +7066,8 @@ async function handleHttpRequest(req, res, requestId) {
       const csvRows = [["fecha", "responsable", "motivo", "rpo_anterior_min", "rto_anterior_min",
         "ventana_anterior", "muestra_anterior", "meta_anterior_pct", "critico_anterior_pct",
         "brechas_anteriores", "rpo_nuevo_min", "rto_nuevo_min", "ventana_nueva", "muestra_nueva",
-        "meta_nueva_pct", "critico_nuevo_pct", "brechas_nuevas"]];
+        "meta_nueva_pct", "critico_nuevo_pct", "brechas_nuevas",
+        "revision_anterior_dias", "revision_nueva_dias"]];
       rows.forEach(row => csvRows.push([new Date(row.changed_at).toISOString(),
         row.changed_by_name || "Migración del sistema", row.reason,
         row.previous_rpo_minutes, row.previous_rto_minutes, row.previous_trend_window_size,
@@ -7071,7 +7075,8 @@ async function handleHttpRequest(req, res, requestId) {
         row.previous_trend_critical_percent, row.previous_trend_consecutive_breach_limit,
         row.target_rpo_minutes, row.target_rto_minutes, row.trend_window_size,
         row.trend_min_samples, row.trend_target_percent, row.trend_critical_percent,
-        row.trend_consecutive_breach_limit]));
+        row.trend_consecutive_breach_limit, row.previous_review_interval_days,
+        row.review_interval_days]));
       const body = Buffer.from(`\uFEFF${csvRows.map(row => row.map(csvCell).join(';')).join('\r\n')}\r\n`, "utf8");
       const sha256 = createHash("sha256").update(body).digest("hex");
       const exportId = `recovery-policy-export-${Date.now()}`;
@@ -7226,6 +7231,7 @@ async function handleHttpRequest(req, res, requestId) {
       const trendTargetPercent = Number(body.trendTargetPercent ?? 95);
       const trendCriticalPercent = Number(body.trendCriticalPercent ?? 80);
       const trendConsecutiveBreachLimit = Number(body.trendConsecutiveBreachLimit ?? 2);
+      const reviewIntervalDays = Number(body.reviewIntervalDays ?? 365);
       const expectedPolicyUpdatedAt = String(body.policyUpdatedAt || "").trim();
       const reason = String(body.reason || "").trim();
       if (!Number.isInteger(targetRpoMinutes) || targetRpoMinutes < 5 || targetRpoMinutes > 10080) {
@@ -7243,6 +7249,9 @@ async function handleHttpRequest(req, res, requestId) {
         || trendConsecutiveBreachLimit > trendWindowSize) {
         throw new Error("La política de tendencia contiene límites incompatibles.");
       }
+      if (!Number.isInteger(reviewIntervalDays) || reviewIntervalDays < 30 || reviewIntervalDays > 730) {
+        throw new Error("La revisión periódica debe estar entre 30 y 730 días.");
+      }
       if (reason.length < 10) throw new Error("Indica un motivo de al menos 10 caracteres.");
       await client.query("BEGIN");
       const before = (await client.query(`SELECT * FROM logistics_backup_recovery_objectives
@@ -7257,29 +7266,34 @@ async function handleHttpRequest(req, res, requestId) {
       }
       const policy = (await client.query(`INSERT INTO logistics_backup_recovery_objectives
         (organization_id,target_rpo_minutes,target_rto_minutes,trend_window_size,trend_min_samples,
-         trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (organization_id) DO UPDATE SET
+         trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,
+         review_interval_days,updated_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (organization_id) DO UPDATE SET
         target_rpo_minutes=EXCLUDED.target_rpo_minutes,target_rto_minutes=EXCLUDED.target_rto_minutes,
         trend_window_size=EXCLUDED.trend_window_size,trend_min_samples=EXCLUDED.trend_min_samples,
         trend_target_percent=EXCLUDED.trend_target_percent,
         trend_critical_percent=EXCLUDED.trend_critical_percent,
         trend_consecutive_breach_limit=EXCLUDED.trend_consecutive_breach_limit,
+        review_interval_days=EXCLUDED.review_interval_days,
         updated_by=EXCLUDED.updated_by,updated_at=NOW() RETURNING *`,
       [logisticsOrganizationId, targetRpoMinutes, targetRtoMinutes, trendWindowSize, trendMinSamples,
-        trendTargetPercent, trendCriticalPercent, trendConsecutiveBreachLimit, apiProfile.id])).rows[0];
+        trendTargetPercent, trendCriticalPercent, trendConsecutiveBreachLimit,
+        reviewIntervalDays, apiProfile.id])).rows[0];
       await client.query(`INSERT INTO logistics_backup_recovery_objective_history
         (organization_id,previous_rpo_minutes,previous_rto_minutes,target_rpo_minutes,
          target_rto_minutes,previous_trend_window_size,previous_trend_min_samples,
          previous_trend_target_percent,previous_trend_critical_percent,
          previous_trend_consecutive_breach_limit,trend_window_size,trend_min_samples,
-         trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,reason,changed_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, [logisticsOrganizationId,
+         trend_target_percent,trend_critical_percent,trend_consecutive_breach_limit,
+         previous_review_interval_days,review_interval_days,reason,changed_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, [logisticsOrganizationId,
         before?.target_rpo_minutes || null, before?.target_rto_minutes || null,
         targetRpoMinutes, targetRtoMinutes, before?.trend_window_size || null,
         before?.trend_min_samples || null, before?.trend_target_percent || null,
         before?.trend_critical_percent || null, before?.trend_consecutive_breach_limit || null,
         trendWindowSize, trendMinSamples, trendTargetPercent, trendCriticalPercent,
-        trendConsecutiveBreachLimit, reason, apiProfile.id]);
+        trendConsecutiveBreachLimit, before?.review_interval_days || null,
+        reviewIntervalDays, reason, apiProfile.id]);
       await client.query(`INSERT INTO logistics_audit_events
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
         VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_UPDATED','recovery_objective',$1,$2,'WEB',$3::jsonb)`,

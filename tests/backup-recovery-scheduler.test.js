@@ -2,11 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [migration,objectiveMigration,objectiveHistoryMigration,trendPolicyMigration,server,app]=await Promise.all([
+const [migration,objectiveMigration,objectiveHistoryMigration,trendPolicyMigration,reviewIntervalMigration,server,app]=await Promise.all([
   readFile(new URL("../migrations/075_backup_recovery_weekly_test.sql",import.meta.url),"utf8"),
   readFile(new URL("../migrations/076_backup_recovery_objectives.sql",import.meta.url),"utf8"),
   readFile(new URL("../migrations/077_backup_recovery_objective_history.sql",import.meta.url),"utf8"),
   readFile(new URL("../migrations/078_backup_recovery_trend_policy.sql",import.meta.url),"utf8"),
+  readFile(new URL("../migrations/079_backup_recovery_review_interval.sql",import.meta.url),"utf8"),
   readFile(new URL("../server.js",import.meta.url),"utf8"),
   readFile(new URL("../app.js",import.meta.url),"utf8")
 ]);
@@ -206,7 +207,7 @@ test("la actualización evita sobrescribir una política modificada por otro adm
 
 test("la política vencida genera revisión anual y se cierra al ratificarla",()=>{
   assert.match(server,/async function reviewBackupRecoveryPolicyValidity/);
-  assert.match(server,/updated_at\+INTERVAL '365 days' AS review_due_at/);
+  assert.match(server,/updated_at\+\(review_interval_days\*INTERVAL '1 day'\) AS review_due_at/);
   assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW/);
   assert.match(server,/Revisar política anual de recuperación/);
   assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW_DUE/);
@@ -214,8 +215,18 @@ test("la política vencida genera revisión anual y se cierra al ratificarla",()
   assert.match(server,/NOW\(\)\+INTERVAL '30 days'/);
   assert.match(server,/backupRecoveryPolicyReview = await reviewBackupRecoveryPolicyValidity/);
   assert.match(app,/data-recovery-policy-review/);
-  assert.match(app,/Revisión anual:/);
+  assert.match(app,/Revisión periódica:/);
   assert.match(app,/Vigente hasta/);
+});
+
+test("la periodicidad de revisión es configurable y se conserva como evidencia",()=>{
+  assert.match(reviewIntervalMigration,/review_interval_days INTEGER NOT NULL DEFAULT 365/);
+  assert.match(reviewIntervalMigration,/BETWEEN 30 AND 730/);
+  assert.match(server,/reviewIntervalDays = Number/);
+  assert.match(server,/La revisión periódica debe estar entre 30 y 730 días/);
+  assert.match(server,/previous_review_interval_days,review_interval_days/);
+  assert.match(app,/name="reviewIntervalDays"/);
+  assert.match(app,/cada \$\{interval\} días/);
 });
 
 test("la revisión anual vencida afecta salud se escala y bloquea preparación",()=>{
