@@ -203,3 +203,17 @@ test("la actualización evita sobrescribir una política modificada por otro adm
   assert.match(app,/form\.dataset\.policyUpdatedAt=updatedAt/);
   assert.match(app,/policyUpdatedAt:e\.target\.dataset\.policyUpdatedAt/);
 });
+
+test("la política vencida genera revisión anual y se cierra al ratificarla",()=>{
+  assert.match(server,/async function reviewBackupRecoveryPolicyValidity/);
+  assert.match(server,/updated_at\+INTERVAL '365 days' AS review_due_at/);
+  assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW/);
+  assert.match(server,/Revisar política anual de recuperación/);
+  assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEW_DUE/);
+  assert.match(server,/BACKUP_RECOVERY_POLICY_REVIEWED/);
+  assert.match(server,/NOW\(\)\+INTERVAL '30 days'/);
+  assert.match(server,/backupRecoveryPolicyReview = await reviewBackupRecoveryPolicyValidity/);
+  assert.match(app,/data-recovery-policy-review/);
+  assert.match(app,/Revisión anual:/);
+  assert.match(app,/Vigente hasta/);
+});
