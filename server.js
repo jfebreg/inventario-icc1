@@ -2880,7 +2880,13 @@ async function reviewBackupRecoveryPolicyValidity() {
        entity_type,entity_id,due_at,payload,updated_at)
       VALUES ($1,'BACKUP_RECOVERY_POLICY_REVIEW','Revisar política periódica de recuperación',$2,
         'Alta','Pendiente','Bodega Central',$3,'recovery_policy',$4,$5::timestamptz+INTERVAL '30 days',$6::jsonb,NOW())
-      ON CONFLICT (id) DO NOTHING RETURNING id`,
+      ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,priority=EXCLUDED.priority,
+        status='Pendiente',assignee_auth_user_id=EXCLUDED.assignee_auth_user_id,
+        due_at=EXCLUDED.due_at,payload=EXCLUDED.payload,resolved_at=NULL,updated_at=NOW()
+      WHERE inventory_tasks.task_type='BACKUP_RECOVERY_POLICY_REVIEW'
+        AND inventory_tasks.status='Resuelta'
+        AND inventory_tasks.payload->>'policyUpdatedAt' IS DISTINCT FROM EXCLUDED.payload->>'policyUpdatedAt'
+      RETURNING id`,
     [taskId, detail, administrator.auth_user_id || null, logisticsOrganizationId, policy.review_due_at,
       asJson({ policyUpdatedAt: policy.updated_at, reviewDueAt: policy.review_due_at,
         reviewIntervalDays: policy.review_interval_days })]);
@@ -2889,7 +2895,7 @@ async function reviewBackupRecoveryPolicyValidity() {
         (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
         VALUES ($1,$2,'Bodega Central',$3,$4,$5,$6,
           'recovery_policy',$7,$8::jsonb) ON CONFLICT (id) DO NOTHING`,
-      [`notification-${taskId}`, administrator.auth_user_id || null,
+      [`notification-${taskId}-${new Date(policy.updated_at).getTime()}`, administrator.auth_user_id || null,
         overdue ? 'BACKUP_RECOVERY_POLICY_REVIEW_DUE' : 'BACKUP_RECOVERY_POLICY_REVIEW_UPCOMING',
         overdue ? 'Revisión de recuperación vencida' : 'Próxima revisión de recuperación',
         detail, overdue ? 'warning' : 'info', logisticsOrganizationId,
@@ -2913,7 +2919,7 @@ async function reviewBackupRecoveryPolicyValidity() {
           (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
           VALUES ($1,$2,'Bodega Central','BACKUP_RECOVERY_POLICY_REVIEW_DUE',$3,$4,'warning',
             'recovery_policy',$5,$6::jsonb) ON CONFLICT (id) DO NOTHING`,
-        [`notification-${taskId}-overdue`, administrator.auth_user_id || null,
+        [`notification-${taskId}-overdue-${new Date(policy.updated_at).getTime()}`, administrator.auth_user_id || null,
           'Revisión de recuperación vencida', detail, logisticsOrganizationId,
           asJson({ taskId, reviewDueAt: policy.review_due_at })]);
         await pool.query(`INSERT INTO logistics_audit_events
@@ -7337,8 +7343,23 @@ async function handleHttpRequest(req, res, requestId) {
         (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
         VALUES ($1,'BACKUP_RECOVERY_OBJECTIVE_UPDATED','recovery_objective',$1,$2,'WEB',$3::jsonb)`,
       [logisticsOrganizationId, apiProfile.id, asJson({ before, after: policy, reason })]);
+      const reviewTaskId = `backup-recovery-policy-review-${logisticsOrganizationId}`;
+      const resolvedReview = await client.query(`UPDATE inventory_tasks
+        SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
+        WHERE id=$1 AND task_type='BACKUP_RECOVERY_POLICY_REVIEW'
+          AND status<>'Resuelta' RETURNING id`, [reviewTaskId]);
+      if (resolvedReview.rowCount) {
+        await client.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
+          WHERE entity_type='recovery_policy' AND entity_id=$1 AND read_at IS NULL`,
+        [logisticsOrganizationId]);
+        await client.query(`INSERT INTO logistics_audit_events
+          (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
+          VALUES ($1,'BACKUP_RECOVERY_POLICY_REVIEWED','recovery_policy',$1,$2,'WEB',$3::jsonb)`,
+        [logisticsOrganizationId, apiProfile.id,
+          asJson({ taskId: reviewTaskId, policyUpdatedAt: policy.updated_at, reason })]);
+      }
       await client.query("COMMIT");
-      return json(res, 200, { policy });
+      return json(res, 200, { policy, reviewResolved: Boolean(resolvedReview.rowCount) });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       if (conflictEvidence) {

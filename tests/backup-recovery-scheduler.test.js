@@ -12,6 +12,24 @@ const [migration,objectiveMigration,objectiveHistoryMigration,trendPolicyMigrati
   readFile(new URL("../app.js",import.meta.url),"utf8")
 ]);
 
+test("ratificar cierra la tarea y sus alertas antes de confirmar la política",()=>{
+  const route=server.slice(server.indexOf('if (url.pathname === "/api/admin/canonical-backups/recovery-objective" && req.method === "PATCH")'));
+  const close=route.indexOf("const resolvedReview = await client.query");
+  const commit=route.indexOf('await client.query("COMMIT")');
+  assert.ok(close>0 && close<commit);
+  assert.match(route.slice(close,commit),/UPDATE inventory_notifications/);
+  assert.match(route.slice(close,commit),/BACKUP_RECOVERY_POLICY_REVIEWED/);
+  assert.match(route,/reviewResolved: Boolean\(resolvedReview.rowCount\)/);
+});
+
+test("una nueva versión permite reabrir la revisión sin duplicar alertas del ciclo previo",()=>{
+  const review=server.slice(server.indexOf("async function reviewBackupRecoveryPolicyValidity()"),server.indexOf("async function sweepScheduledLogisticsJobs()"));
+  assert.match(review,/inventory_tasks.status='Resuelta'/);
+  assert.match(review,/policyUpdatedAt' IS DISTINCT FROM EXCLUDED.payload->>'policyUpdatedAt'/);
+  assert.match(review,/payload=EXCLUDED.payload,resolved_at=NULL/);
+  assert.match(review,/notification-\$\{taskId\}-\$\{new Date\(policy.updated_at\).getTime\(\)\}/);
+});
+
 test("la agenda semanal prueba el respaldo archivado más reciente",()=>{
   assert.match(migration,/BACKUP_RECOVERY_WEEKLY_TEST/);
   assert.match(migration,/period_days,next_run_at/);
