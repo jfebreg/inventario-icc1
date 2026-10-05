@@ -15,6 +15,7 @@ test("la recuperación atiende avisos de escalamiento sólo de su propia tarea",
   assert.match(captured.sql,/read_at IS NULL/);
   assert.match(captured.sql,/severity IN \('warning','critical'\)/);
   assert.match(captured.sql,/BACKUP_RECOVERY_TEST_ESCALATED/);
+  assert.match(captured.sql,/BACKUP_RPO_ESCALATED/);
   assert.match(captured.sql,/BACKUP_RECOVERY_POLICY_REVIEW_ESCALATED/);
   assert.doesNotMatch(captured.sql,/RECOVERED|REVIEWED/);
   assert.equal(result.rowCount,2);

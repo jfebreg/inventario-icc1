@@ -2731,6 +2731,7 @@ async function escalateOverdueSchedulerFailures() {
       payload=jsonb_set(COALESCE(payload,'{}'::jsonb),'{escalatedAt}',to_jsonb(NOW()),TRUE),
       priority='Crítica',updated_at=NOW()
     WHERE (task_type='SCHEDULER_FAILURE' OR task_type='BACKUP_RECOVERY_TEST_FAILED'
+      OR task_type='BACKUP_RPO_BREACH'
       OR task_type='BACKUP_RECOVERY_OBJECTIVE_BREACH'
       OR task_type='BACKUP_RECOVERY_TREND_BREACH'
       OR task_type='BACKUP_RECOVERY_POLICY_REVIEW')
@@ -2742,14 +2743,17 @@ async function escalateOverdueSchedulerFailures() {
     activated_at NULLS LAST,created_at LIMIT 1`)).rows[0] || {} : {};
   for (const task of escalated) {
     const recoveryEscalation = task.task_type === 'BACKUP_RECOVERY_TEST_FAILED';
+    const dailyBackupEscalation = task.task_type === 'BACKUP_RPO_BREACH';
     const objectiveEscalation = task.task_type === 'BACKUP_RECOVERY_OBJECTIVE_BREACH';
     const trendEscalation = task.task_type === 'BACKUP_RECOVERY_TREND_BREACH';
     const policyReviewEscalation = task.task_type === 'BACKUP_RECOVERY_POLICY_REVIEW';
     const notificationType = recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
+      : dailyBackupEscalation ? 'BACKUP_RPO_ESCALATED'
       : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED'
         : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED'
           : policyReviewEscalation ? 'BACKUP_RECOVERY_POLICY_REVIEW_ESCALATED' : 'SCHEDULER_ESCALATION';
     const title = recoveryEscalation ? 'Escalamiento: recuperación de respaldos no restablecida'
+      : dailyBackupEscalation ? 'Escalamiento: respaldo diario no restablecido'
       : objectiveEscalation ? 'Escalamiento: objetivo RPO/RTO aún incumplido'
         : trendEscalation ? 'Escalamiento: tendencia de recuperación aún degradada'
           : policyReviewEscalation ? 'Escalamiento: revisión anual de recuperación vencida'
@@ -2765,6 +2769,7 @@ async function escalateOverdueSchedulerFailures() {
       (organization_id,event_type,entity_type,entity_id,actor_profile_id,source,after_data)
       VALUES ($1,$2,'scheduled_job',$3,$4,'SYSTEM',$5::jsonb)`,
     [logisticsOrganizationId, recoveryEscalation ? 'BACKUP_RECOVERY_TEST_ESCALATED'
+      : dailyBackupEscalation ? 'BACKUP_RPO_ESCALATED'
       : objectiveEscalation ? 'BACKUP_RECOVERY_OBJECTIVE_ESCALATED'
         : trendEscalation ? 'BACKUP_RECOVERY_TREND_ESCALATED'
           : policyReviewEscalation ? 'BACKUP_RECOVERY_POLICY_REVIEW_ESCALATED' : 'SCHEDULER_FAILURE_ESCALATED',

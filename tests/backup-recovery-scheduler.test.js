@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
 
 const [migration,objectiveMigration,objectiveHistoryMigration,trendPolicyMigration,reviewIntervalMigration,server,app]=await Promise.all([
   readFile(new URL("../migrations/075_backup_recovery_weekly_test.sql",import.meta.url),"utf8"),
@@ -11,6 +12,34 @@ const [migration,objectiveMigration,objectiveHistoryMigration,trendPolicyMigrati
   readFile(new URL("../server.js",import.meta.url),"utf8"),
   readFile(new URL("../app.js",import.meta.url),"utf8")
 ]);
+
+test("el escalamiento diario notifica y audita una sola transición",async()=>{
+  const source=server.slice(server.indexOf("async function escalateOverdueSchedulerFailures()"),server.indexOf("async function evaluateInspectionReportAutomationSlo()"));
+  const calls=[];
+  let claimed=false;
+  const pool={query:async(sql,params)=>{
+    calls.push({sql,params});
+    if(sql.includes("UPDATE inventory_tasks")){
+      assert.match(sql,/task_type='BACKUP_RPO_BREACH'/);
+      assert.match(sql,/due_at<=NOW\(\)/);
+      assert.match(sql,/COALESCE\(payload->>'escalatedAt',''\)=''/);
+      if(claimed)return {rows:[]};
+      claimed=true;
+      return {rows:[{id:"backup-rpo-org",task_type:"BACKUP_RPO_BREACH",entity_id:"job",detail:"Falla",payload:{escalatedAt:"2026-10-05"}}]};
+    }
+    if(sql.includes("SELECT id,auth_user_id"))return {rows:[{id:"admin",auth_user_id:"auth-admin"}]};
+    return {rows:[]};
+  }};
+  const escalate=runInNewContext(`${source}; escalateOverdueSchedulerFailures`,{pool,logisticsOrganizationId:"org",asJson:JSON.stringify});
+  assert.equal((await escalate()).length,1);
+  assert.equal((await escalate()).length,0);
+  const notifications=calls.filter(x=>x.sql.includes("INSERT INTO inventory_notifications"));
+  const audit=calls.filter(x=>x.sql.includes("INSERT INTO logistics_audit_events"));
+  assert.equal(notifications.length,1);
+  assert.equal(audit.length,1);
+  assert.equal(notifications[0].params[2],"BACKUP_RPO_ESCALATED");
+  assert.equal(audit[0].params[1],"BACKUP_RPO_ESCALATED");
+});
 
 test("ratificar cierra la tarea y sus alertas antes de confirmar la política",()=>{
   const route=server.slice(server.indexOf('if (url.pathname === "/api/admin/canonical-backups/recovery-objective" && req.method === "PATCH")'));
