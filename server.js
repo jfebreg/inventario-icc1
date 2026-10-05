@@ -1,4 +1,5 @@
 import http from "node:http";
+import { backupTaskResolutionError } from "./lib/backup-task-resolution.js";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -4787,6 +4788,8 @@ async function handleHttpRequest(req, res, requestId) {
       WHERE id=$1 AND ($2::boolean OR assignee_auth_user_id=$3 OR center_name=$4)`,
     [id, Boolean(apiProfile.admin), apiProfile.auth_user_id, apiProfile.cost_center]);
     if (!taskType.rows[0]) return json(res, 404, { error: "Tarea no encontrada o sin permiso." });
+    const backupResolutionError = backupTaskResolutionError(taskType.rows[0].task_type, body.status);
+    if (backupResolutionError) return json(res, 400, { error: backupResolutionError });
     if ((taskType.rows[0].task_type === "CYCLE_COUNT_REVIEW"
         || taskType.rows[0].task_type === "INSPECTION_EVIDENCE"
         || taskType.rows[0].task_type === "INSPECTION_REPORT_ARCHIVE"
