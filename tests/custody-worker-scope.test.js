@@ -8,6 +8,7 @@ function fixture(worker){
   const client={release(){released=true},async query(sql){
     calls.push(sql);
     if(['BEGIN','ROLLBACK','COMMIT'].includes(sql))return{rows:[]};
+    if(sql.includes('pg_advisory_xact_lock'))return{rows:[]};
     if(sql.includes('FROM logistics_custody_assignments'))return{rows:[]};
     if(sql.includes('FROM logistics_items'))return{rows:[{id:'item',active:true,item_type:'CONSUMABLE',tracking_type:'QUANTITY'}]};
     if(sql.includes('FROM logistics_warehouses'))return{rows:[{id:'warehouse',cost_center:'Central'}]};
