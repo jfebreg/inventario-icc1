@@ -1088,7 +1088,8 @@ function cycleCountModal(id){let count=(logisticsV2.cycleCounts||[]).find(x=>x.i
 async function cycleCountAction(id,action,extra={}){let payload=await logisticsFetch(`/api/v1/cycle-counts/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});await loadLogisticsV2(true);toast(action==='SUBMIT'?(payload.recountRequired?`${payload.recountRequired} línea(s) requieren reconteo independiente.`:'Conteo enviado a aprobación.'):action==='RECOUNT'?'Reconteo registrado y enviado a aprobación.':action==='APPROVE'?'Conteo aprobado.':action==='POST'?`Conteo contabilizado: ${payload.adjustedLines||0} ajuste(s).`:'Conteo actualizado.');return payload}
 async function openCycleCountTask(taskId){let task=(window.ICCAuth?.tasks||[]).find(x=>x.id===taskId);if(!task)throw new Error('No encontramos la tarea de conteo.');await loadLogisticsV2(true);let countId=task.payload?.plannedCountId;if(!countId){let result=await logisticsFetch('/api/v1/cycle-counts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({organizationId:logisticsV2.status?.organizationId,warehouseId:task.payload?.warehouseId,taskId,blindCount:true,notes:`Programa automático · ${task.title}`})});countId=result.cycleCount?.id;await Promise.all([loadLogisticsV2(true),window.ICCAuth?.refreshRealtime?.()]);toast(result.replayed?'El conteo programado ya estaba iniciado.':'Conteo programado iniciado. Registra las cantidades físicas.')}if(!countId)throw new Error('No se pudo identificar el conteo programado.');cycleCountModal(countId)}
 document.addEventListener('click',async e=>{let t=e.target.closest?.('[data-cycle-task]');if(!t)return;e.preventDefault();e.stopImmediatePropagation();t.disabled=true;try{await openCycleCountTask(t.dataset.cycleTask)}catch(err){toast(err.message||'No se pudo iniciar el conteo programado.');t.disabled=false}},true);
-async function registerMovementV2({legacyId,a,action,qty,from,to,status,notes}){
+async function registerMovementV2({legacyId,a,action,qty,from,to,status,notes,onRequest=()=>{}}){
+  let send=(url,options)=>{onRequest();return logisticsFetch(url,options)};
   if(!activeUserId)return null;
   if(!logisticsV2.loaded)await loadLogisticsV2(true);
   if(logisticsV2.error)throw new Error(`Libro mayor no disponible: ${logisticsV2.error}`);
@@ -1100,11 +1101,11 @@ async function registerMovementV2({legacyId,a,action,qty,from,to,status,notes}){
     payloadBase={organizationId:logisticsV2.status?.organizationId,itemId:item.id,assetUnitId:unit?.id||null,quantity,source:'QR',notes};
   if(status==='En tránsito'&&sourceWarehouse&&destinationWarehouse){
     let allocations=fefoAllocations(item,sourceLocation,quantity),lines=allocations.map(x=>({itemId:item.id,assetUnitId:unit?.id||null,lotId:x.lotId,quantity:x.quantity}));
-    let created=await logisticsFetch('/api/v1/transfers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    let created=await send('/api/v1/transfers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       organizationId:payloadBase.organizationId,transferNumber:`UI-${legacyId}`,sourceWarehouseId:sourceWarehouse.id,
       destinationWarehouseId:destinationWarehouse.id,notes,lines
     })}),transfer=created.transfer;
-    await logisticsFetch(`/api/v1/transfers/${encodeURIComponent(transfer.id)}/dispatch`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({idempotencyKey:`legacy-ui:${legacyId}:dispatch`,source:'QR',notes})});
+    await send(`/api/v1/transfers/${encodeURIComponent(transfer.id)}/dispatch`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({idempotencyKey:`legacy-ui:${legacyId}:dispatch`,source:'QR',notes})});
     logisticsV2.loaded=false;return{transferId:transfer.id,kind:'transfer'}
   }
   if(action==='Recepción de traslado'){
@@ -1117,13 +1118,13 @@ async function registerMovementV2({legacyId,a,action,qty,from,to,status,notes}){
       if(remaining<=0)break;
     }
     if(remaining>0)throw new Error(`El traslado sólo tiene ${quantity-remaining} unidad(es) pendientes.`);
-    await logisticsFetch(`/api/v1/transfers/${encodeURIComponent(pending.id)}/receive`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({idempotencyKey:`legacy-ui:${legacyId}:receive`,source:'QR',notes,lines})});
+    await send(`/api/v1/transfers/${encodeURIComponent(pending.id)}/receive`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({idempotencyKey:`legacy-ui:${legacyId}:receive`,source:'QR',notes,lines})});
     logisticsV2.loaded=false;return{transferId:pending.id,kind:'receipt'}
   }
   if(action==='Ajuste de stock'){
     if(!destinationLocation)throw new Error(`La bodega ${to} no tiene ubicación V2.`);
     if(!notes)throw new Error('Explica el motivo del ajuste antes de enviarlo a aprobación.');
-    let result=await logisticsFetch('/api/v1/inventory-adjustments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    let result=await send('/api/v1/inventory-adjustments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       organizationId:payloadBase.organizationId,itemId:item.id,assetUnitId:unit?.id||null,
       locationId:destinationLocation.id,quantityDelta:quantity,reasonCode:'DATA_CORRECTION',
       notes,source:'QR'
@@ -1138,7 +1139,7 @@ async function registerMovementV2({legacyId,a,action,qty,from,to,status,notes}){
   if(item.tracking_type==='LOT'&&!fromLocationId)throw new Error('Para ingresar este producto usa “Ingresar lote”, indicando número y vencimiento.');
   let allocations=fefoAllocations(item,sourceLocation,quantity),results=[];
   for(let [index,allocation] of allocations.entries()){
-    results.push(await logisticsFetch('/api/v1/stock/movements',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    results.push(await send('/api/v1/stock/movements',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       ...payloadBase,quantity:allocation.quantity,lotId:allocation.lotId,fromLocationId,toLocationId,movementType,
       referenceType:'legacy_ui',referenceId:legacyId,idempotencyKey:`legacy-ui:${legacyId}:${index}`
     })}));
@@ -1219,6 +1220,7 @@ function userModal(id){let u=id?state.users.find(x=>x.id===id):null,role=u?.admi
 function bind(){document.querySelectorAll('[data-route]').forEach(b=>b.onclick=()=>{route=b.dataset.route;render()});document.querySelectorAll('[data-life]').forEach(b=>b.onclick=()=>{window.lifeId=b.dataset.life;route='life';render()});document.querySelectorAll('[data-inspect]').forEach(b=>b.onclick=()=>requirePerm('inspect')&&inspectionModal(b.dataset.inspect));document.querySelectorAll('[data-deadline]').forEach(b=>b.onclick=()=>requirePerm('admin')&&deadlineModal(b.dataset.deadline));document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>{let a=b.dataset.action;if(['newCenter','newUser','newFamily','organization'].includes(a)&&!requirePerm('admin'))return;if(a==='newAsset'&&!requirePerm('move','Sólo usuarios con permiso de bodega pueden registrar activos.'))return;a==='newAsset'?assetModal():a==='newCenter'?newCenterModal():a==='newUser'?userModal():a==='organization'?organizationModal():familyModal()});document.querySelectorAll('[data-clone-asset]').forEach(b=>b.onclick=()=>requirePerm('move')&&cloneAssetModal(b.dataset.cloneAsset));document.querySelectorAll('[data-edit-family]').forEach(b=>b.onclick=()=>requirePerm('admin')&&familyModal(b.dataset.editFamily));document.querySelectorAll('[data-edit-user]').forEach(b=>b.onclick=()=>requirePerm('admin')&&userModal(b.dataset.editUser));document.querySelectorAll('[data-edit-center]').forEach(b=>b.onclick=()=>requirePerm('admin')&&centerModal(b.dataset.editCenter));document.querySelectorAll('[data-receive]').forEach(b=>b.onclick=()=>requirePerm('receive')&&receiveTransfer(b.dataset.receive));document.querySelectorAll('[data-terrain]').forEach(b=>b.onclick=()=>requirePerm('terrain')&&deliveryModal(b.dataset.terrain));document.querySelectorAll('[data-return-custody]').forEach(b=>b.onclick=()=>requirePerm('terrain')&&returnCustody(b.dataset.returnCustody));document.querySelectorAll('[data-export-report]').forEach(b=>b.onclick=()=>requirePerm('admin')&&exportReport());document.querySelectorAll('[data-start-move],[data-quick-move]').forEach(b=>b.onclick=()=>{if(!requirePerm('move'))return;let a=state.assets.find(x=>x.id===(window.quickAssetId||window.lifeId)),action=b.dataset.startMove||b.dataset.quickMove,userCenter=activeUser().costCenter||'Bodega Central';if(action==='Ingreso a bodega')action='Devolución a bodega';window.scannedAssetCode=a?.code||window.scannedAssetCode;route='scan';render();$('#movementCode').value=a?.code||'';$('#movementAction').value=action;if(action.includes('Salida')){$('#movementFrom').value=a?.location||'Bodega Central';$('#movementTo').value=userCenter;$('#movementStatus').value='En tránsito'}else{$('#movementFrom').value=a?.location==='En tránsito'?'En tránsito':(a?.location||'Bodega Central');$('#movementTo').value=userCenter;$('#movementStatus').value='Recibido'}tuneMovementForm();$('#movementDetail').focus();toast('Movimiento precargado. Completa destino u observación y guarda.')});$('#search')?.addEventListener('input',e=>{assetFilter=e.target.value;render()});$('#familyFilter')?.addEventListener('change',e=>{familyFilter=e.target.value;render()});$('#printAsset')?.addEventListener('change',e=>{window.printAssetId=e.target.value;render()});$('#printButton')?.addEventListener('click',()=>requirePerm('print')&&window.print());$('#movementAction')?.addEventListener('change',tuneMovementForm);$('#assetType')?.addEventListener('change',tuneAssetLotFields);$('#assetTrackLot')?.addEventListener('change',tuneAssetLotFields);$('#assetDuplicateOverride')?.addEventListener('change',tuneDuplicateOverrideFields);tuneMovementForm();$('#movementForm')?.addEventListener('submit',movementSubmit);$('#menuButton').onclick=()=>$('.sidebar').classList.toggle('open');}
 function validateMovementInput({action,qty,notes}){if(!Number.isFinite(qty)||qty<=0)throw new Error('Ingresa una cantidad válida mayor que cero.');if(action==='Ajuste de stock'&&!String(notes||'').trim())throw new Error('Explica el motivo del ajuste antes de enviarlo a aprobación.')}
 function movementAttempt(form,payload){validateMovementInput({action:payload.action,qty:payload.qty,notes:payload.notes});let fingerprint=JSON.stringify(payload);if(form.dataset.movementAttemptId){if(form.dataset.movementAttemptPayload!==fingerprint)throw new Error('Hay un movimiento pendiente de confirmar. Reintenta con los mismos datos o revisa el inventario antes de iniciar otro.');return form.dataset.movementAttemptId}let id=`m${crypto.randomUUID()}`;form.dataset.movementAttemptId=id;form.dataset.movementAttemptPayload=fingerprint;return id}
+async function runMovementAttempt(form,payload,operation){let pending=Boolean(form.dataset.movementAttemptId),sent=false,id=movementAttempt(form,payload);try{return await operation(id,()=>{sent=true})}catch(err){if(!pending&&!sent){delete form.dataset.movementAttemptId;delete form.dataset.movementAttemptPayload}throw err}}
 async function movementSubmit(e){
   e.preventDefault();
   let unlock=lockFormSubmission(e.currentTarget||e.target,'Registrando…');
@@ -1238,7 +1240,7 @@ async function movementSubmit(e){
   let available=availableStockForMovement(a,from);
   if(!external&&action!=='Ajuste de stock'&&from!==to&&available<qty)return toast(`Stock V2 insuficiente en ${from}. Disponible: ${available}`);
   let stockBefore={from:stockAt(a,from),to:stockAt(a,to),transit:stockAt(a,'En tránsito'),total:totalStock(a)},legacyId,v2=null,form=e.currentTarget||e.target;
-  try{legacyId=movementAttempt(form,{assetId:a.id,action,qty,from,to,status,notes:obs,userId:activeUserId});v2=await registerMovementV2({legacyId,a,action,qty,from,to,status,notes:obs})}catch(err){if([400,401,403,422].includes(err.status)){delete form.dataset.movementAttemptId;delete form.dataset.movementAttemptPayload}return toast(err.message||'No se recibió confirmación del movimiento. Reintenta con los mismos datos o revisa el inventario.')}
+  try{v2=await runMovementAttempt(form,{assetId:a.id,action,qty,from,to,status,notes:obs,userId:activeUserId},(id,onRequest)=>{legacyId=id;return registerMovementV2({legacyId,a,action,qty,from,to,status,notes:obs,onRequest})})}catch(err){return toast(err.message||'No se recibió confirmación del movimiento. Reintenta con los mismos datos o revisa el inventario.')}
   if(v2?.kind==='adjustment_request'){await loadLogisticsV2(true);toast('Ajuste enviado a aprobación. El stock aún no ha cambiado.');route='reports';render();return}
   if(action==='Ajuste de stock'||external){setStockAt(a,to,stockAt(a,to)+qty);a.location=to;a.status=a.type==='Consumible'&&a.stock<=Number(a.minimum||0)?'Stock bajo':'Disponible'}
   else{moveStock(a,from,to,qty,status)}
