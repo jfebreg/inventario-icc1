@@ -94,6 +94,7 @@ La selección automática de ubicaciones exige el tipo operativo solicitado. Una
 Los controles de centro para bodegas y ubicaciones incluyen la organización del servidor y su estado activo. Una ubicación en una bodega inactiva no concede acceso operativo; los perfiles deshabilitados no obtienen permisos, incluido el rol administrativo.
 Las recepciones parciales reconocen su clave original bajo el bloqueo del traslado antes de modificar cantidades. Reenviar una confirmación ya contabilizada devuelve el estado vigente sin incrementar la línea ni publicar eventos adicionales.
 Los movimientos bloquean también su clave de operación y contrastan los reintentos con los asientos originales. Cambiar producto, cantidad, unidad, lote, ubicación, tipo o referencia con la misma clave produce conflicto 409 y no modifica saldos.
+La importación de saldos iniciales reconoce los movimientos históricos de apertura por organización, clave y referencia. En reinicios conserva esos asientos aunque el estado operativo haya cambiado; no vuelve a importar ni compara el saldo actual como si fuera una nueva apertura. Esta regla sólo aplica a `OPENING` con origen `LEGACY_BACKFILL`.
 El formulario de movimiento conserva la clave y sus datos durante reintentos en la misma pantalla. Si no hay confirmación no permite transformar ese intento en otra operación; el usuario debe reintentar los mismos datos o consultar el inventario antes de iniciar un formulario nuevo.
 
 ## Despliegue
