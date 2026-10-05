@@ -22,6 +22,16 @@ test("ratificar cierra la tarea y sus alertas antes de confirmar la política",(
   assert.match(route,/reviewResolved: Boolean\(resolvedReview.rowCount\)/);
 });
 
+test("los reintentos conservan el plazo y escalamiento de un incidente abierto",()=>{
+  const start=server.indexOf("const taskTitle = recoveryFailure");
+  const failure=server.slice(start,server.indexOf("if (recoveryFailure)",start));
+  assert.match(failure,/due_at=CASE WHEN inventory_tasks.status='Resuelta' THEN EXCLUDED.due_at/);
+  assert.match(failure,/ELSE COALESCE\(inventory_tasks.due_at,EXCLUDED.due_at\) END/);
+  assert.match(failure,/ELSE COALESCE\(inventory_tasks.payload,'\{\}'::jsonb\)\|\|EXCLUDED.payload END/);
+  assert.match(failure,/ELSE inventory_tasks.status END/);
+  assert.match(failure,/incidentOwner.auth_user_id \|\| null/);
+});
+
 test("una nueva versión permite reabrir la revisión sin duplicar alertas del ciclo previo",()=>{
   const review=server.slice(server.indexOf("async function reviewBackupRecoveryPolicyValidity()"),server.indexOf("async function sweepScheduledLogisticsJobs()"));
   assert.match(review,/inventory_tasks.status='Resuelta'/);

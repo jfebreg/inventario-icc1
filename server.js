@@ -3276,13 +3276,21 @@ async function runDueCanonicalBackupJobs() {
           WHERE admin=TRUE AND active=TRUE ORDER BY (LOWER(email)='jfebreg@msn.com') DESC,
           activated_at NULLS LAST,created_at LIMIT 1`)).rows[0] || {};
         await pool.query(`INSERT INTO inventory_tasks
-          (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,due_at,payload,updated_at)
+          (id,task_type,title,detail,priority,status,center_name,entity_type,entity_id,due_at,payload,
+           assignee_auth_user_id,updated_at)
           VALUES ($1,$2,$3,$4,'Crítica','Pendiente',
-            'Bodega Central','scheduled_job',$5,NOW()+INTERVAL '4 hours',$6::jsonb,NOW())
-          ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,status='Pendiente',resolved_at=NULL,
-            task_type=EXCLUDED.task_type,title=EXCLUDED.title,due_at=EXCLUDED.due_at,
-            payload=EXCLUDED.payload,updated_at=NOW()`,
-        [taskId, taskType, taskTitle, message, job.id, asJson({ executionId, jobCode: job.job_code })]);
+            'Bodega Central','scheduled_job',$5,NOW()+INTERVAL '4 hours',$6::jsonb,$7,NOW())
+          ON CONFLICT (id) DO UPDATE SET detail=EXCLUDED.detail,
+            status=CASE WHEN inventory_tasks.status='Resuelta' THEN 'Pendiente' ELSE inventory_tasks.status END,
+            resolved_at=NULL,task_type=EXCLUDED.task_type,title=EXCLUDED.title,
+            due_at=CASE WHEN inventory_tasks.status='Resuelta' THEN EXCLUDED.due_at
+              ELSE COALESCE(inventory_tasks.due_at,EXCLUDED.due_at) END,
+            payload=CASE WHEN inventory_tasks.status='Resuelta' THEN EXCLUDED.payload
+              ELSE COALESCE(inventory_tasks.payload,'{}'::jsonb)||EXCLUDED.payload END,
+            assignee_auth_user_id=COALESCE(inventory_tasks.assignee_auth_user_id,EXCLUDED.assignee_auth_user_id),
+            updated_at=NOW()`,
+        [taskId, taskType, taskTitle, message, job.id, asJson({ executionId, jobCode: job.job_code }),
+          incidentOwner.auth_user_id || null]);
         if (recoveryFailure) {
           await pool.query(`INSERT INTO inventory_notifications
             (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
