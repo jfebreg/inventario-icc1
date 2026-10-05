@@ -32,6 +32,17 @@ test("los reintentos conservan el plazo y escalamiento de un incidente abierto",
   assert.match(failure,/incidentOwner.auth_user_id \|\| null/);
 });
 
+test("el respaldo diario notifica falla y restablecimiento dentro de su ejecutor",()=>{
+  const scheduler=server.slice(server.indexOf("async function runDueCanonicalBackupJobs()"),server.indexOf("async function verifyArchivedCanonicalBackups"));
+  assert.match(scheduler,/if \(resolvedTask.rowCount && job.job_code === 'BACKUP_RPO_DAILY_CHECK'\)/);
+  assert.match(scheduler,/BACKUP_RPO_RECOVERED/);
+  assert.match(scheduler,/BACKUP_RPO_FAILED/);
+  assert.match(scheduler,/BACKUP_RPO_BREACH/);
+  assert.match(scheduler,/manifestId: summary.manifestId/);
+  assert.match(scheduler,/attendBackupTaskAlerts\(pool, taskId\)/);
+  assert.doesNotMatch(server.slice(0,server.indexOf("async function runDueCanonicalBackupJobs()")),/BACKUP_RPO_RECOVERED|BACKUP_RPO_FAILED/);
+});
+
 test("una nueva versión permite reabrir la revisión sin duplicar alertas del ciclo previo",()=>{
   const review=server.slice(server.indexOf("async function reviewBackupRecoveryPolicyValidity()"),server.indexOf("async function sweepScheduledLogisticsJobs()"));
   assert.match(review,/inventory_tasks.status='Resuelta'/);

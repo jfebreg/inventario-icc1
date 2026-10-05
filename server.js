@@ -3259,6 +3259,21 @@ async function runDueCanonicalBackupJobs() {
           [job.organization_id, job.id, admin.id, `backup-recovery:${executionId}`,
             asJson({ taskId, executionId, recoveryDrillId: summary.recoveryDrillId })]);
         }
+        if (resolvedTask.rowCount && job.job_code === 'BACKUP_RPO_DAILY_CHECK') {
+          await attendBackupTaskAlerts(pool, taskId);
+          await pool.query(`INSERT INTO inventory_notifications
+            (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+            VALUES ($1,$2,'Bodega Central','BACKUP_RPO_RECOVERED',$3,$4,'info','scheduled_job',$5,$6::jsonb)
+            ON CONFLICT (id) DO NOTHING`,
+          [`notification-${taskId}-recovered-${executionId}`, admin.auth_user_id || null,
+            'Respaldo diario restablecido', 'La copia diaria volvió a generarse y verificarse correctamente.',
+            String(job.id), asJson({ taskId, executionId, manifestId: summary.manifestId })]);
+          await pool.query(`INSERT INTO logistics_audit_events
+            (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+            VALUES ($1,'BACKUP_RPO_RECOVERED','scheduled_job',$2,$3,$4,'SYSTEM',$5::jsonb)`,
+          [job.organization_id, job.id, admin.id, `backup-rpo:${executionId}`,
+            asJson({ taskId, executionId, manifestId: summary.manifestId })]);
+        }
         results.push({ jobId: job.id, ok: true, ...summary });
       } catch (error) {
         const message = String(error?.message || error).slice(0, 2000);
@@ -3302,6 +3317,19 @@ async function runDueCanonicalBackupJobs() {
             (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
             VALUES ($1,'BACKUP_RECOVERY_TEST_FAILED','scheduled_job',$2,$3,$4,'SYSTEM',$5::jsonb)`,
           [job.organization_id, job.id, incidentOwner.id || null, `backup-recovery:${executionId}`,
+            asJson({ taskId, executionId, error: message })]);
+        }
+        if (!recoveryFailure) {
+          await pool.query(`INSERT INTO inventory_notifications
+            (id,recipient_auth_user_id,center_name,notification_type,title,body,severity,entity_type,entity_id,payload)
+            VALUES ($1,$2,'Bodega Central','BACKUP_RPO_BREACH',$3,$4,'critical','scheduled_job',$5,$6::jsonb)
+            ON CONFLICT (id) DO NOTHING`,
+          [`notification-${taskId}-${executionId}`, incidentOwner.auth_user_id || null,
+            taskTitle, message, String(job.id), asJson({ taskId, executionId, jobCode: job.job_code })]);
+          await pool.query(`INSERT INTO logistics_audit_events
+            (organization_id,event_type,entity_type,entity_id,actor_profile_id,correlation_id,source,after_data)
+            VALUES ($1,'BACKUP_RPO_FAILED','scheduled_job',$2,$3,$4,'SYSTEM',$5::jsonb)`,
+          [job.organization_id, job.id, incidentOwner.id || null, `backup-rpo:${executionId}`,
             asJson({ taskId, executionId, error: message })]);
         }
         results.push({ jobId: job.id, ok: false, error: message });
