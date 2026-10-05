@@ -1792,7 +1792,7 @@ async function inviteProfile(profile, email) {
 }
 
 function profileCan(profile, permission) {
-  if (!profile) return false;
+  if (!profile || profile.active === false) return false;
   if (!KNOWN_PERMISSIONS.has(permission)) return false;
   if (profile.admin) return true;
   const permissions = Array.isArray(profile.permissions) ? profile.permissions : [];
@@ -1922,11 +1922,13 @@ async function completeAccessReview(actorProfileId) {
 }
 
 async function profileMayAccessWarehouse(profile, warehouseId) {
-  if (!profile || !warehouseId) return false;
+  if (!profile || profile.active === false || !warehouseId) return false;
   if (profile.admin) return true;
+  if (!profile.cost_center) return false;
   const result = await pool.query(`SELECT 1 FROM logistics_warehouses w
     JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
-    WHERE w.id=$1 AND cc.name=$2 AND w.active=TRUE`, [warehouseId, profile.cost_center]);
+    WHERE w.id=$1 AND cc.name=$2 AND w.active=TRUE AND w.organization_id=$3`,
+  [warehouseId, profile.cost_center, logisticsOrganizationId]);
   return Boolean(result.rowCount);
 }
 
@@ -2452,12 +2454,15 @@ async function changeReleaseStatus(releaseId, action, actorProfileId, reason = "
 }
 
 async function profileMayAccessLocation(profile, locationId) {
-  if (!profile || !locationId) return false;
+  if (!profile || profile.active === false || !locationId) return false;
   if (profile.admin) return true;
+  if (!profile.cost_center) return false;
   const result = await pool.query(`SELECT 1 FROM logistics_locations loc
     JOIN logistics_warehouses w ON w.id=loc.warehouse_id
     JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
-    WHERE loc.id=$1 AND cc.name=$2 AND loc.active=TRUE`, [locationId, profile.cost_center]);
+    WHERE loc.id=$1 AND cc.name=$2 AND loc.active=TRUE AND w.active=TRUE
+      AND loc.organization_id=$3 AND w.organization_id=$3`,
+  [locationId, profile.cost_center, logisticsOrganizationId]);
   return Boolean(result.rowCount);
 }
 
