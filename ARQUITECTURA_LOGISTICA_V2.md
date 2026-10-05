@@ -90,6 +90,7 @@ La V2 incorpora un modelo transaccional compatible con la aplicación vigente. D
 Todas las rutas requieren autenticación cuando Supabase Auth está activo y validan los permisos del perfil.
 Las altas de movimientos, entregas, traslados e inspecciones fijan la organización desde el servidor y rechazan identificadores diferentes enviados por el navegador. Las devoluciones y etapas de traslados e inspecciones buscan la entidad dentro de esa organización, incluso para el administrador.
 Una inspección aprobada o cerrada conserva al aprobador final: otra cuenta no puede reemplazarlo. El reintento de la misma acción y persona devuelve el resultado existente sin duplicar auditoría, firmas ni eventos; tampoco permite retroceder su etapa final.
+La selección automática de ubicaciones exige el tipo operativo solicitado. Una zona de cuarentena o tránsito no sustituye el almacenamiento en entregas o traslados; la ausencia de la ubicación requerida bloquea la operación antes de alterar saldos.
 
 ## Despliegue
 
