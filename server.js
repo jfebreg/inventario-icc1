@@ -1,5 +1,5 @@
 import http from "node:http";
-import { backupTaskResolutionError } from "./lib/backup-task-resolution.js";
+import { backupTaskResolutionError, attendBackupTaskAlerts } from "./lib/backup-task-resolution.js";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2937,6 +2937,7 @@ async function reviewBackupRecoveryPolicyValidity() {
       resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
     WHERE id=$1 AND task_type='BACKUP_RECOVERY_POLICY_REVIEW' AND status<>'Resuelta' RETURNING id`, [taskId]);
   if (resolved.rowCount) {
+    await attendBackupTaskAlerts(pool, taskId);
     await pool.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
       WHERE entity_type='recovery_policy' AND entity_id=$1 AND read_at IS NULL`, [logisticsOrganizationId]);
     await pool.query(`INSERT INTO inventory_notifications
@@ -3241,6 +3242,7 @@ async function runDueCanonicalBackupJobs() {
         const resolvedTask = await pool.query(`UPDATE inventory_tasks SET status='Resuelta',resolved_at=COALESCE(resolved_at,NOW()),
           updated_at=NOW() WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [taskId]);
         if (resolvedTask.rowCount && job.job_code === 'BACKUP_RECOVERY_WEEKLY_TEST') {
+          await attendBackupTaskAlerts(pool, taskId);
           await pool.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
             WHERE entity_type='scheduled_job' AND entity_id=$1 AND notification_type='BACKUP_RECOVERY_TEST_FAILED'
               AND read_at IS NULL`, [String(job.id)]);
@@ -3538,6 +3540,7 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
         resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
         WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [objectiveTaskId]);
       if (resolvedObjective.rowCount) {
+        await attendBackupTaskAlerts(client, objectiveTaskId);
         await client.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
           WHERE entity_type='recovery_objective' AND entity_id=$1 AND read_at IS NULL`, [organizationId]);
         await client.query(`INSERT INTO inventory_notifications
@@ -3607,6 +3610,7 @@ async function verifyCanonicalBackupPackage(actorProfile, payload, organizationI
         resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW()
         WHERE id=$1 AND status<>'Resuelta' RETURNING id`, [trendTaskId]);
       if (resolvedTrend.rowCount) {
+        await attendBackupTaskAlerts(client, trendTaskId);
         await client.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
           WHERE entity_type='recovery_trend' AND entity_id=$1 AND read_at IS NULL`, [organizationId]);
         await client.query(`INSERT INTO inventory_notifications
@@ -7352,6 +7356,7 @@ async function handleHttpRequest(req, res, requestId) {
         WHERE id=$1 AND task_type='BACKUP_RECOVERY_POLICY_REVIEW'
           AND status<>'Resuelta' RETURNING id`, [reviewTaskId]);
       if (resolvedReview.rowCount) {
+        await attendBackupTaskAlerts(client, reviewTaskId);
         await client.query(`UPDATE inventory_notifications SET read_at=COALESCE(read_at,NOW())
           WHERE entity_type='recovery_policy' AND entity_id=$1 AND read_at IS NULL`,
         [logisticsOrganizationId]);
