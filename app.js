@@ -345,7 +345,7 @@ async function loadLogisticsV2(force=false){if(!activeUserId||logisticsV2.loadin
 function canonicalItemForAsset(a){let base=normalizeCode(assetBaseCode(a));return logisticsV2.items.find(item=>normalizeCode(item.sku)===base)||logisticsV2.items.find(item=>(item.units||[]).some(unit=>codeMatches(unit.unitCode,a.code)))}
 function canonicalUnitForAsset(item,a){return (item?.units||[]).find(unit=>codeMatches(unit.unitCode,a.code))||null}
 function canonicalWarehouse(name){let normalized=String(name||'').trim().toLowerCase();return logisticsV2.warehouses.find(w=>String(w.cost_center||w.name).trim().toLowerCase()===normalized)||null}
-function canonicalLocation(name,type){let warehouse=canonicalWarehouse(name),locations=warehouse?.locations||[];return locations.find(location=>type?location.type===type:location.type==='STORAGE')||locations[0]||null}
+function canonicalLocation(name,type='STORAGE'){let warehouse=canonicalWarehouse(name),locations=warehouse?.locations||[];return locations.find(location=>location.type===type&&location.active!==false)||null}
 function fefoAllocations(item,location,quantity){
   if(item?.tracking_type!=='LOT')return[{lotId:null,quantity:Number(quantity)}];
   let remaining=Number(quantity),today=new Date().toISOString().slice(0,10),rows=(logisticsV2.stock||[])
