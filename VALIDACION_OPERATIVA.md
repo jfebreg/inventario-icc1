@@ -47,4 +47,8 @@ Registrar el commit activo, fecha, centro, usuario y dispositivo en cada escenar
 
 ## Cierre
 
+### Reintentos en el formulario
+
+En un entorno de pruebas, verificar que un artículo sin catálogo o una bodega sin ubicación produzcan un error corregible antes de enviar. Una solicitud ya enviada cuya respuesta se pierde debe conservar su clave y los mismos datos al reintentar en el mismo formulario. Si se creó un traslado y falló el despacho, el reintento debe mantener el número de traslado y la clave del despacho. No cambiar los datos de una operación incierta ni asumir que falló por no recibir respuesta: consultar su referencia y conciliar primero. Las pruebas automatizadas simulan estos fallos; no sustituyen la validación física ni verifican por sí solas el despliegue.
+
 Aceptar el bloque operativo cuando todos los escenarios aplicables estén aprobados y las diferencias detectadas estén corregidas y repetidas satisfactoriamente. Julio registra la aceptación, la fecha y el commit. Si un escenario no aplica, anotar el motivo; no registrarlo como aprobado sin ejecutarlo.
