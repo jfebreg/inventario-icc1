@@ -362,7 +362,7 @@ function lotExpiryState(row){
   return{days,label:days<0?`Vencido hace ${Math.abs(days)} día(s)`:days===0?'Vence hoy':`Vence en ${days} día(s)`,level:days<0?'bad':days<=30?'warning':'ok'};
 }
 function canonicalWorker({worker,email,phone,center}){let clean=v=>String(v||'').trim().toLowerCase(),digits=v=>String(v||'').replace(/\D/g,'');return (logisticsV2.workers||[]).find(w=>clean(w.cost_center)===clean(center)&&((email&&clean(w.email)===clean(email))||(phone&&digits(w.phone)===digits(phone))||clean(w.name)===clean(worker)))||null}
-async function registerTerrainV2({legacyId,a,qty,from,worker,email,phone,notes,acceptanceToken}){
+async function registerTerrainV2({legacyId,a,qty,from,worker,email,phone,notes,acceptanceToken,onRequest=()=>{}}){
   if(!activeUserId)return null;
   if(!logisticsV2.loaded)await loadLogisticsV2(true);
   if(logisticsV2.error)throw new Error(`Libro mayor no disponible: ${logisticsV2.error}`);
@@ -372,12 +372,14 @@ async function registerTerrainV2({legacyId,a,qty,from,worker,email,phone,notes,a
   if(!person)throw new Error(`${worker} debe estar enrolado en ${from} antes de registrar la entrega.`);
   let quantity=a.type==='Activo'?1:Number(qty),allocation=fefoAllocations(item,location,quantity);
   if(allocation.length>1)throw new Error('La cantidad solicitada abarca más de un lote. Registra entregas separadas para conservar la trazabilidad individual.');
-  let result=await logisticsFetch('/api/v1/custody',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+  let body=JSON.stringify({
     organizationId:logisticsV2.status?.organizationId,itemId:item.id,assetUnitId:unit?.id||null,
     lotId:allocation[0]?.lotId||null,workerId:person.id,warehouseId:warehouse.id,quantity,
     externalReference:`legacy-terrain:${legacyId}`,acceptanceToken,source:'QR',
     notes:`${notes||''}${allocation[0]?.lotNumber?` · Lote FEFO ${allocation[0].lotNumber}`:''}`
-  })});
+  });
+  onRequest();
+  let result=await logisticsFetch('/api/v1/custody',{method:'POST',headers:{'Content-Type':'application/json'},body});
   logisticsV2.loaded=false;
   return{custodyId:result.assignment?.id,movementId:result.movement?.id,kind:result.assignment?.assignment_type}
 }
@@ -1261,9 +1263,13 @@ async function terrainSubmit(e){
   let today=new Date().toISOString().slice(0,10),a=state.assets.find(x=>x.id===e.target.dataset.asset),d=new FormData(e.target),qty=Number(d.get('qty')||1),from=d.get('from'),[worker,email,phone,center]=String(d.get('worker')||'').split('|'),notes=d.get('notes')||'';
   if(!a||!worker){if(submit){submit.disabled=false;submit.textContent='Registrar entrega'}return toast('Selecciona trabajador.')}
   if(a.type==='Consumible'&&stockAt(a,from)<qty){if(submit){submit.disabled=false;submit.textContent='Registrar entrega'}return toast(`Stock insuficiente en ${from}. Disponible: ${stockAt(a,from)}`)}
-  let epp=isEpp(a),token=`cargo-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,status=epp?'Pendiente aceptación':a.type==='Consumible'?'Entrega informada':'Cargo informado',assignment={id:`as${Date.now()}`,assetId:a.id,code:a.code,kind:a.type,worker,email,phone,center,from,qty,date:today,issuer:activeUser().name,notes,status,token};
+  let epp=isEpp(a),token,status=epp?'Pendiente aceptación':a.type==='Consumible'?'Entrega informada':'Cargo informado',assignment;
   try{
-    let canonical=await registerTerrainV2({legacyId:assignment.id,a,qty,from,worker,email,phone,notes,acceptanceToken:epp?token:''});
+    let canonical=await runMovementAttempt(e.target,{assetId:a.id,qty,from,worker,email,phone,center,notes,epp,userId:activeUserId},(id,onRequest)=>{
+      token=`cargo-${id}`;
+      assignment={id,assetId:a.id,code:a.code,kind:a.type,worker,email,phone,center,from,qty,date:today,issuer:activeUser().name,notes,status,token};
+      return registerTerrainV2({legacyId:id,a,qty,from,worker,email,phone,notes,acceptanceToken:epp?token:'',onRequest});
+    });
     assignment.canonicalCustodyId=canonical?.custodyId||'';
     assignment.canonicalMovementId=canonical?.movementId||'';
     state.assignments.unshift(assignment);

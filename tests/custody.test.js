@@ -9,7 +9,10 @@ const migration = await readFile(new URL("../migrations/003_custody_idempotency.
 
 test("la entrega a terreno se registra primero en el modelo V2", () => {
   assert.match(app, /async function registerTerrainV2/);
-  assert.match(app, /await registerTerrainV2\(\{legacyId:assignment\.id/);
+  const terrain=app.slice(app.indexOf('async function terrainSubmit('),app.indexOf("document.addEventListener",app.indexOf('async function terrainSubmit(')));
+  assert.match(terrain, /await runMovementAttempt\(e.target/);
+  assert.match(terrain, /return registerTerrainV2\(\{legacyId:id/);
+  assert.ok(terrain.indexOf('return registerTerrainV2(')<terrain.indexOf('state.assignments.unshift(assignment)'));
   assert.match(app, /canonicalCustodyId/);
   assert.equal(app.split("if(e.target.id!=='terrainForm')return").length - 1, 1);
 });
