@@ -1,4 +1,5 @@
 import http from "node:http";
+import { enforceOperationalOrganization } from "./lib/operational-access.js";
 import { backupTaskResolutionError, attendBackupTaskAlerts, requireVerifiedDailyBackup } from "./lib/backup-task-resolution.js";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
@@ -6746,6 +6747,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "inspect")) return json(res, 403, { error: "Tu perfil no puede registrar inspecciones." });
     try {
       const body = await readJson(req);
+      enforceOperationalOrganization(body, logisticsOrganizationId);
       if (!body.assetUnitId || !body.warehouseId) {
         return json(res, 400, { error: "La inspección requiere una unidad y su bodega V2." });
       }
@@ -6765,7 +6767,7 @@ async function handleHttpRequest(req, res, requestId) {
       }, apiProfile.id);
       return json(res, result.replayed ? 200 : 201, result);
     } catch (error) {
-      return json(res, 400, { error: error.message || "No se pudo registrar la inspección." });
+      return json(res, error.status || 400, { error: error.message || "No se pudo registrar la inspección." });
     }
   }
 
@@ -6777,7 +6779,7 @@ async function handleHttpRequest(req, res, requestId) {
       return json(res, 403, { error: "Tu perfil no puede completar esta etapa de la inspección." });
     }
     try {
-      const scope = await pool.query("SELECT warehouse_id FROM logistics_inspection_runs WHERE id=$1", [inspectionId]);
+      const scope = await pool.query("SELECT warehouse_id FROM logistics_inspection_runs WHERE id=$1 AND organization_id=$2", [inspectionId, logisticsOrganizationId]);
       if (!scope.rows[0]) return json(res, 404, { error: "Inspección V2 no encontrada." });
       if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, scope.rows[0].warehouse_id))) {
         return json(res, 403, { error: "La inspección pertenece a otro centro de costo." });
@@ -6949,6 +6951,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede mover inventario." });
     try {
       const body = await readJson(req);
+      enforceOperationalOrganization(body, logisticsOrganizationId);
       body.idempotencyKey = requireStableOperationKey(body.idempotencyKey);
       if (String(body.movementType || "").toUpperCase() === "ADJUSTMENT") {
         return json(res, 409, { error: "Los ajustes deben solicitarse y aprobarse antes de contabilizarse." });
@@ -6991,6 +6994,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "terrain")) return json(res, 403, { error: "Tu perfil no puede entregar productos a terreno." });
     try {
       const body = await readJson(req);
+      enforceOperationalOrganization(body, logisticsOrganizationId);
       body.externalReference = requireStableOperationKey(body.externalReference, "externalReference");
       if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.warehouseId))) {
         return json(res, 403, { error: "Sólo puedes entregar desde una bodega de tu centro." });
@@ -7012,7 +7016,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "terrain")) return json(res, 403, { error: "Tu perfil no puede registrar devoluciones desde terreno." });
     try {
       const assignmentId = decodeURIComponent(custodyReturn[1]);
-      const current = await pool.query("SELECT warehouse_id FROM logistics_custody_assignments WHERE id=$1", [assignmentId]);
+      const current = await pool.query("SELECT warehouse_id FROM logistics_custody_assignments WHERE id=$1 AND organization_id=$2", [assignmentId, logisticsOrganizationId]);
       if (!current.rows[0]) return json(res, 404, { error: "Entrega a terreno no encontrada." });
       if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, current.rows[0].warehouse_id))) {
         return json(res, 403, { error: "La entrega pertenece a otra bodega." });
@@ -7039,6 +7043,7 @@ async function handleHttpRequest(req, res, requestId) {
     if (!profileCan(apiProfile, "move")) return json(res, 403, { error: "Tu perfil no puede crear traslados." });
     try {
       const body = await readJson(req);
+      enforceOperationalOrganization(body, logisticsOrganizationId);
       body.transferNumber = requireStableOperationKey(body.transferNumber, "transferNumber");
       if (!apiProfile.admin && !(await profileMayAccessWarehouse(apiProfile, body.sourceWarehouseId))) {
         return json(res, 403, { error: "Sólo puedes despachar desde una bodega de tu centro." });
@@ -7061,7 +7066,7 @@ async function handleHttpRequest(req, res, requestId) {
     try {
       const body = await readJson(req);
       body.idempotencyKey = requireStableOperationKey(body.idempotencyKey);
-      const transferResult = await pool.query("SELECT * FROM logistics_transfer_orders WHERE id=$1", [transferId]);
+      const transferResult = await pool.query("SELECT * FROM logistics_transfer_orders WHERE id=$1 AND organization_id=$2", [transferId, logisticsOrganizationId]);
       const transfer = transferResult.rows[0];
       if (!transfer) return json(res, 404, { error: "Traslado no encontrado." });
       const scopedWarehouse = action === "receive" ? transfer.destination_warehouse_id : transfer.source_warehouse_id;
