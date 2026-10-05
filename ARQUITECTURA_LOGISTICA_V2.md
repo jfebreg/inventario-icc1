@@ -92,6 +92,7 @@ Las altas de movimientos, entregas, traslados e inspecciones fijan la organizaci
 Una inspección aprobada o cerrada conserva al aprobador final: otra cuenta no puede reemplazarlo. El reintento de la misma acción y persona devuelve el resultado existente sin duplicar auditoría, firmas ni eventos; tampoco permite retroceder su etapa final.
 La selección automática de ubicaciones exige el tipo operativo solicitado. Una zona de cuarentena o tránsito no sustituye el almacenamiento en entregas o traslados; la ausencia de la ubicación requerida bloquea la operación antes de alterar saldos.
 Los controles de centro para bodegas y ubicaciones incluyen la organización del servidor y su estado activo. Una ubicación en una bodega inactiva no concede acceso operativo; los perfiles deshabilitados no obtienen permisos, incluido el rol administrativo.
+Las recepciones parciales reconocen su clave original bajo el bloqueo del traslado antes de modificar cantidades. Reenviar una confirmación ya contabilizada devuelve el estado vigente sin incrementar la línea ni publicar eventos adicionales.
 
 ## Despliegue
 
