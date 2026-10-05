@@ -114,9 +114,9 @@ Después de publicar, revisar `/api/health`. Debe indicar:
 }
 ```
 
-## Próximo corte de migración
+## Estado del corte de migración
 
-La siguiente etapa debe conectar las pantallas de movimientos y traslados a `/api/v1`. Durante ese período se compararán automáticamente los saldos antiguos con el libro mayor. Sólo después de lograr conciliación completa se dejará `inventory_app_state` como respaldo de lectura.
+Las pantallas de movimientos y traslados están conectadas a `/api/v1`. La conciliación compara los saldos anteriores con el libro mayor y el control de corte permite activar la fuente canónica tras cumplir sus verificaciones. La implementación de ese control no confirma que se haya activado en producción: el modo efectivo debe comprobarse en Configuración. La aceptación operativa se registra siguiendo `VALIDACION_OPERATIVA.md`.
 
 ## Segunda etapa implementada
 
