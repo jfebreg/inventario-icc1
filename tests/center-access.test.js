@@ -27,6 +27,7 @@ test("las bodegas se consultan con centro y organización del servidor",async()=
     assert.deepEqual(Array.from(params),["warehouse","Obra Túnel","icc"]);
     assert.match(sql,/w.organization_id=\$3/);
     assert.match(sql,/w.active=TRUE/);
+    assert.match(sql,/cc.active=TRUE AND cc.organization_id=\$3/);
     return {rowCount:0};
   }};
   assert.equal(await warehouse(pool)({cost_center:"Obra Túnel"},"warehouse"),false);
@@ -37,6 +38,7 @@ test("la ubicación exige bodega activa y misma organización",async()=>{
     assert.deepEqual(Array.from(params),["location","Obra Túnel","icc"]);
     assert.match(sql,/loc.active=TRUE AND w.active=TRUE/);
     assert.match(sql,/loc.organization_id=\$3 AND w.organization_id=\$3/);
+    assert.match(sql,/cc.active=TRUE AND cc.organization_id=\$3/);
     return {rowCount:1};
   }};
   assert.equal(await location(pool)({cost_center:"Obra Túnel"},"location"),true);
@@ -46,6 +48,13 @@ test("la administración activa conserva su alcance entre centros",async()=>{
   const pool={query:async()=>{throw new Error("No debe restringir por centro al administrador");}};
   assert.equal(await warehouse(pool)({admin:true,active:true},"warehouse"),true);
   assert.equal(await location(pool)({admin:true,active:true},"location"),true);
+});
+test("sin coincidencia de centro activo y organización se deniega la ubicación",async()=>{
+  const pool={query:async(sql)=>{
+    assert.match(sql,/cc.active=TRUE AND cc.organization_id=\$3/);
+    return {rowCount:0};
+  }};
+  assert.equal(await location(pool)({active:true,cost_center:"Centro deshabilitado"},"location"),false);
 });
 
 test("un perfil deshabilitado pierde también los permisos de rol",()=>{

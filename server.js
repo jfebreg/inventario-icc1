@@ -1927,7 +1927,8 @@ async function profileMayAccessWarehouse(profile, warehouseId) {
   if (!profile.cost_center) return false;
   const result = await pool.query(`SELECT 1 FROM logistics_warehouses w
     JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
-    WHERE w.id=$1 AND cc.name=$2 AND w.active=TRUE AND w.organization_id=$3`,
+    WHERE w.id=$1 AND cc.name=$2 AND w.active=TRUE AND w.organization_id=$3
+      AND cc.active=TRUE AND cc.organization_id=$3`,
   [warehouseId, profile.cost_center, logisticsOrganizationId]);
   return Boolean(result.rowCount);
 }
@@ -2461,7 +2462,8 @@ async function profileMayAccessLocation(profile, locationId) {
     JOIN logistics_warehouses w ON w.id=loc.warehouse_id
     JOIN logistics_cost_centers cc ON cc.id=w.cost_center_id
     WHERE loc.id=$1 AND cc.name=$2 AND loc.active=TRUE AND w.active=TRUE
-      AND loc.organization_id=$3 AND w.organization_id=$3`,
+      AND loc.organization_id=$3 AND w.organization_id=$3
+      AND cc.active=TRUE AND cc.organization_id=$3`,
   [locationId, profile.cost_center, logisticsOrganizationId]);
   return Boolean(result.rowCount);
 }
