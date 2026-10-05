@@ -1,10 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { backupTaskResolutionError, attendBackupTaskAlerts } from "../lib/backup-task-resolution.js";
+import { backupTaskResolutionError, attendBackupTaskAlerts, requireVerifiedDailyBackup } from "../lib/backup-task-resolution.js";
 
 const protectedTypes = ["BACKUP_RPO_BREACH", "BACKUP_ARCHIVE_INTEGRITY",
   "BACKUP_RECOVERY_TEST_FAILED", "BACKUP_RECOVERY_OBJECTIVE_BREACH",
   "BACKUP_RECOVERY_TREND_BREACH", "BACKUP_RECOVERY_POLICY_REVIEW"];
+
+test("el éxito diario exige que la copia recién creada esté archivada y verificada",()=>{
+  const manifest={id:"new",metadata:{storageArchived:true,storagePath:"daily/new.json"}};
+  assert.doesNotThrow(()=>requireVerifiedDailyBackup(manifest,{results:[{manifestId:"new",status:"VALID"}]}));
+  assert.throws(()=>requireVerifiedDailyBackup(manifest,{results:[{manifestId:"new",status:"FAILED"}]}),/verificar/);
+  assert.throws(()=>requireVerifiedDailyBackup(manifest,{results:[{manifestId:"older",status:"VALID"}]}),/verificar/);
+  assert.throws(()=>requireVerifiedDailyBackup({id:"new",metadata:{}},{results:[]}),/archivada/);
+  assert.throws(()=>requireVerifiedDailyBackup(manifest,null),/verificar/);
+});
+
+test("una copia histórica fallida no invalida la nueva copia comprobada",()=>{
+  requireVerifiedDailyBackup({id:"new",metadata:{storageArchived:true,storagePath:"daily/new.json"}},
+    {results:[{manifestId:"older",status:"FAILED"},{manifestId:"new",status:"VALID"}]});
+});
 
 test("la recuperación atiende avisos de escalamiento sólo de su propia tarea", async () => {
   let captured;

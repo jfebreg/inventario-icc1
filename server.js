@@ -1,5 +1,5 @@
 import http from "node:http";
-import { backupTaskResolutionError, attendBackupTaskAlerts } from "./lib/backup-task-resolution.js";
+import { backupTaskResolutionError, attendBackupTaskAlerts, requireVerifiedDailyBackup } from "./lib/backup-task-resolution.js";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -3230,6 +3230,7 @@ async function runDueCanonicalBackupJobs() {
         } else {
           const backup = await createCanonicalBackup(admin, job.organization_id);
           const archiveVerification = await verifyArchivedCanonicalBackups(admin, 5, job.organization_id);
+          requireVerifiedDailyBackup(backup.manifest, archiveVerification);
           summary = { manifestId: backup.manifest.id, payloadSha256: backup.manifest.payload_sha256,
             storagePath: backup.manifest.metadata?.storagePath || null, archiveVerification };
         }
