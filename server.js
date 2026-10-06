@@ -1606,13 +1606,17 @@ async function createAuthAndRealtimeTables(client) {
   await client.query(`CREATE INDEX IF NOT EXISTS inventory_notifications_recipient_idx ON inventory_notifications(recipient_auth_user_id, read_at)`);
 
   await client.query(`CREATE OR REPLACE FUNCTION public.inventory_is_admin()
-    RETURNS BOOLEAN LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = public
+    RETURNS BOOLEAN LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp
     AS $$ SELECT COALESCE((SELECT admin AND active FROM public.inventory_user_profiles WHERE auth_user_id = auth.uid()), FALSE) $$`);
   await client.query(`CREATE OR REPLACE FUNCTION public.inventory_user_center()
-    RETURNS TEXT LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = public
+    RETURNS TEXT LANGUAGE SQL STABLE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp
     AS $$ SELECT cost_center FROM public.inventory_user_profiles WHERE auth_user_id = auth.uid() AND active LIMIT 1 $$`);
 
+  await client.query(`REVOKE ALL ON FUNCTION public.inventory_is_admin(), public.inventory_user_center() FROM PUBLIC, anon`);
+  await client.query(`GRANT EXECUTE ON FUNCTION public.inventory_is_admin(), public.inventory_user_center() TO authenticated`);
+
   const serverOnlyTables = [
+    "inventory_auth_settings",
     "inventory_app_state", "inventory_families", "inventory_cost_centers", "inventory_users",
     "inventory_assets", "inventory_asset_stock", "inventory_movements", "inventory_workers",
     "inventory_worker_signatures", "inventory_inspections", "inventory_documents", "inventory_ai_results",
